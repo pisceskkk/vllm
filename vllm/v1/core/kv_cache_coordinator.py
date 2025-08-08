@@ -7,6 +7,7 @@ from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock
 from vllm.v1.core.single_type_kv_cache_manager import (
     FullAttentionManager, get_manager_for_kv_cache_spec)
+from vllm.config import ParallelConfig
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
 from vllm.v1.request import Request
 
@@ -18,6 +19,7 @@ class KVCacheCoordinator(ABC):
 
     def __init__(
         self,
+        parallel_config: ParallelConfig,
         kv_cache_config: KVCacheConfig,
         max_model_len: int,
         use_eagle: bool,
@@ -25,11 +27,12 @@ class KVCacheCoordinator(ABC):
         caching_hash_fn: Callable,
         enable_kv_cache_events: bool,
     ):
+        self.parallel_config = parallel_config
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
         self.enable_caching = enable_caching
 
-        self.block_pool = BlockPool(kv_cache_config.num_blocks, enable_caching,
+        self.block_pool = BlockPool(kv_cache_config.num_blocks * parallel_config.context_parallel_size, enable_caching,
                                     enable_kv_cache_events)
 
         # Needs special handling for find_longest_cache_hit if eagle is enabled
@@ -179,10 +182,10 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
     Does not implement any features related to prefix caching.
     """
 
-    def __init__(self, kv_cache_config: KVCacheConfig, max_model_len: int,
+    def __init__(self, parallel_config: ParallelConfig, kv_cache_config: KVCacheConfig, max_model_len: int,
                  use_eagle: bool, caching_hash_fn: Callable,
                  enable_kv_cache_events: bool):
-        super().__init__(kv_cache_config, max_model_len, use_eagle, False,
+        super().__init__(parallel_config, kv_cache_config, max_model_len, use_eagle, False,
                          caching_hash_fn, enable_kv_cache_events)
         self.num_single_type_manager = len(self.single_type_managers)
 
@@ -207,10 +210,10 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
     full attention or all attention layers use sliding window attention.
     """
 
-    def __init__(self, kv_cache_config: KVCacheConfig, max_model_len: int,
+    def __init__(self, parallel_config: ParallelConfig, kv_cache_config: KVCacheConfig, max_model_len: int,
                  use_eagle: bool, enable_caching: bool,
                  caching_hash_fn: Callable, enable_kv_cache_events: bool):
-        super().__init__(kv_cache_config, max_model_len, use_eagle,
+        super().__init__(parallel_config, kv_cache_config, max_model_len, use_eagle,
                          enable_caching, caching_hash_fn,
                          enable_kv_cache_events)
         self.kv_cache_spec = self.kv_cache_config.kv_cache_groups[
@@ -244,10 +247,10 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
     May extend to more general cases in the future.
     """
 
-    def __init__(self, kv_cache_config: KVCacheConfig, max_model_len: int,
+    def __init__(self, parallel_config: ParallelConfig, kv_cache_config: KVCacheConfig, max_model_len: int,
                  use_eagle: bool, enable_caching: bool,
                  caching_hash_fn: Callable, enable_kv_cache_events: bool):
-        super().__init__(kv_cache_config, max_model_len, use_eagle,
+        super().__init__(parallel_config, kv_cache_config, max_model_len, use_eagle,
                          enable_caching, caching_hash_fn,
                          enable_kv_cache_events)
         self.verify_and_split_kv_cache_groups()
@@ -385,18 +388,18 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
 
 
 def get_kv_cache_coordinator(
-        kv_cache_config: KVCacheConfig, max_model_len: int, use_eagle: bool,
-        enable_caching: bool, caching_hash_fn: Callable,
+        parallel_config: ParallelConfig, kv_cache_config: KVCacheConfig,
+        max_model_len: int, use_eagle: bool, enable_caching: bool, caching_hash_fn: Callable,
         enable_kv_cache_events: bool) -> KVCacheCoordinator:
     if not enable_caching:
-        return KVCacheCoordinatorNoPrefixCache(kv_cache_config, max_model_len,
+        return KVCacheCoordinatorNoPrefixCache(parallel_config, kv_cache_config, max_model_len,
                                                use_eagle, caching_hash_fn,
                                                enable_kv_cache_events)
     if len(kv_cache_config.kv_cache_groups) == 1:
-        return UnitaryKVCacheCoordinator(kv_cache_config, max_model_len,
+        return UnitaryKVCacheCoordinator(parallel_config, kv_cache_config, max_model_len,
                                          use_eagle, enable_caching,
                                          caching_hash_fn,
                                          enable_kv_cache_events)
-    return HybridKVCacheCoordinator(kv_cache_config, max_model_len, use_eagle,
+    return HybridKVCacheCoordinator(parallel_config, kv_cache_config, max_model_len, use_eagle,
                                     enable_caching, caching_hash_fn,
                                     enable_kv_cache_events)

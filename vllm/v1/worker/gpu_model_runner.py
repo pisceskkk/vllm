@@ -26,7 +26,7 @@ from vllm.distributed.kv_transfer import (get_kv_transfer_group,
 from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorBase_V1
 from vllm.distributed.parallel_state import (
     get_pp_group, get_tp_group, graph_capture, is_global_first_rank,
-    prepare_communication_buffer_for_model)
+    prepare_communication_buffer_for_model, get_context_parallel_rank)
 from vllm.forward_context import (DPMetadata, get_forward_context,
                                   set_forward_context)
 from vllm.logger import init_logger
@@ -123,13 +123,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[
                 cache_config.cache_dtype]
 
+        self.cp_rank = get_context_parallel_rank()
+        self.cp_size = parallel_config.context_parallel_size
+
         self.is_multimodal_model = model_config.is_multimodal_model
         self.is_pooling_model = model_config.pooler_config is not None
         self.model_supports_multimodal_raw_input = (
             model_config.model_supports_multimodal_raw_input)
         self.max_model_len = model_config.max_model_len
+        self.max_cp_model_len = model_config.max_model_len // self.cp_size
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
+        self.max_cp_num_tokens = scheduler_config.max_num_batched_tokens // self.cp_size
         self.max_num_reqs = scheduler_config.max_num_seqs
+
+        self.global_cp_block_ids: dict[int, int] = {}
 
         # Model-related.
         self.num_query_heads = model_config.get_num_attention_heads(
@@ -363,6 +370,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def _sync_device(self) -> None:
         torch.cuda.synchronize()
 
+    def _context_parallel_update(self, scheduler_output: "SchedulerOutput") -> None:
+        for req_id, num_scheduled_token in scheduler_output.num_scheduled_tokens.items():
+            assert num_scheduled_token >= self.cp_size, (
+                "sequence length must be greater than or equal to cp_size")
+            num_cp_padded_tokens = round_up(num_scheduled_token, self.cp_size)
+            scheduler_output.num_cp_pad_tokens[req_id] = num_cp_padded_tokens
+            assert num_cp_padded_tokens == num_scheduled_token, (
+                f"{req_id} with sequence length: {num_scheduled_token} must be a multiple of cp_size")
+
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         """Update the cached states and the persistent batch with the scheduler
         output.
@@ -373,6 +389,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
+
+        self._context_parallel_update(scheduler_output)
+
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
@@ -430,6 +449,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 model = cast(VllmModelForPooling, self.model)
                 to_update = model.pooler.get_pooling_updates(task)
                 to_update.apply(pooling_params)
+
+            print("prompt_token_ids: ", new_req_data.prompt_token_ids)
 
             self.requests[req_id] = CachedRequestState(
                 req_id=req_id,
@@ -652,20 +673,29 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         req_ids = self.input_batch.req_ids
         tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
         num_scheduled_tokens = np.array(tokens, dtype=np.int32)
-        max_num_scheduled_tokens = max(tokens)
+
+        cp_pad_tokens = [scheduler_output.num_cp_pad_tokens[i] // self.cp_size for i in req_ids]
+        num_cp_pad_tokens = np.array(cp_pad_tokens, dtype=np.int32)
+        total_num_cp_scheduled_tokens = int(num_cp_pad_tokens.sum())
+
+        max_num_cp_pad_tokens = max(cp_pad_tokens)
+
+        cp_token_offset = np.repeat(num_cp_pad_tokens * self.cp_rank, num_cp_pad_tokens)
 
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
         req_indices = np.repeat(self.arange_np[:num_reqs],
-                                num_scheduled_tokens)
+                        num_cp_pad_tokens)
 
         # cu_num_tokens: [2, 5, 3] -> [2, 7, 10]
         # arange: [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
         cu_num_tokens, arange = self._get_cumsum_and_arange(
-            num_scheduled_tokens)
+            num_cp_pad_tokens)
+        # np.add(arange, cp_token_offset, out=arange)
+        arange = arange * self.cp_size + self.cp_rank
 
         # Get positions.
-        positions_np = self.positions_np[:total_num_scheduled_tokens]
+        positions_np = self.positions_np[:total_num_cp_scheduled_tokens]
         np.add(self.input_batch.num_computed_tokens_cpu[req_indices],
                arange,
                out=positions_np)
@@ -688,7 +718,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         torch.index_select(self.input_batch.token_ids_cpu_tensor.flatten(),
                            0,
                            torch.from_numpy(token_indices),
-                           out=self.input_ids_cpu[:total_num_scheduled_tokens])
+                           out=self.input_ids_cpu[:total_num_cp_scheduled_tokens])
 
         self.input_batch.block_table.compute_slot_mapping(
             req_indices, positions_np)
@@ -699,13 +729,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.query_start_loc_np[0] = 0
         self.query_start_loc_np[1:num_reqs + 1] = cu_num_tokens
 
+        # TODO num_cp_computed_tokens
         self.seq_lens_np[:num_reqs] = (
             self.input_batch.num_computed_tokens_cpu[:num_reqs] +
-            num_scheduled_tokens)
+            num_cp_pad_tokens)
 
         # Copy the tensors to the GPU.
-        self.input_ids[:total_num_scheduled_tokens].copy_(
-            self.input_ids_cpu[:total_num_scheduled_tokens], non_blocking=True)
+        self.input_ids[:total_num_cp_scheduled_tokens].copy_(
+            self.input_ids_cpu[:total_num_cp_scheduled_tokens], non_blocking=True)
         if self.uses_mrope:
             # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
             self.mrope_positions[:, :total_num_scheduled_tokens].copy_(
@@ -713,8 +744,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 non_blocking=True)
         else:
             # Common case (1D positions)
-            self.positions[:total_num_scheduled_tokens].copy_(
-                self.positions_cpu[:total_num_scheduled_tokens],
+            self.positions[:total_num_cp_scheduled_tokens].copy_(
+                self.positions_cpu[:total_num_cp_scheduled_tokens],
                 non_blocking=True)
 
         self.query_start_loc[:num_reqs + 1].copy_(
@@ -747,6 +778,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # graph mode.
             blk_table.slot_mapping[total_num_scheduled_tokens:].fill_(-1)
 
+            # TODO cp rank pad list metadata
             common_attn_metadata = CommonAttentionMetadata(
                 query_start_loc=self.query_start_loc[:num_reqs + 1],
                 query_start_loc_cpu=self.query_start_loc_cpu[:num_reqs + 1],
@@ -755,8 +787,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_computed_tokens_cpu=self.input_batch.
                 num_computed_tokens_cpu_tensor[:num_reqs],
                 num_reqs=num_reqs,
-                num_actual_tokens=total_num_scheduled_tokens,
-                max_query_len=max_num_scheduled_tokens,
+                num_actual_tokens=total_num_cp_scheduled_tokens,
+                max_query_len=max_num_cp_pad_tokens,
                 block_table_tensor=blk_table_tensor,
                 slot_mapping=slot_mapping,
             )
@@ -803,6 +835,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # from these partial requests, we do so for simplicity.
             # We will ignore the sampled tokens from the partial requests.
             # TODO: Support prompt logprobs.
+            # TODO: ignore pad tokens when cp
             logits_indices = query_start_loc[1:] - 1
             spec_decode_metadata = None
         else:
@@ -822,6 +855,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Hot-Swap lora model
         if self.lora_config:
             self.set_active_loras(self.input_batch, num_scheduled_tokens)
+
+        scheduler_output.total_num_scheduled_tokens = total_num_cp_scheduled_tokens
 
         return (attn_metadata, attention_cuda_graphs, logits_indices,
                 spec_decode_metadata, num_scheduled_tokens,
@@ -1446,6 +1481,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 skip_cuda_graphs=skip_cuda_graphs,
         ):
             self.maybe_setup_kv_connector(scheduler_output)
+
+            print(input_ids, positions)
 
             model_output = self.model(
                 input_ids=input_ids,
@@ -2413,7 +2450,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Add `is_profile` here to pre-allocate communication buffers
         hidden_states, last_hidden_states \
-            = self._dummy_run(self.max_num_tokens, is_profile=True)
+            = self._dummy_run(self.max_cp_num_tokens, is_profile=True)
         if get_pp_group().is_last_rank:
             if self.is_pooling_model:
                 output = self._dummy_pooler_run(hidden_states)

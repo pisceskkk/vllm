@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import threading
-from typing import Optional, Union
+from typing import Optional, Union, Tuple
 from weakref import WeakValueDictionary
 
 import torch
@@ -103,7 +103,8 @@ class DeviceCommunicatorBase:
             # as long as we use data parallel (coupled data parallel
             # where all data parallel ranks execute forward together),
             # we initialize the all2all manager used in expert parallel.
-            use_ep = config.parallel_config.data_parallel_size > 1
+            use_ep = config.parallel_config.data_parallel_size > 1 or \
+                config.parallel_config.context_parallel_size > 1
 
         self.use_all2all = "ep" in unique_name and use_ep
         self.all2all_manager: Optional[All2AllManagerBase] = None
@@ -237,6 +238,12 @@ class DeviceCommunicatorBase:
         tensor = torch.empty(size, dtype=dtype, device=self.device)
         torch.distributed.recv(tensor, self.ranks[src], self.device_group)
         return tensor
+
+    def neighbor_exchange(self, send_tensors: Tuple[torch.Tensor,...],
+                          recv_tensors_buffer: Tuple[torch.Tensor,...],
+                          stream: Optional[torch.cuda.Stream] = None):
+        pass
+        
 
     def destroy(self):
         pass

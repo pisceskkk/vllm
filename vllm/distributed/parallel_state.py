@@ -30,7 +30,7 @@ from collections import namedtuple
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from multiprocessing import shared_memory
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Optional, Union, Tuple
 from unittest.mock import patch
 
 import torch
@@ -794,6 +794,13 @@ class GroupCoordinator:
         """NOTE: `src` is the local rank of the source rank."""
         return self.device_communicator.recv(size, dtype, src)
 
+    def neighbor_exchange(self, send_tensors: Tuple[torch.Tensor,...],
+                          recv_tensors_buffer: Tuple[torch.Tensor,...],
+                          stream: Optional[torch.cuda.Stream] = None):
+        """Neighbor exchange among the group."""
+        return self.device_communicator.neighbor_exchange(
+            send_tensors, recv_tensors_buffer, stream)
+
     def destroy(self):
         if self.device_group is not None:
             torch.distributed.destroy_process_group(self.device_group)
@@ -893,6 +900,11 @@ def get_ep_group() -> GroupCoordinator:
     assert _EP is not None, ("expert parallel group is not initialized")
     return _EP
 
+_CP: Optional[GroupCoordinator] = None
+
+def get_cp_group() -> GroupCoordinator:
+    assert _CP is not None, ("context parallel group is not initialized")
+    return _CP
 
 def get_pp_group() -> GroupCoordinator:
     assert _PP is not None, (
@@ -1003,6 +1015,7 @@ def init_distributed_environment(
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
+    context_parallel_size: int = 1,
     backend: Optional[str] = None,
 ) -> None:
     """
@@ -1013,6 +1026,7 @@ def initialize_model_parallel(
             parallelism.
         pipeline_model_parallel_size: number of GPUs used for pipeline model
             parallelism.
+        context_parallel_size: number of GPUs used for context parallelism.
 
     Let's say we have a total of 8 GPUs denoted by g0 ... g7 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -1040,7 +1054,7 @@ def initialize_model_parallel(
     if config is not None:
         data_parallel_size = config.parallel_config.data_parallel_size
 
-    # the layout order is: ExternalDP x DP x PP x TP
+    # the layout order is: ExternalDP x DP x PP x CP x TP
     # ExternalDP is the data parallel group that is not part of the model,
     # every dp rank can generate independently (in verl integration).
     # DP is the data parallel group that is part of the model,
@@ -1051,7 +1065,7 @@ def initialize_model_parallel(
     # last dimension, then reshape to 2D, then unbind the last dimension
     all_ranks = torch.arange(world_size).reshape(
         -1, data_parallel_size, pipeline_model_parallel_size,
-        tensor_model_parallel_size)  # noqa
+        context_parallel_size, tensor_model_parallel_size)  # noqa
 
     # Build the tensor model-parallel groups.
     global _TP
@@ -1066,11 +1080,22 @@ def initialize_model_parallel(
                                     use_message_queue_broadcaster=True,
                                     group_name="tp")
 
+    # Build the context parallel groups.
+    global _CP
+    assert _CP is None, ("context parallel group is already initialized")
+    group_ranks = all_ranks.transpose(3, 4).reshape(
+        -1, context_parallel_size).unbind(0)
+    group_ranks = [x.tolist() for x in group_ranks]
+    _CP = init_model_parallel_group(group_ranks,
+                                    get_world_group().local_rank,
+                                    backend,
+                                    group_name="cp")
+
     # Build the pipeline model-parallel groups.
     global _PP
     assert _PP is None, (
         "pipeline model parallel group is already initialized")
-    group_ranks = all_ranks.transpose(2, 3).reshape(
+    group_ranks = all_ranks.transpose(2, 4).reshape(
         -1, pipeline_model_parallel_size).unbind(0)
     group_ranks = [x.tolist() for x in group_ranks]
     _PP = init_model_parallel_group(group_ranks,
@@ -1081,7 +1106,7 @@ def initialize_model_parallel(
     global _DP
     assert _DP is None, ("data parallel group is already initialized")
     group_ranks = all_ranks.transpose(1,
-                                      3).reshape(-1,
+                                      4).reshape(-1,
                                                  data_parallel_size).unbind(0)
     group_ranks = [x.tolist() for x in group_ranks]
     _DP = init_model_parallel_group(group_ranks,
@@ -1091,8 +1116,10 @@ def initialize_model_parallel(
 
     global _EP
     assert _EP is None, ("expert parallel group is already initialized")
-    group_ranks = all_ranks.transpose(1, 2).reshape(
-        -1, data_parallel_size * tensor_model_parallel_size).unbind(0)
+    group_ranks = all_ranks.transpose(1, 2).reshape(-1, 
+                                                    data_parallel_size * 
+                                                    tensor_model_parallel_size * 
+                                                    context_parallel_size).unbind(0)
     group_ranks = [x.tolist() for x in group_ranks]
     _EP = init_model_parallel_group(group_ranks,
                                     get_world_group().local_rank,
@@ -1101,14 +1128,15 @@ def initialize_model_parallel(
 
     logger.info(
         "rank %s in world size %s is assigned as "
-        "DP rank %s, PP rank %s, TP rank %s, EP rank %s", rank, world_size,
-        _DP.rank_in_group, _PP.rank_in_group, _TP.rank_in_group,
+        "DP rank %s, PP rank %s, CP rank %s, TP rank %s, EP rank %s", rank, world_size,
+        _DP.rank_in_group, _PP.rank_in_group, _CP.rank_in_group, _TP.rank_in_group,
         _EP.rank_in_group)
 
 
 def ensure_model_parallel_initialized(
     tensor_model_parallel_size: int,
     pipeline_model_parallel_size: int,
+    context_parallel_size: int,
     backend: Optional[str] = None,
 ) -> None:
     """Helper to initialize model parallel groups if they are not initialized,
@@ -1119,7 +1147,8 @@ def ensure_model_parallel_initialized(
         get_world_group().device_group)
     if not model_parallel_is_initialized():
         initialize_model_parallel(tensor_model_parallel_size,
-                                  pipeline_model_parallel_size, backend)
+                                  pipeline_model_parallel_size, 
+                                  context_parallel_size, backend)
         return
 
     assert (
@@ -1132,6 +1161,11 @@ def ensure_model_parallel_initialized(
         "pipeline parallel group already initialized, but of unexpected size: "
         f"{pp_world_size=} vs. "
         f"{pipeline_model_parallel_size=}")
+    cp_world_size = get_cp_group().world_size
+    assert (cp_world_size == context_parallel_size), (
+        "context parallel group already initialized, but of unexpected size: "
+        f"{cp_world_size=} vs. "
+        f"{context_parallel_size=}")
 
 
 def prepare_communication_buffer_for_model(model: torch.nn.Module):
@@ -1143,6 +1177,8 @@ def prepare_communication_buffer_for_model(model: torch.nn.Module):
     """
     if _TP is not None:
         _TP.prepare_communication_buffer_for_model(model)
+    if _CP is not None:
+        _CP.prepare_communication_buffer_for_model(model)
     if _PP is not None:
         _PP.prepare_communication_buffer_for_model(model)
     if _DP is not None:
@@ -1153,7 +1189,7 @@ def prepare_communication_buffer_for_model(model: torch.nn.Module):
 
 def model_parallel_is_initialized():
     """Check if tensor and pipeline parallel groups are initialized."""
-    return (_TP is not None and _PP is not None)
+    return (_TP is not None and _PP is not None and _CP is not None)
 
 
 _TP_STATE_PATCHED = False
@@ -1194,6 +1230,14 @@ def get_tensor_model_parallel_rank():
     return get_tp_group().rank_in_group
 
 
+def get_context_parallel_world_size():
+    """Return world size for the context parallel group."""
+    return get_cp_group().world_size
+
+def get_context_parallel_rank():
+    """Return my rank for the context parallel group."""
+    return get_cp_group().rank_in_group
+
 def get_node_count() -> int:
     """Return the total number of nodes in the distributed environment. """
     assert _NODE_COUNT is not None, (
@@ -1208,6 +1252,11 @@ def destroy_model_parallel():
     if _TP:
         _TP.destroy()
     _TP = None
+
+    global _CP
+    if _CP:
+        _CP.destroy()
+    _CP = None
 
     global _PP
     if _PP:

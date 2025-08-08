@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import Optional, Union
+from typing import Optional, Union, Tuple
 
 import torch
 from torch.distributed import ProcessGroup
@@ -206,6 +206,27 @@ class CudaCommunicator(DeviceCommunicatorBase):
         else:
             torch.distributed.recv(tensor, self.ranks[src], self.device_group)
         return tensor
+
+    def neighbor_exchange(self, send_tensors: Tuple[torch.Tensor,...],
+                          recv_tensors_buffer: Tuple[torch.Tensor,...],
+                          stream: Optional[torch.cuda.Stream] = None):
+        assert len(send_tensors) == len(recv_tensors_buffer), (
+            f"send_tensors and recv_tensors_buffer must have the same length, "
+            f"but got {len(send_tensors)} and {len(recv_tensors_buffer)}")
+        
+        src = (self.rank_in_group - 1) % self.world_size
+        dst = (self.rank_in_group + 1) % self.world_size
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is not None and not pynccl_comm.disabled:
+            pynccl_comm.group_start()
+            for send_tensor, recv_tensor in zip(send_tensors, recv_tensors_buffer):
+                pynccl_comm.send(send_tensor, dst, stream)
+                pynccl_comm.recv(recv_tensor, src, stream)
+            pynccl_comm.group_end()
+        else:
+            for send_tensor, recv_tensor in zip(send_tensors, recv_tensors_buffer):
+                torch.distributed.send(send_tensor, self.ranks[dst], self.device_group)
+                torch.distributed.recv(recv_tensor, self.ranks[src], self.device_group)
 
     def destroy(self):
         if self.pynccl_comm is not None:

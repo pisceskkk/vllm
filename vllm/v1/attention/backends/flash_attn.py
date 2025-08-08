@@ -30,6 +30,8 @@ from vllm.v1.attention.backends.utils import (AttentionMetadataBuilder,
                                               get_kv_cache_layout)
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+from vllm.distributed.parallel_state import get_cp_group, get_context_parallel_world_size, get_context_parallel_rank
+
 logger = init_logger(__name__)
 
 # NOTE(woosuk): This is an arbitrary number. Tune it if needed.
@@ -373,6 +375,10 @@ class FlashAttentionImpl(AttentionImpl):
 
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
 
+        self.cp_size = get_context_parallel_world_size()
+        self.cp_rank = get_context_parallel_rank()
+        self.cp_group = get_cp_group()
+
         FlashAttentionBackend.validate_head_size(head_size)
 
         if attn_type != AttentionType.DECODER:
@@ -442,16 +448,19 @@ class FlashAttentionImpl(AttentionImpl):
             # and value[:num_actual_tokens] because the reshape_and_cache_flash
             # op uses the slot_mapping's shape to determine the number of
             # actual tokens.
-            reshape_and_cache_flash(
-                key,
-                value,
-                key_cache,
-                value_cache,
-                attn_metadata.slot_mapping,
-                self.kv_cache_dtype,
-                layer._k_scale,
-                layer._v_scale,
-            )
+            if self.cp_size > 1:
+                pass
+            else:
+                reshape_and_cache_flash(
+                    key,
+                    value,
+                    key_cache,
+                    value_cache,
+                    attn_metadata.slot_mapping,
+                    self.kv_cache_dtype,
+                    layer._k_scale,
+                    layer._v_scale,
+                )
 
         if self.kv_cache_dtype.startswith("fp8"):
             key_cache = key_cache.view(torch.float8_e4m3fn)
@@ -472,6 +481,32 @@ class FlashAttentionImpl(AttentionImpl):
             scheduler_metadata = attn_metadata.scheduler_metadata
 
             descale_shape = (cu_seqlens_q.shape[0] - 1, key.shape[1])
+
+            if self.cp_size > 1:
+                key = key.contiguous()
+                value = value.contiguous()
+
+                self._forward_prefill_cp(
+                    output=output[:num_actual_tokens],
+                    query=query[:num_actual_tokens],
+                    key=key[:num_actual_tokens],
+                    value=value[:num_actual_tokens],
+                    cu_query_lens=cu_seqlens_q,
+                    max_query_len=max_seqlen_q,
+                    cu_seq_lens=cu_seqlens_q,
+                    max_seq_len=max_seqlen_k,
+                    softmax_scale=self.scale,
+                    alibi_slopes=self.alibi_slopes,
+                    sliding_window=self.sliding_window,
+                    logits_soft_cap=self.logits_soft_cap,
+                    fa_version=self.vllm_flash_attn_version,
+                    scheduler_metadata=scheduler_metadata,
+                    q_descale=layer._q_scale.expand(descale_shape),
+                    k_descale=layer._k_scale.expand(descale_shape),
+                    v_descale=layer._v_scale.expand(descale_shape),
+                )
+
+                return output
 
             flash_attn_varlen_func(
                 q=query[:num_actual_tokens],
@@ -523,6 +558,124 @@ class FlashAttentionImpl(AttentionImpl):
             v_descale=layer._v_scale,
         )
         return output
+
+    def _forward_prefill_cp(
+        self,
+        output: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        cu_query_lens: torch.Tensor,
+        max_query_len: int,
+        cu_seq_lens: torch.Tensor,
+        max_seq_len: int,
+        softmax_scale: float,
+        alibi_slopes: Optional[torch.Tensor],
+        sliding_window: tuple[int, int],
+        logits_soft_cap: float,
+        fa_version: int,
+        scheduler_metadata: Optional[torch.Tensor] = None,
+        q_descale: Optional[torch.Tensor] = None,
+        k_descale: Optional[torch.Tensor] = None,
+        v_descale: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # buffers for K/V exchange
+        next_key, next_value = torch.empty_like(key), torch.empty_like(value)
+        comm_stream = type(self)._get_comm_stream()
+        current_stream = torch.cuda.current_stream()
+        comm_stream.wait_stream(current_stream)
+
+        for step in range(self.cp_size):
+            if step + 1 < self.cp_size:
+                self.cp_group.neighbor_exchange(
+                                send_tensors=(key, value), 
+                                recv_tensors_buffer=(next_key, next_value), 
+                                stream=comm_stream
+                            )
+            if (step <= self.cp_rank):
+                chunk_out, chunk_lse = flash_attn_varlen_func(
+                    q=query,
+                    k=key,
+                    v=value,
+                    cu_seqlens_q=cu_query_lens,
+                    max_seqlen_q=max_query_len,
+                    cu_seqlens_k=cu_seq_lens,
+                    max_seqlen_k=max_seq_len,
+                    softmax_scale=softmax_scale,
+                    causal=True,
+                    alibi_slopes=alibi_slopes,
+                    window_size=sliding_window,
+                    softcap=logits_soft_cap,
+                    return_softmax_lse=True,
+                    fa_version=fa_version,
+                    q_descale=q_descale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                )
+                if step == 0:
+                    output.copy_(chunk_out)
+                    lse = chunk_lse
+                else:
+                    merge_attn_states(output, output, lse, chunk_out, chunk_lse, lse)
+            else:
+                # 1. torch index select Q, K, V
+                query_indices_list = []
+                kv_indices_list = []
+
+                for index in range(cu_query_lens.shape[0] - 1):
+                    req_start_i = int(cu_query_lens[index])
+                    req_end_i = int(cu_query_lens[index+1])
+                    query_indices_list.append(torch.arange(req_start_i+1, req_end_i))
+                    kv_indices_list.append(torch.arange(req_start_i, req_end_i-1))
+                
+                query_select = torch.index_select(query, 0, torch.cat(query_indices_list).cuda())
+                key_select = torch.index_select(key, 0, torch.cat(kv_indices_list).cuda())
+                value_select = torch.index_select(value, 0, torch.cat(kv_indices_list).cuda())
+
+                # 2. flash_attn
+                cu_query_lens_select = cu_query_lens.clone()
+                cu_query_lens_select[1:] -= 1
+                cu_seq_lens_select = cu_seq_lens.clone()
+                cu_seq_lens_select[1:] -= 1
+                chunk_out, chunk_lse = flash_attn_varlen_func(
+                    q=query_select,
+                    k=key_select,
+                    v=value_select,
+                    cu_seqlens_q=cu_query_lens_select,
+                    max_seqlen_q=max_query_len-1,
+                    cu_seqlens_k=cu_seq_lens_select,
+                    max_seqlen_k=max_seq_len-1,
+                    softmax_scale=softmax_scale,
+                    causal=True,
+                    alibi_slopes=alibi_slopes,
+                    window_size=sliding_window,
+                    softcap=logits_soft_cap,
+                    return_softmax_lse=True,
+                    fa_version=fa_version,
+                    # q_descale=q_descale[1:],
+                    # k_descale=k_descale[1:],
+                    # v_descale=v_descale[1:],
+                )
+                # 3. (Optimize it!) merge_attn_states
+                output_select = torch.index_select(output, 0, torch.cat(query_indices_list).cuda())
+                lse_select = torch.index_select(lse, 1, torch.cat(query_indices_list).cuda())
+                merge_attn_states(output_select, output_select, lse_select, chunk_out, chunk_lse, lse_select)
+
+                for index in range(cu_query_lens.shape[0] - 1):
+                    req_start_i = int(cu_query_lens[index])
+                    req_end_i = int(cu_query_lens[index+1])
+                    output[req_start_i+1:req_end_i].copy_(output_select[req_start_i-index:req_end_i-index-1])
+                    lse[:, req_start_i+1:req_end_i].copy_(lse_select[:, req_start_i-index:req_end_i-index-1])
+
+            if step + 1 < self.cp_size:
+                # wait for K/V exchange complete
+                current_stream.wait_stream(comm_stream)
+                temp_key = key
+                temp_value = value
+                key = next_key
+                value = next_value
+                next_key = temp_key
+                next_value = temp_value
 
 
 def use_cascade_attention(

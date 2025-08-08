@@ -11,6 +11,7 @@ from vllm.utils import sha256, sha256_cbor_64bit
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_utils import (BlockHash, KVCacheBlock,
                                          hash_request_tokens, init_none_hash)
+from vllm.config import ParallelConfig
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
@@ -68,6 +69,7 @@ class KVCacheManager:
 
     def __init__(
         self,
+        parallel_config: ParallelConfig,
         kv_cache_config: KVCacheConfig,
         max_model_len: int,
         enable_caching: bool = True,
@@ -103,6 +105,7 @@ class KVCacheManager:
                 0].kv_cache_spec.block_size
 
         self.coordinator = get_kv_cache_coordinator(
+            parallel_config=parallel_config,
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
             use_eagle=self.use_eagle,

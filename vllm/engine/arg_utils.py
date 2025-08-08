@@ -293,6 +293,7 @@ class EngineArgs:
     # number of P/D disaggregation (or other disaggregation) workers
     pipeline_parallel_size: int = ParallelConfig.pipeline_parallel_size
     tensor_parallel_size: int = ParallelConfig.tensor_parallel_size
+    context_parallel_size: int = ParallelConfig.context_parallel_size
     data_parallel_size: int = ParallelConfig.data_parallel_size
     data_parallel_rank: Optional[int] = None
     data_parallel_start_rank: Optional[int] = None
@@ -598,6 +599,8 @@ class EngineArgs:
             **parallel_kwargs["pipeline_parallel_size"])
         parallel_group.add_argument("--tensor-parallel-size", "-tp",
                                     **parallel_kwargs["tensor_parallel_size"])
+        parallel_group.add_argument("--context-parallel-size", "-cp",
+                                    **parallel_kwargs["context_parallel_size"])
         parallel_group.add_argument("--data-parallel-size", "-dp",
                                     **parallel_kwargs["data_parallel_size"])
         parallel_group.add_argument(
@@ -1155,6 +1158,7 @@ class EngineArgs:
         parallel_config = ParallelConfig(
             pipeline_parallel_size=self.pipeline_parallel_size,
             tensor_parallel_size=self.tensor_parallel_size,
+            context_parallel_size=self.context_parallel_size,
             data_parallel_size=self.data_parallel_size,
             data_parallel_rank=self.data_parallel_rank or 0,
             data_parallel_external_lb=data_parallel_external_lb,

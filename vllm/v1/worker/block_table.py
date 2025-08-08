@@ -89,6 +89,7 @@ class BlockTable:
         # NOTE(woosuk): We can't simply use `token_indices // block_size`
         # here because M (max_model_len) is not necessarily divisible by
         # block_size.
+        # TODO cp position or global -> local block map
         block_table_indices = (req_indices * self.max_num_blocks_per_req +
                                positions // self.block_size)
         block_table_cpu = self.get_cpu_tensor()

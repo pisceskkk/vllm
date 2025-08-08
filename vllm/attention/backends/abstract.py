@@ -304,6 +304,12 @@ class AttentionImpl(ABC, Generic[T]):
         """
         return False
 
+    @classmethod
+    def _get_comm_stream(cls):
+        if not hasattr(cls, '_comm_stream') or cls._comm_stream is None:
+            cls._comm_stream = torch.cuda.Stream()
+        return cls._comm_stream
+
 
 class MLAAttentionImpl(AttentionImpl[T], Generic[T]):
 

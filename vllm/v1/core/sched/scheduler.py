@@ -152,6 +152,7 @@ class Scheduler(SchedulerInterface):
 
         # Create the KV cache manager.
         self.kv_cache_manager = KVCacheManager(
+            parallel_config=vllm_config.parallel_config,
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
             enable_caching=self.cache_config.enable_prefix_caching,
@@ -553,6 +554,7 @@ class Scheduler(SchedulerInterface):
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
             num_scheduled_tokens=num_scheduled_tokens,
+            num_cp_pad_tokens=num_scheduled_tokens,
             total_num_scheduled_tokens=total_num_scheduled_tokens,
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_encoder_inputs=scheduled_encoder_inputs,

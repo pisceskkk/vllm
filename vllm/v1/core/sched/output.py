@@ -124,6 +124,8 @@ class SchedulerOutput:
     # req_id -> num_scheduled_tokens
     # Number of tokens scheduled for each request.
     num_scheduled_tokens: dict[str, int]
+    num_cp_pad_tokens: dict[str, int]
+
     # Total number of tokens scheduled for all requests.
     # Equal to sum(num_scheduled_tokens.values())
     total_num_scheduled_tokens: int
