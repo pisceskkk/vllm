@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
+import random
 import time
 from collections import defaultdict
 from collections.abc import Iterable
@@ -38,6 +40,7 @@ from vllm.v1.core.sched.output import (
     SchedulerOutput,
 )
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
+from vllm.v1.core.sched.budget import BudgetType, TokenBudget
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -50,8 +53,10 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
+from vllm.model_executor.flops_estimator import create_estimator_safely
 
 logger = init_logger(__name__)
+
 
 
 class Scheduler(SchedulerInterface):
@@ -202,6 +207,13 @@ class Scheduler(SchedulerInterface):
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
 
+        self.attn_estimator = None
+        self.budget_type = self.scheduler_config.budget_type
+
+
+
+        self.token_budget = TokenBudget(self)
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -221,7 +233,6 @@ class Scheduler(SchedulerInterface):
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
-        token_budget = self.max_num_scheduled_tokens
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
         encoder_compute_budget = self.max_num_encoder_input_tokens
@@ -231,9 +242,12 @@ class Scheduler(SchedulerInterface):
         # For logging.
         scheduled_timestamp = time.monotonic()
 
+        token_budget = self.token_budget
+        token_budget.update()
+
         # First, schedule the RUNNING requests.
         req_index = 0
-        while req_index < len(self.running) and token_budget > 0:
+        while req_index < len(self.running) and token_budget.has_running():
             request = self.running[req_index]
 
             if (
@@ -259,7 +273,8 @@ class Scheduler(SchedulerInterface):
             )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
-            num_new_tokens = min(num_new_tokens, token_budget)
+            num_new_tokens = min(num_new_tokens,
+                                 token_budget.get(request.computed_prompt))
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -284,6 +299,7 @@ class Scheduler(SchedulerInterface):
                     encoder_compute_budget,
                     shift_computed_tokens=1 if self.use_eagle else 0,
                 )
+
 
             if num_new_tokens == 0:
                 # The request cannot be scheduled because one of the following
@@ -361,7 +377,10 @@ class Scheduler(SchedulerInterface):
             scheduled_running_reqs.append(request)
             req_to_new_blocks[request.request_id] = new_blocks
             num_scheduled_tokens[request.request_id] = num_new_tokens
-            token_budget -= num_new_tokens
+            token_budget.consume(
+               num_new_tokens,
+               request.computed_prompt
+            )
             req_index += 1
 
             # Speculative decode related.
@@ -413,7 +432,7 @@ class Scheduler(SchedulerInterface):
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs:
-            while self.waiting and token_budget > 0:
+            while self.waiting and token_budget.has_waiting():
                 if len(self.running) == self.max_num_running_reqs:
                     break
 
@@ -513,6 +532,7 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
+
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
@@ -521,13 +541,14 @@ class Scheduler(SchedulerInterface):
                     # pooling requests to be chunked
                     if (
                         not self.scheduler_config.enable_chunked_prefill
-                        and num_new_tokens > token_budget
+                        and num_new_tokens > token_budget.get(False)
                     ):
                         # If chunked_prefill is disabled,
                         # we can stop the scheduling here.
                         break
 
-                    num_new_tokens = min(num_new_tokens, token_budget)
+                    num_new_tokens = min(num_new_tokens,
+                                         token_budget.get(False))
                     assert num_new_tokens > 0
 
                     # Schedule encoder inputs.
@@ -625,7 +646,7 @@ class Scheduler(SchedulerInterface):
                     self.kv_cache_manager.get_blocks(request.request_id)
                 )
                 num_scheduled_tokens[request.request_id] = num_new_tokens
-                token_budget -= num_new_tokens
+                token_budget.consume(num_new_tokens, False)
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 # Count the number of prefix cached tokens.
@@ -653,8 +674,7 @@ class Scheduler(SchedulerInterface):
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
-
-        assert token_budget >= 0
+        token_budget.verify()
         assert len(self.running) <= self.max_num_running_reqs
         # Since some requests in the RUNNING queue may not be scheduled in
         # this step, the total number of scheduled requests can be smaller than
@@ -1466,6 +1486,27 @@ class Scheduler(SchedulerInterface):
             self.kv_event_publisher.shutdown()
         if self.connector is not None:
             self.connector.shutdown()
+
+    def _maybe_init_estimator(self, vllm_config: VllmConfig) -> None:
+        """Initialize FLOPs estimator using a helper from flops_estimator.
+
+        Keeps changes minimal in scheduler; helper handles all fallbacks.
+        """
+        if self.budget_type != BudgetType.CL:
+            return
+        hf_cfg = (getattr(vllm_config.model_config, "hf_text_config", None)
+                  or getattr(vllm_config.model_config, "hf_config", None))
+        # Prefer HF config object; only use on-disk config.json if model is a
+        # local directory. ModelConfig does not expose `model_path`.
+        model_root = getattr(vllm_config.model_config, "model", None)
+        cfg_path = (os.path.join(model_root, "config.json")
+                    if isinstance(model_root, str) and os.path.isdir(model_root)
+                    else None)
+        self.attn_estimator = create_estimator_safely(
+            hf_config_obj=hf_cfg,
+            config_path=cfg_path,
+            scheduler_config=self.scheduler_config,
+        )
 
     ########################################################################
     # KV Connector Related Methods

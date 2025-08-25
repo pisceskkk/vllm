@@ -75,7 +75,7 @@ from vllm.config.model import (
 from vllm.config.multimodal import MMCacheType, MMEncoderTPMode
 from vllm.config.observability import DetailedTraceModules
 from vllm.config.parallel import DistributedExecutorBackend, ExpertPlacementStrategy
-from vllm.config.scheduler import SchedulerPolicy
+from vllm.config.scheduler import SchedulerPolicy, BudgetType
 from vllm.config.utils import get_field
 from vllm.config.vllm import OptimizationLevel
 from vllm.logger import init_logger, suppress_logging
@@ -569,6 +569,8 @@ class EngineArgs:
         CacheConfig.kv_offloading_backend
     )
     tokens_only: bool = False
+
+    budget_type: BudgetType = "token"
 
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
@@ -1081,6 +1083,7 @@ class EngineArgs:
         scheduler_group.add_argument(
             "--stream-interval", **scheduler_kwargs["stream_interval"]
         )
+
 
         # Compilation arguments
         compilation_kwargs = get_kwargs(CompilationConfig)
@@ -1640,6 +1643,7 @@ class EngineArgs:
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
+            budget_type=self.budget_type,
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:

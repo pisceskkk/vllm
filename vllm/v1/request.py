@@ -240,6 +240,10 @@ class Request:
             return self.request_id < other.request_id
         return id(self) < id(other)
 
+    @property
+    def computed_prompt(self) -> bool:
+        return self.num_computed_tokens >= self.num_prompt_tokens
+
 
 class RequestStatus(enum.IntEnum):
     """Status of a request."""

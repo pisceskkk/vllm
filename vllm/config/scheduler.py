@@ -21,6 +21,7 @@ logger = init_logger(__name__)
 
 RunnerType = Literal["generate", "pooling", "draft"]
 SchedulerPolicy = Literal["fcfs", "priority"]
+BudgetType = Literal["token", "computational_load"]
 
 
 @config
@@ -140,6 +141,14 @@ class SchedulerConfig:
     A smaller value (1) makes streaming smoother by sending each token immediately,
     while a larger value (e.g., 10) reduces host overhead and may increase throughput
     by batching multiple tokens before sending."""
+
+    budget_type: BudgetType = "token"
+    """The budget type to use:\n
+    - "token" means each scheduling uses a fixed number of tokens to form a batch.\n
+    - "computational_load" means using computational load as a metric to determine
+        the number of tokens that can be allocated in the current batch during 
+        each scheduling operation.
+    """
 
     @staticmethod
     def default_factory(**kwargs):
