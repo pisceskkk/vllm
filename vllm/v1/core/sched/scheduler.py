@@ -172,6 +172,7 @@ class Scheduler(SchedulerInterface):
         self.dcpp_length_threshold = self.scheduler_config.dcpp_length_threshold
         self.dcpp_min_chunk = self.scheduler_config.dcpp_min_chunk or 0
         self._maybe_init_dcpp(vllm_config)
+        self.use_multichunks = False
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -242,14 +243,29 @@ class Scheduler(SchedulerInterface):
                 dcpp_equitable_tokens = num_new_tokens
                 target_tokens = self.scheduler_config.long_prefill_token_threshold \
                     if self.scheduler_config.long_prefill_token_threshold > 0 else token_budget
-                num_new_tokens, dcpp_scheduled_chunk = self.attn_estimator.compute_chunk_size_with_overhead(
-                                                                        request.num_computed_tokens,
-                                                                        request.num_tokens,
-                                                                        target_tokens,
-                                                                        self.cache_config.block_size)
+                # does using token_budget as chunk_size to compute target_time make sense?
+                if self.use_multichunks:
+                    num_new_tokens, dcpp_scheduled_chunk, chunks_list = self.attn_estimator.compute_chunks_list_with_overhead(
+                                                                            request.num_computed_tokens,
+                                                                            request.num_tokens,
+                                                                            target_tokens,
+                                                                            self.cache_config.block_size)
+                else:
+                    num_new_tokens, dcpp_scheduled_chunk = self.attn_estimator.compute_chunk_size_with_overhead(
+                                                                            request.num_computed_tokens,
+                                                                            request.num_tokens,
+                                                                            target_tokens,
+                                                                            self.cache_config.block_size)
+                    chunks_list = [num_new_tokens]
                 # NOTE: Prevent short tail effect
                 floor = self.dcpp_min_chunk if self.dcpp_min_chunk and self.dcpp_min_chunk > 0 else 0
-                num_new_tokens = min(num_new_tokens, dcpp_equitable_tokens)
+                if num_new_tokens > dcpp_equitable_tokens:
+                    chunks_list[-1] -= num_new_tokens - dcpp_equitable_tokens 
+                    while chunks_list[-1] <= 0:
+                        chunks_list[-2] += chunks_list[-1]
+                        chunks_list.pop()
+                    num_new_tokens = dcpp_equitable_tokens
+                ## 
                 num_new_tokens = min(request.num_tokens - request.num_computed_tokens,
                                      max(floor, num_new_tokens))
                 request.dcpp_scheduled_chunk = dcpp_scheduled_chunk

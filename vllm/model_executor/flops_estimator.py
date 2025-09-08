@@ -195,6 +195,36 @@ class BaseModelEstimator(ABC):
         # do not exceed remaining tokens
         dcpp_chunk = min(dcpp_chunk, seq_len - hist_seq_len)
         return dcpp_chunk, scheduled_chunk
+
+    def compute_chunks_list_with_overhead(self,
+                                         hist_seq_len: int,
+                                         seq_len: int,
+                                         chunk_size: int,
+                                         block_size: int) -> tuple[int, int]:
+        """
+        Compute shortened chunks to offset long-KV attention overhead.
+
+        Returns (dcpp_chunk, scheduled_chunk):
+        - total_dcpp_chunk: total chunk length to run this step (block-aligned)
+        - scheduled_chunk: the baseline chunk length used for budgeting/accounting
+        - chunks_list: the list of actual reduced chunk lengthes
+        """
+        total_dcpp_chunk = 0
+        scheduled_chunk = 0
+        chunks_list = []
+        while total_dcpp_chunk < chunk_size // 2 and hist_seq_len+total_dcpp_chunk < seq_len:
+            dcpp_chunk, scheduled_chunk = self.compute_chunk_size_with_overhead(
+                hist_seq_len=hist_seq_len+total_dcpp_chunk,
+                seq_len=seq_len,
+                chunk_size=chunk_size,
+                block_size=block_size
+            )
+            chunks_list.append(dcpp_chunk)
+            total_dcpp_chunk += dcpp_chunk
+        # the second chunk length is strict not greater than the first length due to greater hist_seq_len
+        assert total_dcpp_chunk <= chunk_size, f"{total_dcpp_chunk} should not greater than {chunk_size}"
+        return total_dcpp_chunk, scheduled_chunk, chunks_list
+
     
     def estimate_flops_ratio(self, chunk_size: int, kv_cache_len: int, layer_idx: Optional[int] = None) -> float:
         """
@@ -876,11 +906,19 @@ def main():
     chunk_size = 2048
     hist_seq_len = 0
     block_size = 16
+    print("Test chunk split")
     while(hist_seq_len < seq_len):
         chunk_size_with_overhead = estimator.compute_chunk_size_with_overhead(
             hist_seq_len, seq_len, chunk_size, block_size)
         print(f"chunk_size_with_overhead = {chunk_size_with_overhead}")
         hist_seq_len += chunk_size_with_overhead[0]
+    hist_seq_len = 0
+    print("Test chunks split")
+    while(hist_seq_len < seq_len):
+        chunks_list_with_overhead = estimator.compute_chunks_list_with_overhead(
+            hist_seq_len, seq_len, chunk_size, block_size)
+        print(f"chunks_list_with_overhead = {chunks_list_with_overhead}")
+        hist_seq_len += chunks_list_with_overhead[0]
 
 if __name__ == "__main__":
     main()
