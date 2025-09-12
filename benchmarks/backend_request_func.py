@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import asyncio
 import io
 import json
 import os
@@ -305,20 +306,46 @@ async def async_request_openai_completions(
         generated_text = ""
         st = time.perf_counter()
         most_recent_timestamp = st
+        chunks_processed = 0
+        done_received = False
+        
         try:
             async with session.post(
                 url=api_url, json=payload, headers=headers
             ) as response:
                 if response.status == 200:
                     first_chunk_received = False
+                    
+                    # Add timeout mechanism for stream processing
+                    stream_timeout = 60.0  # 60 seconds for stream processing
+                    stream_start = time.perf_counter()
+                    
                     async for chunk_bytes in response.content:
+                        # Check for stream timeout
+                        if time.perf_counter() - stream_start > stream_timeout:
+                            output.success = False
+                            output.error = f"Stream processing timed out after {stream_timeout}s"
+                            break
+                            
                         chunk_bytes = chunk_bytes.strip()
                         if not chunk_bytes:
                             continue
 
-                        chunk = chunk_bytes.decode("utf-8").removeprefix("data: ")
-                        if chunk != "[DONE]":
+                        try:
+                            chunk_str = chunk_bytes.decode("utf-8")
+                            
+                            # Skip SSE comments (ping messages)
+                            if chunk_str.startswith(":"):
+                                continue
+                                
+                            chunk = chunk_str.removeprefix("data: ")
+                            
+                            if chunk == "[DONE]":
+                                done_received = True
+                                break
+                                
                             data = json.loads(chunk)
+                            chunks_processed += 1
 
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
@@ -342,19 +369,39 @@ async def async_request_openai_completions(
                                 generated_text += text or ""
                             if usage := data.get("usage"):
                                 output.output_tokens = usage.get("completion_tokens")
-                    if first_chunk_received:
+                                
+                        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                            # Log malformed chunks but continue processing
+                            print(f"Warning: Failed to process chunk: {e}")
+                            continue
+                    
+                    # Improved success criteria
+                    if first_chunk_received or done_received:
                         output.success = True
+                        # If we never got [DONE] but got chunks, still consider successful
+                        # but log a warning for debugging
+                        if not done_received and chunks_processed > 0:
+                            print(f"Warning: Completed without [DONE] marker, processed {chunks_processed} chunks")
                     else:
                         output.success = False
-                        output.error = (
-                            "Never received a valid chunk to calculate TTFT."
-                            "This response will be marked as failed!"
-                        )
+                        if chunks_processed == 0:
+                            output.error = (
+                                "Never received a valid chunk to calculate TTFT. "
+                                "This response will be marked as failed!"
+                            )
+                        else:
+                            output.error = (
+                                f"Processed {chunks_processed} chunks but no valid content found"
+                            )
+                    
                     output.generated_text = generated_text
                     output.latency = most_recent_timestamp - st
                 else:
                     output.error = response.reason or ""
                     output.success = False
+        except asyncio.TimeoutError:
+            output.success = False
+            output.error = "Request timed out"
         except Exception:
             output.success = False
             exc_info = sys.exc_info()
@@ -420,26 +467,45 @@ async def async_request_openai_chat_completions(
         ttft = 0.0
         st = time.perf_counter()
         most_recent_timestamp = st
+        chunks_processed = 0
+        done_received = False
+        
         try:
             async with session.post(
                 url=api_url, json=payload, headers=headers
             ) as response:
                 if response.status == 200:
+                    # Add timeout mechanism for stream processing
+                    stream_timeout = 60.0  # 60 seconds for stream processing
+                    stream_start = time.perf_counter()
+                    
                     async for chunk_bytes in response.content:
+                        # Check for stream timeout
+                        if time.perf_counter() - stream_start > stream_timeout:
+                            output.success = False
+                            output.error = f"Stream processing timed out after {stream_timeout}s"
+                            break
+                            
                         chunk_bytes = chunk_bytes.strip()
                         if not chunk_bytes:
                             continue
-                        chunk_bytes = chunk_bytes.decode("utf-8")
-                        # NOTE: SSE comments (often used as pings) start with a colon.
-                        # These are not JSON data payload and should be skipped.
-                        if chunk_bytes.startswith(":"):
-                            continue
+                            
+                        try:
+                            chunk_bytes = chunk_bytes.decode("utf-8")
+                            # NOTE: SSE comments (often used as pings) start with a colon.
+                            # These are not JSON data payload and should be skipped.
+                            if chunk_bytes.startswith(":"):
+                                continue
 
-                        chunk = chunk_bytes.removeprefix("data: ")
+                            chunk = chunk_bytes.removeprefix("data: ")
 
-                        if chunk != "[DONE]":
+                            if chunk == "[DONE]":
+                                done_received = True
+                                break
+                                
                             timestamp = time.perf_counter()
                             data = json.loads(chunk)
+                            chunks_processed += 1
 
                             if choices := data.get("choices"):
                                 content = choices[0]["delta"].get("content")
@@ -457,13 +523,32 @@ async def async_request_openai_chat_completions(
                                 output.output_tokens = usage.get("completion_tokens")
 
                             most_recent_timestamp = timestamp
+                            
+                        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                            # Log malformed chunks but continue processing
+                            print(f"Warning: Failed to process chunk: {e}")
+                            continue
 
                     output.generated_text = generated_text
-                    output.success = True
+                    
+                    # Improved success criteria
+                    if ttft > 0.0 or done_received or chunks_processed > 0:
+                        output.success = True
+                        # If we never got [DONE] but got chunks, still consider successful
+                        # but log a warning for debugging
+                        if not done_received and chunks_processed > 0:
+                            print(f"Warning: Completed without [DONE] marker, processed {chunks_processed} chunks")
+                    else:
+                        output.success = False
+                        output.error = f"No valid content received, processed {chunks_processed} chunks"
+                    
                     output.latency = most_recent_timestamp - st
                 else:
                     output.error = response.reason or ""
                     output.success = False
+        except asyncio.TimeoutError:
+            output.success = False
+            output.error = "Request timed out"
         except Exception:
             output.success = False
             exc_info = sys.exc_info()
