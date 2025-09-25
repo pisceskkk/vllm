@@ -27,7 +27,8 @@ from vllm.distributed.device_communicators.shm_broadcast import (Handle,
                                                                  MessageQueue)
 from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
 from vllm.distributed.parallel_state import (get_dp_group, get_ep_group,
-                                             get_pp_group, get_tp_group)
+                                             get_pp_group, get_tp_group,
+                                             get_cp_group)
 from vllm.executor.multiproc_worker_utils import (
     set_multiprocessing_worker_envs)
 from vllm.logger import init_logger
@@ -669,11 +670,15 @@ class WorkerProc:
         pp_rank = get_pp_group().rank_in_group
         tp_size = get_tp_group().world_size
         tp_rank = get_tp_group().rank_in_group
+        cp_size = get_cp_group().world_size
+        cp_rank = get_cp_group().rank_in_group
         process_name = "Worker"
         if dp_size > 1:
             process_name += f"_DP{dp_rank}"
         if pp_size > 1:
             process_name += f"_PP{pp_rank}"
+        if cp_size > 1:
+            process_name += f"_CP{cp_rank}"
         if tp_size > 1:
             process_name += f"_TP{tp_rank}"
         if enable_ep:
