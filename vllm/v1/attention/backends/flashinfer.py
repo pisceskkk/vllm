@@ -592,10 +592,42 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     if self.cp_world_size > 1:
                         # 不考虑prefix cache和chunk prefill，all gather kv后
                         kv_indptr_cpu = qo_indptr_cpu * self.cp_world_size
-                        # TODO 计算custom_mask
+                        # init custom mask for head-tail query order
+                        mask_arr = []
+                        total_lens = seq_lens_cpu[prefill_start:
+                                        prefill_start + num_prefills
+                                        ].to(torch.int64).tolist()
+                        q_ids = common_attn_metadata.input_ids[1:]
+                        for i in range(num_prefills):
+                            # |----<C>-----|-<Q0>-|-<Q1>-|
+                            # |-----------<T>------------|
+                            # T = 12
+                            # Q = 2
+                            # cp_world_size = 2
+                            # C = 8
+                            # cur_q_ids = [0,3]
+                            # context_mask_i.shape = (2, 8)
+                            # upper = [0,1,2,3]
+                            # local_mask_i = [[True, False, False, False], 
+                            #                 [True, True, True, True]], size=(2, 4)
+                            # mask_i.shape = (2, 12)
+                            cur_q_ids = q_ids[qo_indptr_cpu[i]:qo_indptr_cpu[i+1]]
+                            T = int(total_lens[i])
+                            Q = len(cur_q_ids)
+                            C = T - Q * self.cp_world_size
+                            if Q <= 0:
+                                mask_arr.append(torch.zeros(0, dtype=torch.bool))
+                                continue
+                            context_mask_i = torch.ones((Q, C), dtype=torch.bool)
+                            upper = torch.arange(Q*self.cp_world_size)
+                            local_mask_i = (upper.unsqueeze(0) <= cur_q_ids.unsqueeze(1))
+                            mask_i = torch.cat([context_mask_i, local_mask_i], dim=1)
+                            mask_arr.append(mask_i.flatten())
+                        custom_mask = torch.cat(mask_arr, dim=0).to(self.device)
+
                         attn_metadata.prefill_wrapper.plan(
-                            qo_indptr_cpu,
-                            kv_indptr_cpu,
+                            qo_indptr_cpu.to(self.device),
+                            kv_indptr_cpu.to(self.device),
                             self.num_qo_heads,
                             self.num_kv_heads,
                             self.head_dim,
@@ -894,12 +926,18 @@ class FlashInferImpl(AttentionImpl):
                     self.logits_soft_cap or 0.0)
                 assert prefill_wrapper._sm_scale == self.scale
                 if self.cp_world_size > 1:
-                    key_across_cp = get_cp_group.all_gather(
+                    key_across_cp = get_cp_group().all_gather(
                         key[num_decode_tokens:].contiguous())
-                    value_across_cp = get_cp_group.all_gather(
+                    value_across_cp = get_cp_group().all_gather(
                         value[num_decode_tokens:].contiguous())
-                    #TODO 按sequence重排KV
-
+                    key_across_cp = torch.index_select(
+                        key_across_cp, 0,
+                        attn_metadata.prefill.cp_kv_recover_idx
+                    )
+                    value_across_cp = torch.index_select(
+                        value_across_cp, 0,
+                        attn_metadata.prefill.cp_kv_recover_idx
+                    )
                     torch.ops._C_cache_ops.reshape_and_cache_flash(
                         key_across_cp,
                         value_across_cp,
@@ -910,7 +948,8 @@ class FlashInferImpl(AttentionImpl):
                         layer._k_scale,
                         layer._v_scale,
                     )
-
+                    # TODO(qcs): 考虑 chunked prefill/ prefix cache 情况下
+                    # kvcache的获取与拼接
                     prefill_wrapper.run(
                         prefill_query,
                         key_across_cp,
