@@ -1970,6 +1970,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
 
     def _get_num_input_tokens(self, num_scheduled_tokens: int) -> int:
+        cp_size = self.vllm_config.parallel_config.context_parallel_size
+        if cp_size > 1:
+            # TODO(qcs): check if it is proper to div cp_world_size here
+            return cdiv(num_scheduled_tokens, self.cp_world_size * 2) * 2
         if (self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
                 and not envs.VLLM_DISABLE_PAD_FOR_CUDAGRAPH
                 and hasattr(self, "cudagraph_batch_sizes")
@@ -2008,8 +2012,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             num_pad, num_tokens_after_padding = self.get_dp_padding(
                 num_input_tokens)
             num_input_tokens += num_pad
-            # TODO(qcs): check if it is proper to div cp_world_size here
-            num_input_tokens = cdiv(num_input_tokens, self.cp_world_size)
 
         # _prepare_inputs may reorder the batch, so we must gather multi
         # modal outputs after that to ensure the correct order
