@@ -241,34 +241,46 @@ class Scheduler(SchedulerInterface):
                 # Shorten length to reduce long kv history effect
                 # Target execution time is num_new_tokens execution time without history
                 dcpp_equitable_tokens = num_new_tokens
-                target_tokens = self.scheduler_config.long_prefill_token_threshold \
+                total_tokens = self.scheduler_config.long_prefill_token_threshold \
                     if self.scheduler_config.long_prefill_token_threshold > 0 else token_budget
+                target_tokens = min(token_budget, self.max_num_scheduled_tokens // 8)
                 # does using token_budget as chunk_size to compute target_time make sense?
                 if self.use_multichunks:
-                    num_new_tokens, dcpp_scheduled_chunk, chunks_list = self.attn_estimator.compute_chunks_list_with_overhead(
-                                                                            request.num_computed_tokens,
-                                                                            request.num_tokens,
-                                                                            target_tokens,
-                                                                            self.cache_config.block_size)
+                    num_new_tokens, dcpp_scheduled_chunk, chunks_list = \
+                        self.attn_estimator.compute_chunks_list_with_overhead(
+                            request.num_computed_tokens,
+                            request.num_tokens,
+                            self.max_num_scheduled_toekns//4,
+                            token_budget,
+                            self.max_num_scheduled_toekns,
+                            self.cache_config.block_size)
                 else:
-                    num_new_tokens, dcpp_scheduled_chunk = self.attn_estimator.compute_chunk_size_with_overhead(
-                                                                            request.num_computed_tokens,
-                                                                            request.num_tokens,
-                                                                            target_tokens,
-                                                                            self.cache_config.block_size)
+                    num_new_tokens, dcpp_scheduled_chunk = \
+                        self.attn_estimator.compute_chunk_size_with_overhead(
+                            request.num_computed_tokens,
+                            request.num_tokens,
+                            target_tokens,
+                            self.cache_config.block_size)
                     chunks_list = [num_new_tokens]
                 # NOTE: Prevent short tail effect
                 floor = self.dcpp_min_chunk if self.dcpp_min_chunk and self.dcpp_min_chunk > 0 else 0
-                if num_new_tokens > dcpp_equitable_tokens:
-                    chunks_list[-1] -= num_new_tokens - dcpp_equitable_tokens 
+                def _update_chunks_list(chunks_list, total_tokens, target_tokens): 
+                    # decase total_tokens to target_tokens
+                    chunks_list[-1] -= total_tokens - target_tokens
                     while chunks_list[-1] <= 0:
                         chunks_list[-2] += chunks_list[-1]
                         chunks_list.pop()
-                    num_new_tokens = dcpp_equitable_tokens
-                ## 
-                num_new_tokens = min(request.num_tokens - request.num_computed_tokens,
-                                     max(floor, num_new_tokens))
+                    return chunks_list, target_tokens
+                    
+                if num_new_tokens > dcpp_equitable_tokens:
+                    chunks_list, num_new_tokens = _update_chunks_list(chunks_list, num_new_tokens, dcpp_equitable_tokens)
+                if num_new_tokens < floor:
+                    chunks_list[-1] += floor - num_new_tokens
+                    num_new_tokens = floor
+                if num_new_tokens > request.num_tokens - request.num_computed_tokens:
+                    chunks_list, num_new_tokens = _update_chunks_list(chunks_list, num_new_tokens, request.num_tokens - request.num_computed_tokens)
                 request.dcpp_scheduled_chunk = dcpp_scheduled_chunk
+                request.chunks_list = chunks_list
                 logger.debug(
                     "DCPP adjusted chunk from %d to %d (hist=%d, total=%d)",
                     dcpp_equitable_tokens, num_new_tokens, request.num_computed_tokens, request.num_tokens)
@@ -698,6 +710,7 @@ class Scheduler(SchedulerInterface):
         new_token_ids: list[list[int]] = []
         new_block_ids: list[Optional[tuple[list[int], ...]]] = []
         num_computed_tokens: list[int] = []
+        chunks_lists: list[list[int]] = []
 
         use_connector = self.connector is not None
         for req in itertools.chain(running_reqs, resumed_reqs):
@@ -722,6 +735,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids.append(
                 req_to_new_blocks[req_id].get_block_ids(allow_none=True))
             num_computed_tokens.append(req.num_computed_tokens)
+            chunks_lists.append(req.chunks_list)
         # Because resumed_reqs is usually empty, it is more efficient to do
         # in-place appending so that we don't need to allocate a new list.
         resumed_from_preemption = [False] * len(running_reqs)
@@ -733,6 +747,7 @@ class Scheduler(SchedulerInterface):
             new_token_ids=new_token_ids,
             new_block_ids=new_block_ids,
             num_computed_tokens=num_computed_tokens,
+            chunks_lists=chunks_lists,
         )
 
     def _try_schedule_encoder_inputs(

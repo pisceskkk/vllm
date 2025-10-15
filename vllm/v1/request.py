@@ -41,7 +41,8 @@ class Request:
         block_hasher: Optional[Callable[["Request"],
                                         list["BlockHash"]]] = None,
         is_dcpp: Optional[bool] = False,
-        dcpp_scheduled_chunk: Optional[int] = 0
+        dcpp_scheduled_chunk: Optional[int] = 0,
+        chunks_list: list[int] = []
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -118,6 +119,7 @@ class Request:
 
         self.is_dcpp = is_dcpp
         self.dcpp_scheduled_chunk = dcpp_scheduled_chunk
+        self.chunks_list = chunks_list
 
         self.block_hashes: list[BlockHash] = []
         self.get_hash_new_full_blocks: Optional[Callable[

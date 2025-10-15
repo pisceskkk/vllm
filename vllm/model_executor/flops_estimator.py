@@ -200,6 +200,8 @@ class BaseModelEstimator(ABC):
                                          hist_seq_len: int,
                                          seq_len: int,
                                          chunk_size: int,
+                                         remained_budget: int,
+                                         total_budget: int,
                                          block_size: int) -> tuple[int, int]:
         """
         Compute shortened chunks to offset long-KV attention overhead.
@@ -211,8 +213,11 @@ class BaseModelEstimator(ABC):
         """
         total_dcpp_chunk = 0
         scheduled_chunk = 0
+        ratio = 1 - min(max(total_budget / seq_len, 1/5), 1)
+        if ratio == 0:
+            ratio = 1
         chunks_list = []
-        while total_dcpp_chunk < chunk_size // 2 and hist_seq_len+total_dcpp_chunk < seq_len:
+        while total_dcpp_chunk < total_budget * ratio and total_dcpp_chunk < remained_budget and hist_seq_len+total_dcpp_chunk < seq_len:
             dcpp_chunk, scheduled_chunk = self.compute_chunk_size_with_overhead(
                 hist_seq_len=hist_seq_len+total_dcpp_chunk,
                 seq_len=seq_len,
@@ -221,8 +226,9 @@ class BaseModelEstimator(ABC):
             )
             chunks_list.append(dcpp_chunk)
             total_dcpp_chunk += dcpp_chunk
-        # the second chunk length is strict not greater than the first length due to greater hist_seq_len
-        assert total_dcpp_chunk <= chunk_size, f"{total_dcpp_chunk} should not greater than {chunk_size}"
+        if total_dcpp_chunk > remained_budget:
+            chunks_list[-1] -= total_dcpp_chunk - remained_budget
+            total_dcpp_chunk = remained_budget
         return total_dcpp_chunk, scheduled_chunk, chunks_list
 
     
@@ -904,19 +910,20 @@ def main():
     estimator.configure_baseline_from_scheduler(None)
     seq_len = 128000
     chunk_size = 2048
+    budget_size = 8 * 1024
     hist_seq_len = 0
     block_size = 16
     print("Test chunk split")
     while(hist_seq_len < seq_len):
         chunk_size_with_overhead = estimator.compute_chunk_size_with_overhead(
-            hist_seq_len, seq_len, chunk_size, block_size)
+            hist_seq_len, seq_len, budget_size, block_size)
         print(f"chunk_size_with_overhead = {chunk_size_with_overhead}")
         hist_seq_len += chunk_size_with_overhead[0]
     hist_seq_len = 0
     print("Test chunks split")
     while(hist_seq_len < seq_len):
         chunks_list_with_overhead = estimator.compute_chunks_list_with_overhead(
-            hist_seq_len, seq_len, chunk_size, block_size)
+            hist_seq_len, seq_len, chunk_size, budget_size, budget_size, block_size)
         print(f"chunks_list_with_overhead = {chunks_list_with_overhead}")
         hist_seq_len += chunks_list_with_overhead[0]
 
