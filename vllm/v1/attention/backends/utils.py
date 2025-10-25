@@ -48,6 +48,22 @@ PAD_SLOT_ID = -1
 def is_valid_kv_cache_layout(value: str) -> bool:
     return value in get_args(KVCacheLayoutType)
 
+@dataclass
+class PrefillContextParallelMetadata:
+    """
+    Attention metadata for prefill context parallel
+    """
+    q_head_indices: torch.Tensor
+    q_tail_indices: torch.Tensor
+    q_head_start_loc: torch.Tensor
+    kv_nomask_for_head_indices: torch.Tensor
+    kv_mask_for_head_indices : torch.Tensor
+    kv_nomask_for_tail_indices: torch.Tensor
+    kv_mask_for_tail_indices: torch.Tensor
+    kv_nomask_for_head_indptr: torch.Tensor
+    kv_mask_for_head_indptr: torch.Tensor
+    kv_nomask_for_tail_indptr: torch.Tensor
+    kv_mask_for_tail_indptr: torch.Tensor
 
 @dataclass
 class CommonAttentionMetadata:
@@ -97,6 +113,7 @@ class CommonAttentionMetadata:
     # Needed by custom mask calc for context parallelism
     query_positions: np.ndarray | None = None
     pcp_allgather_restore_idx: torch.Tensor | None = None
+    pcp_metadata: PrefillContextParallelMetadata | None = None
 
 
 def slice_query_start_locs(
