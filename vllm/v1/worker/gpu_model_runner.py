@@ -948,51 +948,107 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         return self._get_mm_dummy_batch(dummy_modality, num_seqs)
 
     def _get_pcp_metadata(self, q_lens, kv_lens):
-        pcp_chunk_sizes = q_lens // 2
-        q_head_start_loc, q_chunk_arange self._get_cumsum_and_arange(q_lens)
-        q_tail_start_loc = q_head_start_loc + pcp_chunk_sizes
+        # q_lens [4, 8]  kv_lens [8, 16]
+        pcp_chunk_sizes = q_lens // 2  # [2, 4]
+        q_indptr = np.zeros(len(pcp_chunk_sizes) + 1)  # [0, 0, 0]
+        q_indptr[1:], q_chunk_arange = self._get_cumsum_and_arange(pcp_chunk_sizes)  # [0, 2, 4] [0, 1, 0, 1, 2, 3]
 
+        q_head_start_loc = np.roll(np.cumsum(q_lens), 1) # [4, 12] -> [12, 4]
+        q_head_start_loc[0] = 0  # [0, 4]
         q_head_indices = q_chunk_arange + np.repeat(
             q_head_start_loc,
             pcp_chunk_sizes,
-        )
+        )  # [0, 1, 0, 1, 2, 3] + [0, 0, 4, 4, 4, 4] = [0, 1, 4, 5, 6, 7]
+
+        q_tail_start_loc = q_head_start_loc + pcp_chunk_sizes # [0, 4] + [2, 4] = [2, 8]
         q_tail_indices = q_chunk_arange + np.repeat(
             q_tail_start_loc,
             pcp_chunk_sizes,
+        )  # [0, 1, 0, 1, 2, 3] + [2, 2, 8, 8, 8, 8] = [2, 3, 8, 9, 10, 11]
+
+        kv_start_loc = np.roll(np.cumsum(kv_lens), 1)  # [8, 24] -> [24, 8]
+        kv_start_loc[0] = 0  # [0, 8]
+        # kv_for_q_head_nomask
+        kv_head_nomask_len = pcp_chunk_sizes * self.pcp_rank  # r0 [0, 0] r1 [2, 4]
+        kv_nomask_for_head_indptr = np.zeros(len(kv_head_nomask_len) + 1)  # [0, 0, 0]
+        kv_nomask_for_head_indptr[1:], kv_nomask_head_arange = self._get_cumsum_and_arange(kv_head_nomask_len)  # r0 [0, 0, 0] [] / r1 [0, 2, 6] [0, 1, 0, 1, 2, 3]
+        kv_nomask_for_head_indices = kv_nomask_head_arange + np.repeat(
+            kv_start_loc,
+            kv_head_nomask_len,
+        )  # r0 [] / r1 [0, 1, 0, 1, 2, 3] + [0, 0, 8, 8, 8, 8] = [0, 1, 8, 9, 10, 11]
+
+        # kv_for_q_head_mask
+        kv_mask_for_head_indptr = np.zeros(len(pcp_chunk_sizes) + 1)  # [0, 0, 0]
+        kv_mask_for_head_indptr[1:], kv_mask_head_arange = self._get_cumsum_and_arange(pcp_chunk_sizes) # [0, 2, 6] [0, 1, 0, 1, 2, 3]
+        kv_mask_for_head_start_loc = kv_start_loc + kv_head_nomask_len  # r0 [0, 8] / r1 [2, 12]
+        kv_mask_for_head_indices = kv_mask_head_arange + np.repeat(
+            kv_mask_for_head_start_loc,
+            pcp_chunk_sizes,
+        )  # r0 [0, 1, 0, 1, 2, 3] + [0, 0, 8, 8, 8, 8] = [0, 1, 8, 9, 10, 11] / r1 + [2, 2, 12, 12, 12, 12] = [2, 3, 12, 13, 14, 15]
+
+        # kv_for_q_tail_nomask
+        kv_tail_nomask_len = pcp_chunk_sizes * (2 * self.pcp_world_size - 1 - self.pcp_rank)  # r0 [6, 12] / r1 [4, 8]
+        kv_nomask_for_tail_indptr = np.zeros(len(kv_tail_nomask_len) + 1)
+        # r0 [0, 6, 18] [0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        # r1 [0, 4, 12] [0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 6, 7]
+        kv_nomask_for_tail_indptr[1:], kv_nomask_tail_arange = self._get_cumsum_and_arange(kv_tail_nomask_len)
+        # r0 [0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11] + [0, .., 8, ..] = [0, 1,.., 5, 8, 9, ..., 19]
+        # r1 [0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 6, 7] + [] = [0, 1, 2, 3, 8, 9, .., 15]
+        kv_nomask_for_tail_indices = kv_nomask_tail_arange + np.repeat(
+            kv_start_loc,
+            kv_tail_nomask_len,
+        )
+
+        # kv_for_q_tail_mask
+        kv_mask_for_tail_indptr = np.zeros(len(pcp_chunk_sizes) + 1)
+        kv_mask_for_tail_indptr[1:], kv_mask_tail_arange = self._get_cumsum_and_arange(pcp_chunk_sizes)  # [0, 2, 4] [0, 1, 0, 1, 2, 3]
+        kv_mask_for_tail_start_loc = kv_start_loc + kv_tail_nomask_len # r0 [0, 8] + [6, 12] = [6, 20] / r1 [0, 8] + [4, 8] = [4, 16]
+        # r0 [0, 1, 0, 1, 2, 3] + [6, 6, 20, 20, 20, 20] = [6, 7, 20, 21, 22, 23]
+        # r1 [0, 1, 0, 1, 2, 3] + [4, 4, 16, 16, 16, 16] = [4, 5, 16, 17, 18, 19]
+        kv_mask_for_tail_indices = kv_mask_tail_arange + np.repeat(
+            kv_mask_for_tail_start_loc,
+            pcp_chunk_sizes,
         )
         
-        kv_start_loc, _ = self._get_cumsum_and_arange(kv_lens)
-        def _get_kv_pos(partial_kv_lens):
-            partial_kv_indptr, arange = self._get_cumsum_and_arange(partial_kv_lens)
-            partial_kv_pos = arange + np.repeat(
-                kv_start_loc,
-                partial_kv_lens,
+        head_tail_indices = {
+            "q_head": q_head_indices,
+            "q_tail": q_tail_indices,
+            "kv_nomask_head": kv_nomask_for_head_indices,
+            "kv_nomask_tail": kv_nomask_for_tail_indices,
+            "kv_mask_head": kv_mask_for_head_indices,
+            "kv_mask_tail": kv_mask_for_tail_indices
+        }
+        head_tail_indptr = {
+            "q": q_indptr,
+            "kv_nomask_head": kv_nomask_for_head_indptr,
+            "kv_mask_head": kv_mask_for_head_indptr,
+            "kv_nomask_tail": kv_nomask_for_tail_indptr,
+            "kv_mask_tail": kv_mask_for_tail_indptr
+        }
+
+        for key, value in head_tail_indices.items():
+            head_tail_indices[key] = torch.from_numpy(value).to(
+                device=self.device, dtype=torch.int64, non_blocking=True
             )
-            return partial_kv_pos, partial_kv_indptr
-        kv_nomask_for_head_indices, kv_nomask_for_head_indptr = _get_kv_pos(
-            pcp_chunk_sizes * self.pcp_rank
-        )
-        kv_mask_for_head_indices, kv_mask_for_head_indptr = _get_kv_pos(
-            pcp_chunk_sizes * (self.pcp_rank + 1)
-        )
-        kv_nomask_for_tail_indices, kv_nomask_for_tail_indptr = _get_kv_pos(
-            pcp_chunk_sizes * (self.pcp_world_size - self.pcp_rank - 1)
-        )
-        kv_mask_for_tail_indices, kv_mask_for_tail_indptr = _get_kv_pos(
-            pcp_chunk_sizes * (self.pcp_world_size - self.pcp_rank)
-        )
+        
+        for key, value in head_tail_indptr.items():
+            head_tail_indptr[key] = torch.from_numpy(value).to(
+                dtype=torch.int64
+            )
+            # print(f"pcp_rank{self.pcp_rank}", key, head_tail_indptr[key])
+
         return PrefillContextParallelMetadata(
-            q_head_indices=q_head_indices,
-            q_tail_indices=q_tail_indices,
-            q_head_start_loc=q_head_start_loc,
-            kv_nomask_for_head_indices=kv_nomask_for_head_indices,
-            kv_mask_for_head_indices=kv_mask_for_head_indices, 
-            kv_nomask_for_tail_indices=kv_nomask_for_tail_indices,
-            kv_mask_for_tail_indices=kv_mask_for_tail_indices,
-            kv_nomask_for_head_indptr=kv_nomask_for_head_indptr,
-            kv_mask_for_head_indptr=kv_mask_for_head_indptr,
-            kv_nomask_for_tail_indptr=kv_nomask_for_tail_indptr,
-            kv_mask_for_tail_indptr=kv_mask_for_tail_indptr,
+            q_head_indices=head_tail_indices["q_head"],
+            q_tail_indices=head_tail_indices["q_tail"],
+            q_head_start_loc=head_tail_indptr["q"],
+            kv_nomask_for_head_indices=head_tail_indices["kv_nomask_head"],
+            kv_mask_for_head_indices=head_tail_indices["kv_mask_head"],
+            kv_nomask_for_tail_indices=head_tail_indices["kv_nomask_tail"],
+            kv_mask_for_tail_indices=head_tail_indices["kv_mask_tail"],
+            kv_nomask_for_head_indptr=head_tail_indptr["kv_nomask_head"],
+            kv_mask_for_head_indptr=head_tail_indptr["kv_mask_head"],
+            kv_nomask_for_tail_indptr=head_tail_indptr["kv_nomask_tail"],
+            kv_mask_for_tail_indptr=head_tail_indptr["kv_mask_tail"],
         )
         
     def _update_tokens_for_pcp(self, tokens):
@@ -1096,10 +1152,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         return (
             pcp_tokens,
             positions, 
-            _get_pcp_metadata(
+            self._get_pcp_metadata(
                 pcp_tokens[num_decode_reqs:],
                 num_padded_scheduled_tokens[num_decode_reqs:],
-            ),
+            ) if num_reqs > num_decode_reqs
+            else None,
         )
 
     def _get_cumsum_and_arange(
@@ -1437,11 +1494,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # from these partial requests, we do so for simplicity.
             # We will ignore the sampled tokens from the partial requests.
             # TODO: Support prompt logprobs.
-            logits_indices = (
-                torch.from_numpy(cu_num_tokens) * self.pcp_world_size
-                - self.num_pcp_pads_cpu_tensor[:num_reqs]
-                - 1
-            )
+            if self.pcp_world_size > 1:
+                logits_indices = (
+                    torch.from_numpy(cu_num_tokens) * self.pcp_world_size
+                    - self.num_pcp_pads_cpu_tensor[:num_reqs]
+                    - 1
+                )
+            else:
+                logits_indices = query_start_loc[1:] - 1
             num_draft_tokens = None
             spec_decode_metadata = None
         else:
@@ -3569,7 +3629,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             )
             self.query_start_loc.np[1 : num_reqs + 1] = cum_num_tokens
             self.query_start_loc.copy_to_gpu()
-
+            
+            # pcp_metadata = None
+            # if self.pcp_world_size > 1:
+            #     num_decode_reqs = sum(num_scheduled_tokens == 1)
+            #     pcp_metadata = self._get_pcp_metadata(
+            #         num_scheduled_tokens[num_decode_reqs:],
+            #         self.seq_lens.np[num_decode_reqs:num_reqs],
+            #     )
             for kv_cache_group_id, kv_cache_group_spec in enumerate(
                 self.kv_cache_config.kv_cache_groups
             ):
@@ -3593,9 +3660,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     ].slot_mapping.gpu[:num_tokens],
                     causal=True,
                     query_positions=query_positions,
+                    pcp_metadata=None,
                     pcp_allgather_restore_idx=self.pcp_allgather_restore_idx.gpu[
                         : total_num_scheduled_tokens * self.pcp_world_size
-                    ],
+                    ] if self.pcp_world_size > 1
+                    else None,
                     dcp_local_seq_lens=self.dcp_local_seq_lens.gpu[:num_reqs]
                     if self.dcp_world_size > 1
                     else None,
