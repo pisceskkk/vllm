@@ -64,6 +64,7 @@ class PrefillContextParallelMetadata:
     kv_mask_for_head_indptr: torch.Tensor
     kv_nomask_for_tail_indptr: torch.Tensor
     kv_mask_for_tail_indptr: torch.Tensor
+    q_full_indices: torch.Tensor
 
 @dataclass
 class CommonAttentionMetadata:
