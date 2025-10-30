@@ -948,84 +948,75 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         return self._get_mm_dummy_batch(dummy_modality, num_seqs)
 
     def _get_pcp_metadata(self, q_lens, kv_lens):
-        # q_lens [4, 8]  kv_lens [8, 16]
-        pcp_chunk_sizes = q_lens // 2  # [2, 4]
-        q_indptr = np.zeros(len(pcp_chunk_sizes) + 1)  # [0, 0, 0]
-        q_indptr[1:], q_chunk_arange = self._get_cumsum_and_arange(pcp_chunk_sizes)  # [0, 2, 4] [0, 1, 0, 1, 2, 3]
+        """
+        During the prefill phrase, the attention computation is divided into
+        two parts: q_head and q_tail. Here, we calculate the kv indices 
+        corresponding to q_head or q_tail. Meawhile, the q and kv indptr are 
+        also computed to build the attention wrapper.
+        If the pcp_size is 2, the variables are following:
+        >>> q_lens [4, 8]  kv_lens [8, 16]
+        >>> pcp_chunk_sizes[2, 4]
+        >>> q_indptr [0, 2, 4]
+        >>> q_head_indices [0, 1, 4, 5, 6, 7] q_tail_indices [2, 3, 8, 9, 10, 11]
+        >>> kv_head_len r0 [2, 4] / r1 [4, 8]
+        >>> kv_for_head_indptr r0 [0, 2, 6] / r1 [0, 4, 12]
+        >>> kv_for_head_indices r0 [0, 1, 8, 9, 10, 11]
+        >>> r1 [0, 1, 2, 3, 8, 9, 10, 11, 12, 13, 14, 15]
+        >>> kv_tail_len r0 [8, 16] / r1 [6, 12]
+        >>> kv_for_tail_indptr r0 [0, 8, 24] / r1 [0, 6, 18]
+        >>> kv_for_tail_indices r0 [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, ..., 23]
+        >>> r1 [0, 1, 2, 3, 4, 5, 8, 9, ..., 19]
+        """
+        pcp_chunk_sizes = q_lens // 2  
+        q_indptr = np.zeros(len(pcp_chunk_sizes) + 1)
+        q_indptr[1:], q_chunk_arange = self._get_cumsum_and_arange(pcp_chunk_sizes)
 
-        q_head_start_loc = np.roll(np.cumsum(q_lens), 1) # [4, 12] -> [12, 4]
+        # [4, 12] -> [12, 4]
+        q_head_start_loc = np.roll(np.cumsum(q_lens), 1)
         q_head_start_loc[0] = 0  # [0, 4]
         q_head_indices = q_chunk_arange + np.repeat(
             q_head_start_loc,
             pcp_chunk_sizes,
-        )  # [0, 1, 0, 1, 2, 3] + [0, 0, 4, 4, 4, 4] = [0, 1, 4, 5, 6, 7]
+        )
 
-        q_tail_start_loc = q_head_start_loc + pcp_chunk_sizes # [0, 4] + [2, 4] = [2, 8]
+        # [0, 4] + [2, 4] = [2, 8]
+        q_tail_start_loc = q_head_start_loc + pcp_chunk_sizes
         q_tail_indices = q_chunk_arange + np.repeat(
             q_tail_start_loc,
             pcp_chunk_sizes,
-        )  # [0, 1, 0, 1, 2, 3] + [2, 2, 8, 8, 8, 8] = [2, 3, 8, 9, 10, 11]
-
-        kv_start_loc = np.roll(np.cumsum(kv_lens), 1)  # [8, 24] -> [24, 8]
-        kv_start_loc[0] = 0  # [0, 8]
-        # kv_for_q_head_nomask
-        kv_head_nomask_len = pcp_chunk_sizes * self.pcp_rank  # r0 [0, 0] r1 [2, 4]
-        kv_nomask_for_head_indptr = np.zeros(len(kv_head_nomask_len) + 1)  # [0, 0, 0]
-        kv_nomask_for_head_indptr[1:], kv_nomask_head_arange = self._get_cumsum_and_arange(kv_head_nomask_len)  # r0 [0, 0, 0] [] / r1 [0, 2, 6] [0, 1, 0, 1, 2, 3]
-        kv_nomask_for_head_indices = kv_nomask_head_arange + np.repeat(
-            kv_start_loc,
-            kv_head_nomask_len,
-        )  # r0 [] / r1 [0, 1, 0, 1, 2, 3] + [0, 0, 8, 8, 8, 8] = [0, 1, 8, 9, 10, 11]
-
-        # kv_for_q_head_mask
-        kv_mask_for_head_indptr = np.zeros(len(pcp_chunk_sizes) + 1)  # [0, 0, 0]
-        kv_mask_for_head_indptr[1:], kv_mask_head_arange = self._get_cumsum_and_arange(pcp_chunk_sizes) # [0, 2, 6] [0, 1, 0, 1, 2, 3]
-        kv_mask_for_head_start_loc = kv_start_loc + kv_head_nomask_len  # r0 [0, 8] / r1 [2, 12]
-        kv_mask_for_head_indices = kv_mask_head_arange + np.repeat(
-            kv_mask_for_head_start_loc,
-            pcp_chunk_sizes,
-        )  # r0 [0, 1, 0, 1, 2, 3] + [0, 0, 8, 8, 8, 8] = [0, 1, 8, 9, 10, 11] / r1 + [2, 2, 12, 12, 12, 12] = [2, 3, 12, 13, 14, 15]
-
-        # kv_for_q_tail_nomask
-        kv_tail_nomask_len = pcp_chunk_sizes * (2 * self.pcp_world_size - 1 - self.pcp_rank)  # r0 [6, 12] / r1 [4, 8]
-        kv_nomask_for_tail_indptr = np.zeros(len(kv_tail_nomask_len) + 1)
-        # r0 [0, 6, 18] [0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
-        # r1 [0, 4, 12] [0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 6, 7]
-        kv_nomask_for_tail_indptr[1:], kv_nomask_tail_arange = self._get_cumsum_and_arange(kv_tail_nomask_len)
-        # r0 [0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11] + [0, .., 8, ..] = [0, 1,.., 5, 8, 9, ..., 19]
-        # r1 [0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 6, 7] + [] = [0, 1, 2, 3, 8, 9, .., 15]
-        kv_nomask_for_tail_indices = kv_nomask_tail_arange + np.repeat(
-            kv_start_loc,
-            kv_tail_nomask_len,
         )
 
-        # kv_for_q_tail_mask
-        kv_mask_for_tail_indptr = np.zeros(len(pcp_chunk_sizes) + 1)
-        kv_mask_for_tail_indptr[1:], kv_mask_tail_arange = self._get_cumsum_and_arange(pcp_chunk_sizes)  # [0, 2, 4] [0, 1, 0, 1, 2, 3]
-        kv_mask_for_tail_start_loc = kv_start_loc + kv_tail_nomask_len # r0 [0, 8] + [6, 12] = [6, 20] / r1 [0, 8] + [4, 8] = [4, 16]
-        # r0 [0, 1, 0, 1, 2, 3] + [6, 6, 20, 20, 20, 20] = [6, 7, 20, 21, 22, 23]
-        # r1 [0, 1, 0, 1, 2, 3] + [4, 4, 16, 16, 16, 16] = [4, 5, 16, 17, 18, 19]
-        kv_mask_for_tail_indices = kv_mask_tail_arange + np.repeat(
-            kv_mask_for_tail_start_loc,
-            pcp_chunk_sizes,
+        # [8, 24] -> [24, 8]
+        kv_start_loc = np.roll(np.cumsum(kv_lens), 1)
+        kv_start_loc[0] = 0  # [0, 8]
+        # kv_for_q_head
+        kv_head_len = pcp_chunk_sizes * (self.pcp_rank + 1)
+        kv_for_head_indptr = np.zeros(len(kv_head_len) + 1)
+        kv_for_head_indptr[1:], kv_nomask_head_arange = self._get_cumsum_and_arange(kv_head_len)
+        kv_for_head_indices = kv_nomask_head_arange + np.repeat(
+            kv_start_loc,
+            kv_head_len,
+        )
+        # kv_for_q_tail
+        kv_tail_len = pcp_chunk_sizes * (2 * self.pcp_world_size - self.pcp_rank)
+        kv_for_tail_indptr = np.zeros(len(kv_tail_len) + 1)
+        kv_for_tail_indptr[1:], kv_nomask_tail_arange = self._get_cumsum_and_arange(kv_tail_len)
+        kv_for_tail_indices = kv_nomask_tail_arange + np.repeat(
+            kv_start_loc,
+            kv_tail_len,
         )
         
         head_tail_indices = {
             "q_head": q_head_indices,
             "q_tail": q_tail_indices,
-            "kv_nomask_head": kv_nomask_for_head_indices,
-            "kv_nomask_tail": kv_nomask_for_tail_indices,
-            "kv_mask_head": kv_mask_for_head_indices,
-            "kv_mask_tail": kv_mask_for_tail_indices
+            "kv_head": kv_for_head_indices,
+            "kv_tail": kv_for_tail_indices,
         }
         head_tail_indptr = {
             "q": q_indptr,
-            "kv_nomask_head": kv_nomask_for_head_indptr,
-            "kv_mask_head": kv_mask_for_head_indptr,
-            "kv_nomask_tail": kv_nomask_for_tail_indptr,
-            "kv_mask_tail": kv_mask_for_tail_indptr
+            "kv_head": kv_for_head_indptr,
+            "kv_tail": kv_for_tail_indptr
         }
-
         for key, value in head_tail_indices.items():
             head_tail_indices[key] = torch.from_numpy(value).to(
                 device=self.device, dtype=torch.int64, non_blocking=True
@@ -1042,14 +1033,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             q_head_indices=head_tail_indices["q_head"],
             q_tail_indices=head_tail_indices["q_tail"],
             q_head_start_loc=head_tail_indptr["q"],
-            kv_nomask_for_head_indices=head_tail_indices["kv_nomask_head"],
-            kv_mask_for_head_indices=head_tail_indices["kv_mask_head"],
-            kv_nomask_for_tail_indices=head_tail_indices["kv_nomask_tail"],
-            kv_mask_for_tail_indices=head_tail_indices["kv_mask_tail"],
-            kv_nomask_for_head_indptr=head_tail_indptr["kv_nomask_head"],
-            kv_mask_for_head_indptr=head_tail_indptr["kv_mask_head"],
-            kv_nomask_for_tail_indptr=head_tail_indptr["kv_nomask_tail"],
-            kv_mask_for_tail_indptr=head_tail_indptr["kv_mask_tail"],
+            kv_for_head_indices=head_tail_indices["kv_head"],
+            kv_for_tail_indices=head_tail_indices["kv_tail"],
+            kv_for_head_indptr=head_tail_indptr["kv_head"],
+            kv_for_tail_indptr=head_tail_indptr["kv_tail"],
             q_full_indices=q_full_indices,
         )
         

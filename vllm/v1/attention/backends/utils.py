@@ -56,14 +56,10 @@ class PrefillContextParallelMetadata:
     q_head_indices: torch.Tensor
     q_tail_indices: torch.Tensor
     q_head_start_loc: torch.Tensor
-    kv_nomask_for_head_indices: torch.Tensor
-    kv_mask_for_head_indices : torch.Tensor
-    kv_nomask_for_tail_indices: torch.Tensor
-    kv_mask_for_tail_indices: torch.Tensor
-    kv_nomask_for_head_indptr: torch.Tensor
-    kv_mask_for_head_indptr: torch.Tensor
-    kv_nomask_for_tail_indptr: torch.Tensor
-    kv_mask_for_tail_indptr: torch.Tensor
+    kv_for_head_indices: torch.Tensor
+    kv_for_tail_indices : torch.Tensor
+    kv_for_head_indptr: torch.Tensor
+    kv_for_tail_indptr: torch.Tensor
     q_full_indices: torch.Tensor
 
 @dataclass
