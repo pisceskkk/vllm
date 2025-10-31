@@ -24,6 +24,7 @@ from vllm.attention.backends.abstract import (
     MultipleOf,
 )
 from vllm.attention.ops.common import cp_lse_ag_out_ar, cp_lse_ag_out_rs
+from vllm.attention.ops.merge_attn_states import merge_attn_states
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.parallel_state import get_pcp_group, get_dcp_group
 from vllm.logger import init_logger
@@ -51,6 +52,7 @@ from vllm.v1.attention.backends.utils import (
     get_per_layer_parameters,
     infer_global_hyperparameters,
     split_decodes_and_prefills,
+    PrefillContextParallelMetadata,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -274,6 +276,7 @@ class FlashInferMetadata:
 
     # For context parallel
     pcp_allgather_restore_idx: torch.Tensor | None = None
+    pcp_metadata: PrefillContextParallelMetadata | None = None
 
 
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
@@ -435,16 +438,18 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             )
         return self._workspace_buffer
 
-    def _get_prefill_wrapper(self):
-        if self._prefill_wrapper is None:
-            if self.pcp_world_size > 1:
-                self._prefill_wrapper = BatchPrefillWithRaggedKVCacheWrapper(
+    def _get_prefill_wrapper(self, attn_metadata):
+        # if self._prefill_wrapper is None:
+        if self.pcp_world_size > 1:
+            self._prefill_wrapper = {}
+            for key in ["head", "tail"]:
+                self._prefill_wrapper[key] = BatchPrefillWithRaggedKVCacheWrapper(
                     self._get_workspace_buffer(), get_kv_cache_layout()
                 )
-            else:
-                self._prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
-                    self._get_workspace_buffer(), get_kv_cache_layout()
-                )
+        else:
+            self._prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                self._get_workspace_buffer(), get_kv_cache_layout()
+            )
         return self._prefill_wrapper
 
     def _get_decode_wrapper(self, batch_size: int, use_cudagraph: bool = False):
@@ -557,28 +562,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         valid_positions = valid_q[:, :, None] & valid_k[:, None, :]
         # flashinfer backend needs flattened format
         custom_mask = torch.masked_select(mask, valid_positions)
-        return custom_mask
-
-    def _get_pcp_custom_mask(
-        self,
-        qo_indptr: torch.Tensor,
-        q_pos: torch.Tensor,
-        kv_lens: torch.Tensor,
-    ) -> torch.Tensor:
-        max_q_lens = int(q_pos.max().item()) + 1
-        max_kv_lens = int(kv_lens.max().item())
-        mask = torch.ones(
-            max_q_lens,
-            max_kv_lens,
-            dtype=torch.bool,
-            device=q_pos.device,
-        ).tril()
-        custom_mask_lst = [
-            mask[q_pos[q_pos_start_loc:q_pos_end_loc], :kv_len].flatten()
-                for kv_len, q_pos_start_loc, q_pos_end_loc in 
-                    zip(kv_lens, qo_indptr[:-1], qo_indptr[1:])
-        ]
-        custom_mask = torch.cat(custom_mask_lst)
         return custom_mask
 
     def build(
@@ -750,6 +733,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             num_prefill_tokens=num_prefill_tokens,
             use_cascade=use_cascade,
             pcp_allgather_restore_idx=common_attn_metadata.pcp_allgather_restore_idx,
+            pcp_metadata=common_attn_metadata.pcp_metadata,
         )
 
         qo_indptr_cpu = common_attn_metadata.query_start_loc_cpu
@@ -782,7 +766,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             if num_prefills > 0:
                 # Decodes are first so prefills start after the last decode
                 prefill_start = num_decodes
-                attn_metadata.prefill_wrapper = self._get_prefill_wrapper()
+                attn_metadata.prefill_wrapper = self._get_prefill_wrapper(common_attn_metadata)
                 assert qo_indptr_cpu[prefill_start:].shape[0] == num_prefills + 1
                 assert paged_kv_indptr_cpu[prefill_start:].shape[0] == num_prefills + 1
                 assert (
@@ -810,34 +794,40 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         qo_indptr_cpu * self.pcp_world_size
                     )
                     if self.pcp_world_size > 1:
+                        assert common_attn_metadata.pcp_metadata is not None
                         assert common_attn_metadata.query_positions is not None
-                        # init custom mask for head-tail query order
-                        custom_mask = self._get_pcp_custom_mask(
-                            qo_indptr=qo_indptr_cpu,
-                            q_pos = torch.from_numpy(
-                                common_attn_metadata.query_positions[prefill_start:]
-                            ).long().to(self.device),
-                            kv_lens=(
-                                prefill_num_computed_tokens_cpu
-                                + kv_indptr_cpu[1:]
-                                - kv_indptr_cpu[:-1]
-                            ).to(self.device),
-                        )
 
-                        attn_metadata.prefill_wrapper.plan(
+                        pcp_metadata = common_attn_metadata.pcp_metadata
+                        qo_indptr_cpu = pcp_metadata.q_head_start_loc
+                        kv_for_head_indptr = pcp_metadata.kv_for_head_indptr
+                        kv_for_tail_indptr = pcp_metadata.kv_for_tail_indptr
+
+                        attn_metadata.prefill_wrapper["head"].plan(
                             qo_indptr_cpu.to(self.device),
-                            kv_indptr_cpu.to(self.device),
+                            kv_for_head_indptr.to(self.device),
                             self.num_qo_heads,
                             self.num_kv_heads,
                             self.head_dim,
-                            custom_mask=custom_mask,
+                            causal=True,
                             sm_scale=self.sm_scale,
                             window_left=self.window_left,
                             logits_soft_cap=self.logits_soft_cap,
                             q_data_type=self.q_data_type,
                             kv_data_type=self.kv_cache_dtype,
-                            fixed_split_size=self.prefill_fixed_split_size,
-                            disable_split_kv=self.disable_split_kv,
+                        )
+                        # tail 
+                        attn_metadata.prefill_wrapper["tail"].plan(
+                            qo_indptr_cpu.to(self.device),
+                            kv_for_tail_indptr.to(self.device),
+                            self.num_qo_heads,
+                            self.num_kv_heads,
+                            self.head_dim,
+                            causal=True,
+                            sm_scale=self.sm_scale,
+                            window_left=self.window_left,
+                            logits_soft_cap=self.logits_soft_cap,
+                            q_data_type=self.q_data_type,
+                            kv_data_type=self.kv_cache_dtype,
                         )
                     else:
                         custom_mask = None
@@ -1024,6 +1014,62 @@ class FlashInferImpl(AttentionImpl):
         if self.sinks is not None and self.sinks.dtype != torch.float32:
             self.sinks = self.sinks.to(torch.float32)
 
+    def _attention_with_head_and_tail(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        prefill_wrapper: BatchPrefillWithRaggedKVCacheWrapper,
+        metadata: PrefillContextParallelMetadata,
+        return_lse: bool = False,
+    ):
+        q_head_indices = metadata.q_head_indices
+        q_tail_indices = metadata.q_tail_indices
+        kv_for_head_indices = metadata.kv_for_head_indices
+        kv_for_tail_indices = metadata.kv_for_tail_indices
+        q_full_indices = metadata.q_full_indices
+
+        q_head = torch.index_select(query, 0, q_head_indices)
+        q_tail = torch.index_select(query, 0, q_tail_indices)
+        k_head = torch.index_select(key, 0, kv_for_head_indices)
+        v_head = torch.index_select(value, 0, kv_for_head_indices)
+        k_tail = torch.index_select(key, 0, kv_for_tail_indices)
+        v_tail = torch.index_select(value, 0, kv_for_tail_indices)
+
+        output_head = prefill_wrapper["head"].run(
+            q_head,
+            k_head,
+            v_head,
+            return_lse=return_lse,
+        )
+        output_tail = prefill_wrapper["tail"].run(
+            q_tail,
+            k_tail,
+            v_tail,
+            return_lse=return_lse,
+        )
+        if return_lse:
+            output_head, lse_head = output_head
+            output_tail, lse_tail = output_tail
+            output = torch.index_select(
+                torch.cat([output_head, output_tail], dim=0),
+                0,
+                q_full_indices,
+            )
+            lse = torch.index_select(
+                torch.cat([lse_head, lse_tail], dim=0),
+                0,
+                q_full_indices,
+            )
+            return output, lse
+        else:
+            output = torch.index_select(
+                torch.cat([output_head, output_tail], dim=0),
+                0,
+                q_full_indices,
+            )
+            return output
+
     def forward(
         self,
         layer: torch.nn.Module,
@@ -1186,19 +1232,27 @@ class FlashInferImpl(AttentionImpl):
             assert prefill_wrapper is not None
 
             if not attn_metadata.prefill_use_trtllm:
-                assert prefill_wrapper._window_left == self.window_left
-                assert prefill_wrapper._logits_soft_cap == (self.logits_soft_cap or 0.0)
-                assert prefill_wrapper._sm_scale == self.scale
                 if self.pcp_world_size > 1:
+                    assert type(prefill_wrapper) ==  dict
+                    for _, prefill_wrapper_i in prefill_wrapper.items():
+                        assert prefill_wrapper_i._window_left == self.window_left
+                        assert prefill_wrapper_i._logits_soft_cap == (self.logits_soft_cap or 0.0)
+                        assert prefill_wrapper_i._sm_scale == self.scale
+                    assert attn_metadata.pcp_metadata is not None
+
                     # NOTE(qcs): Allgather causes duplicate decoding tokens.
                     prefill_key = key[num_decode_tokens * self.pcp_world_size :]
                     prefill_value = value[num_decode_tokens * self.pcp_world_size :]
-                    prefill_wrapper.run(
+
+                    out = self._attention_with_head_and_tail(
                         prefill_query,
                         prefill_key,
                         prefill_value,
-                        out=output[num_decode_tokens:],
+                        prefill_wrapper,
+                        attn_metadata.pcp_metadata,
                     )
+
+                    output[num_decode_tokens:] = out
                 elif self.dcp_world_size > 1:
                     prefill_query = get_dcp_group().all_gather(
                         prefill_query.contiguous(), dim=1
@@ -1215,6 +1269,9 @@ class FlashInferImpl(AttentionImpl):
                         out, lse, get_dcp_group()
                     )
                 else:
+                    assert prefill_wrapper._window_left == self.window_left
+                    assert prefill_wrapper._logits_soft_cap == (self.logits_soft_cap or 0.0)
+                    assert prefill_wrapper._sm_scale == self.scale
                     assert prefill_wrapper._causal
                     prefill_wrapper.run(
                         prefill_query,
