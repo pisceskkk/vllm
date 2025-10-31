@@ -23,9 +23,9 @@ from vllm.attention.backends.abstract import (
     AttentionType,
     MultipleOf,
 )
-from vllm.attention.ops.common import cp_lse_ag_out_ar
+from vllm.attention.ops.common import cp_lse_ag_out_ar, cp_lse_ag_out_rs
 from vllm.config import CUDAGraphMode, VllmConfig
-from vllm.distributed.parallel_state import get_pcp_group
+from vllm.distributed.parallel_state import get_pcp_group, get_dcp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.batch_invariant import (
     vllm_is_batch_invariant,
@@ -340,9 +340,19 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self.pcp_world_size = 1
             self.pcp_rank = 0
 
-        self.num_qo_heads = self.model_config.get_num_attention_heads(
-            self.vllm_config.parallel_config
+        try:
+            self.dcp_world_size = get_dcp_group().world_size
+            self.dcp_rank = get_dcp_group().rank_in_group
+        except AssertionError:
+            # DCP might not be initialized in testing
+            self.dcp_world_size = 1
+            self.dcp_rank = 0
+
+        self.num_qo_heads = (
+            self.model_config.get_num_attention_heads(self.vllm_config.parallel_config)
+            * (self.dcp_world_size if self.pcp_world_size > 1 else 1)
         )
+
         self.num_kv_heads = self.kv_cache_spec.num_kv_heads
         self.head_dim = self.kv_cache_spec.head_size
         FlashInferBackend.validate_head_size(self.head_dim)
@@ -480,9 +490,78 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             )
         return self._cascade_wrapper
 
+    def _get_dcp_custom_mask(
+        self,
+        q_lens: torch.Tensor,
+        kv_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        # init custom mask for interleave kv cache
+        # |-------total_lens----------|
+        # |--context_lens--|--q_lens--|
+        # Example: dcp_size=2, dcp_rank=0
+        # For a SINGLE prefill seq, q_lens=3, total_lens=5
+        # k_lens on RANK1 is (5 - 1 - 0) // 2 + 1 = 3
+        # mask.shape = [q_lens, k_lens] = [3,3]
+        # mask [[True, True, False],
+        #       [True, True, False],
+        #       [True, True, True]]
+        dcp_rank = self.dcp_rank
+        dcp_size = self.dcp_world_size
+
+        context_lens = kv_lens - q_lens
+        # max indices for global sequences
+        max_indices = kv_lens - 1
+        # if max_indices are smaller than dcp_rank,
+        # current rank has no kv cache, is invalid,
+        # the mask is skipped
+        valid = max_indices >= dcp_rank
+        assert torch.any(valid), "There is no valid sequence"
+
+        # local kv lens on current dcp_rank
+        k_lens = (
+            torch.div(
+                max_indices - dcp_rank, dcp_size, rounding_mode="floor"
+            )
+            + 1
+        )
+        k_lens = torch.where(valid, k_lens, 0)
+        # vectorize operation
+        # obtain the max length of all prefill reqs
+        max_q = int(q_lens[valid].max().item())
+        max_k = int(k_lens[valid].max().item())
+        # generate local q and k indices
+        q_indices = torch.arange(max_q, device=self.device)
+        k_indices = torch.arange(max_k, device=self.device)
+        # valid q and k indices of each reqs
+        valid_q = valid[:, None] & (q_indices[None, :] < q_lens[:, None])
+        valid_k = valid[:, None] & (k_indices[None, :] < k_lens[:, None])
+        # where global q_indices >= global k_indices,
+        # the mask is True
+        # global q_indices = context_lens + local q_indices
+        # global k_indices = local k_indcies * dcp_size + dcp_rank
+        # ====> local k_indcies must be smaller or equal k_upper
+        # k_upper=(context_lens + local q_indices - dcp_rank) // dcp_size
+        k_upper = torch.div(
+            context_lens[:, None] + q_indices - dcp_rank,
+            dcp_size,
+            rounding_mode="floor",
+        )
+        k_upper = torch.where(
+            valid_q,
+            torch.clamp(k_upper, min=-1),
+            k_upper.new_full(k_upper.shape, -1),
+        )
+        mask = (k_indices[None, None, :] <= k_upper[:, :, None]) & (
+            k_upper[:, :, None] >= 0
+        )
+        valid_positions = valid_q[:, :, None] & valid_k[:, None, :]
+        # flashinfer backend needs flattened format
+        custom_mask = torch.masked_select(mask, valid_positions)
+        return custom_mask
+
     def _get_pcp_custom_mask(
         self,
-        qo_indptr_cpu: torch.Tensor,
+        qo_indptr: torch.Tensor,
         q_pos: torch.Tensor,
         kv_lens: torch.Tensor,
     ) -> torch.Tensor:
@@ -497,7 +576,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         custom_mask_lst = [
             mask[q_pos[q_pos_start_loc:q_pos_end_loc], :kv_len].flatten()
                 for kv_len, q_pos_start_loc, q_pos_end_loc in 
-                    zip(kv_lens, qo_indptr_cpu[:-1], qo_indptr_cpu[1:])
+                    zip(kv_lens, qo_indptr[:-1], qo_indptr[1:])
         ]
         custom_mask = torch.cat(custom_mask_lst)
         return custom_mask
@@ -523,14 +602,17 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         max_seq_len = common_attn_metadata.max_seq_len
         seq_lens = common_attn_metadata.seq_lens
         seq_lens_cpu = common_attn_metadata.seq_lens_cpu
-        if self.pcp_world_size > 1:
-            seq_lens_cpu = seq_lens_cpu // self.pcp_world_size + (
-                self.pcp_rank < seq_lens_cpu % self.pcp_world_size
-            )
+        
+        total_cp_world_size = self.pcp_world_size * self.dcp_world_size
+        total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
         seq_lens_np = seq_lens_cpu.numpy()
         num_computed_tokens_cpu = common_attn_metadata.num_computed_tokens_cpu
         block_table_tensor = common_attn_metadata.block_table_tensor
 
+        if total_cp_world_size > 1:
+            seq_lens_np = seq_lens_np // total_cp_world_size + (
+                total_cp_rank < seq_lens_np % total_cp_world_size
+            )
         num_blocks_np = (seq_lens_np + (page_size - 1)) // page_size
 
         use_cascade = common_prefix_len > 0
@@ -619,7 +701,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             has_sinks=self.has_sinks,
             has_spec=uses_spec_reorder,
         )
-        if self.pcp_world_size > 1 and (prefill_use_trtllm or decode_use_trtllm):
+        if self.pcp_world_size * self.dcp_world_size > 1 \
+            and (prefill_use_trtllm or decode_use_trtllm):
             raise NotImplementedError(
                 "Trtllm not support lse, please use flash attention "
                 "or disable attention sinks."
@@ -720,16 +803,18 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 attn_metadata.max_q_len_prefill = int(query_lens_prefill.max().item())
 
                 if not attn_metadata.prefill_use_trtllm:
+                    prefill_num_computed_tokens_cpu = num_computed_tokens_cpu[
+                        prefill_start:
+                    ]
+                    kv_indptr_cpu = (
+                        qo_indptr_cpu * self.pcp_world_size
+                    )
                     if self.pcp_world_size > 1:
                         assert common_attn_metadata.query_positions is not None
-                        prefill_num_computed_tokens_cpu = num_computed_tokens_cpu[
-                            prefill_start:
-                        ]
-                        kv_indptr_cpu = qo_indptr_cpu * self.pcp_world_size
                         # init custom mask for head-tail query order
                         custom_mask = self._get_pcp_custom_mask(
-                            qo_indptr_cpu=qo_indptr_cpu,
-                            q_pos=torch.from_numpy(
+                            qo_indptr=qo_indptr_cpu,
+                            q_pos = torch.from_numpy(
                                 common_attn_metadata.query_positions[prefill_start:]
                             ).long().to(self.device),
                             kv_lens=(
@@ -755,16 +840,27 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                             disable_split_kv=self.disable_split_kv,
                         )
                     else:
+                        custom_mask = None
+                        if self.dcp_world_size > 1:
+                            custom_mask = self._get_dcp_custom_mask(
+                                q_lens = (qo_indptr_cpu[1:] - qo_indptr_cpu[:-1]).to(
+                                    dtype=torch.int64, device=self.device
+                                ),
+                                kv_lens = seq_lens_cpu[
+                                    prefill_start : prefill_start + num_prefills
+                                ].to(dtype=torch.int64, device=self.device)
+                            )
                         attn_metadata.prefill_wrapper.plan(
-                            qo_indptr_cpu,
-                            paged_kv_indptr_cpu,
+                            qo_indptr_cpu.to(self.device),
+                            paged_kv_indptr_cpu.to(self.device),
                             paged_kv_indices,
-                            paged_kv_last_page_len_cpu[prefill_start:],
+                            paged_kv_last_page_len_cpu[prefill_start:].to(self.device),
                             self.num_qo_heads,
                             self.num_kv_heads,
                             self.head_dim,
                             self.page_size,
-                            causal=True,
+                            causal=custom_mask is None,
+                            custom_mask=custom_mask,
                             sm_scale=self.sm_scale,
                             window_left=self.window_left,
                             logits_soft_cap=self.logits_soft_cap,
@@ -851,6 +947,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
 
 class FlashInferImpl(AttentionImpl):
+    can_return_lse_for_decode: bool = True
+
     def __init__(
         self,
         num_heads: int,
@@ -1101,6 +1199,21 @@ class FlashInferImpl(AttentionImpl):
                         prefill_value,
                         out=output[num_decode_tokens:],
                     )
+                elif self.dcp_world_size > 1:
+                    prefill_query = get_dcp_group().all_gather(
+                        prefill_query.contiguous(), dim=1
+                    )
+
+                    out, lse = prefill_wrapper.run(
+                        prefill_query,
+                        kv_cache_permute,
+                        k_scale=layer._k_scale_float,
+                        v_scale=layer._v_scale_float,
+                        return_lse=True,
+                    )
+                    output[num_decode_tokens:] = cp_lse_ag_out_rs(
+                        out, lse, get_dcp_group()
+                    )
                 else:
                     assert prefill_wrapper._causal
                     prefill_wrapper.run(
@@ -1185,12 +1298,20 @@ class FlashInferImpl(AttentionImpl):
                 assert decode_wrapper._window_left == self.window_left
                 assert decode_wrapper._logits_soft_cap == (self.logits_soft_cap or 0.0)
                 assert decode_wrapper._sm_scale == self.scale
-                if self.pcp_world_size > 1:
+
+                if self.dcp_world_size * self.pcp_world_size > 1:
+                    decode_query = get_dcp_group().all_gather(
+                        decode_query.contiguous(), dim=-2
+                    )
                     out, lse = decode_wrapper.run(
                         decode_query,
                         kv_cache_permute,
                         k_scale=layer._k_scale_float,
                         v_scale=layer._v_scale_float,
+                        return_lse=True,
+                    )
+                    out, lse = cp_lse_ag_out_rs(
+                        out, lse, get_dcp_group(),
                         return_lse=True,
                     )
                     output[:num_decode_tokens] = cp_lse_ag_out_ar(

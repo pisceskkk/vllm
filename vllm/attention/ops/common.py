@@ -179,7 +179,7 @@ def _cp_lse_common(
     cp_attn_lse: [ B, H ]
     """
     if cp_group.world_size == 1:
-        return cp_attn_out
+        return cp_attn_out, cp_attn_lse
 
     if ctx is None:
         ctx = CPTritonContext()
