@@ -94,7 +94,7 @@ from vllm.v1.attention.backends.utils import (
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
     create_fast_prefill_custom_backend,
-    get_dcp_local_seq_lens,
+    get_cp_local_seq_lens,
     PrefillContextParallelMetadata,
     reorder_batch_to_split_decodes_and_prefills,
     split_attn_metadata,
@@ -256,10 +256,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # This will be overridden in load_model()
         self.is_multimodal_pruning_enabled = False
         self.max_model_len = model_config.max_model_len
-        self.pcp_world_size = get_pcp_group().world_size
-        self.pcp_rank = get_pcp_group().rank_in_group
+        self.pcp_world_size = self.parallel_config.prefill_context_parallel_size
+        self.pcp_rank = 0 if self.pcp_world_size <= 1 else get_pcp_group().rank_in_group
         self.dcp_world_size = self.parallel_config.decode_context_parallel_size
         self.dcp_rank = 0 if self.dcp_world_size <= 1 else get_dcp_group().rank_in_group
+        self.total_cp_world_size = self.pcp_world_size * self.dcp_world_size
+        self.total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
         self.max_num_reqs = scheduler_config.max_num_seqs
 
@@ -416,8 +418,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.max_num_reqs + 1, dtype=torch.int32
         )
         self.seq_lens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
-        if self.dcp_world_size > 1:
-            self.dcp_local_seq_lens = self._make_buffer(
+        if self.total_cp_world_size > 1:
+            self.cp_local_seq_lens = self._make_buffer(
                 self.max_num_reqs, dtype=torch.int32
             )
         # Because inputs_embeds may be bfloat16 and we don't need a numpy
@@ -1537,14 +1539,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             )
 
         # update seq_lens of decode reqs under DCP.
-        if self.dcp_world_size > 1:
-            self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
+        if self.total_cp_world_size > 1:
+            self.cp_local_seq_lens.cpu[:num_reqs] = get_cp_local_seq_lens(
                 self.seq_lens.cpu[:num_reqs],
-                self.dcp_world_size,
-                self.dcp_rank,
+                self.total_cp_world_size,
+                self.total_cp_rank,
                 self.parallel_config.dcp_kv_cache_interleave_size,
             )
-            self.dcp_local_seq_lens.copy_to_gpu(num_reqs)
+            self.cp_local_seq_lens.copy_to_gpu(num_reqs)
 
         attn_metadata: PerLayerAttnMetadata = {}
         if ubatch_slices is not None:
@@ -1636,15 +1638,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 num_logits_indices=logits_indices.size(0),
                 causal=True,
                 encoder_seq_lens=encoder_seq_lens,
-                query_positions=positions_np,
                 pcp_allgather_restore_idx=self.pcp_allgather_restore_idx.gpu[
                     : total_num_scheduled_tokens * self.pcp_world_size
                 ]
                 if self.pcp_world_size > 1
                 else None,
                 pcp_metadata=pcp_metadata,
-                dcp_local_seq_lens=self.dcp_local_seq_lens.gpu[:num_reqs]
-                if self.dcp_world_size > 1
+                dcp_local_seq_lens=self.cp_local_seq_lens.gpu[:num_reqs]
+                if self.total_cp_world_size > 1
                 else None,
             )
 
@@ -3627,7 +3628,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.seq_lens.np[num_reqs:] = 0
             self.seq_lens.copy_to_gpu()
 
-            cum_num_tokens, query_positions = self._get_cumsum_and_arange(
+            cum_num_tokens, _ = self._get_cumsum_and_arange(
                 num_scheduled_tokens
             )
             self.query_start_loc.np[1 : num_reqs + 1] = cum_num_tokens
@@ -3662,14 +3663,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         kv_cache_group_id
                     ].slot_mapping.gpu[:num_tokens],
                     causal=True,
-                    query_positions=query_positions,
                     pcp_metadata=pcp_metadata if self.pcp_world_size > 1 else None,
                     pcp_allgather_restore_idx=self.pcp_allgather_restore_idx.gpu[
                         : total_num_scheduled_tokens * self.pcp_world_size
                     ] if self.pcp_world_size > 1
                     else None,
-                    dcp_local_seq_lens=self.dcp_local_seq_lens.gpu[:num_reqs]
-                    if self.dcp_world_size > 1
+                    dcp_local_seq_lens=self.cp_local_seq_lens.gpu[:num_reqs]
+                    if self.total_cp_world_size > 1
                     else None,
                 )
                 for attn_group in self.attn_groups[kv_cache_group_id]:
@@ -4864,14 +4864,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             kv_transfer_group.register_kv_caches(kv_caches)
             kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
 
-        if self.dcp_world_size > 1:
+        if self.total_cp_world_size > 1:
             layer_names = self.attn_groups[0][0].layer_names
             layers = get_layers_from_vllm_config(
                 self.vllm_config, AttentionLayerBase, layer_names
             )
             for layer in layers.values():
                 assert layer.impl.need_to_return_lse_for_decode, (
-                    "DCP requires attention impls to return"
+                    "PCP&DCP requires attention impls to return"
                     " the softmax lse for decode, but the impl "
                     f"{layer.impl.__class__.__name__} "
                     "does not return the softmax lse for decode."

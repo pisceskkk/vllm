@@ -742,9 +742,6 @@ class EngineArgs:
             **parallel_kwargs["dcp_kv_cache_interleave_size"],
         )
         parallel_group.add_argument(
-            "--data-parallel-size", "-dp", **parallel_kwargs["data_parallel_size"]
-        )
-        parallel_group.add_argument(
             "--data-parallel-rank",
             "-dpn",
             type=int,

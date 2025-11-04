@@ -48,7 +48,7 @@ from vllm.v1.attention.backends.utils import (
     AttentionCGSupport,
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
-    get_dcp_local_seq_lens,
+    get_cp_local_seq_lens,
     get_kv_cache_layout,
     get_per_layer_parameters,
     infer_global_hyperparameters,
@@ -354,6 +354,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self.dcp_rank = 0
             self.dcp_kv_cache_interleave_size = 1
 
+        self.total_cp_world_size = self.pcp_world_size * self.dcp_world_size
+        self.total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
+
         self.num_qo_heads = (
             self.model_config.get_num_attention_heads(self.vllm_config.parallel_config)
         )
@@ -442,7 +445,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
     def _get_prefill_wrapper(self, attn_metadata):
         if self._prefill_wrapper is None:
-            if self.dcp_world_size * self.pcp_world_size > 1:
+            if self.total_cp_world_size > 1:
                 self._prefill_wrapper = dict()
                 self._prefill_wrapper["context"] = BatchPrefillWithPagedKVCacheWrapper(
                     self._get_workspace_buffer(), get_kv_cache_layout()
@@ -530,9 +533,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         block_table_tensor = common_attn_metadata.block_table_tensor
         qo_indptr_cpu = common_attn_metadata.query_start_loc_cpu
 
-        total_cp_world_size = self.pcp_world_size * self.dcp_world_size
-        total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
-        if total_cp_world_size > 1:
+        if self.total_cp_world_size > 1:
             if num_prefills > 0:
                 qo_indptr_prefill_cpu = (
                     qo_indptr_cpu[num_decodes:] - qo_indptr_cpu[num_decodes]
@@ -540,10 +541,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 query_lens_prefill_cpu = qo_indptr_prefill_cpu[1:] - qo_indptr_prefill_cpu[:-1]
                 seq_lens_cpu[num_decodes:] = seq_lens_cpu[num_decodes:] - query_lens_prefill_cpu
 
-            seq_lens_cpu = get_dcp_local_seq_lens(
+            seq_lens_cpu = get_cp_local_seq_lens(
                 seq_lens_cpu,
-                total_cp_world_size,
-                total_cp_rank,
+                self.total_cp_world_size,
+                self.total_cp_rank,
                 self.dcp_kv_cache_interleave_size,
             )
         seq_lens_np = seq_lens_cpu.numpy()
@@ -636,7 +637,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             has_sinks=self.has_sinks,
             has_spec=uses_spec_reorder,
         )
-        if self.pcp_world_size * self.dcp_world_size > 1 \
+        if self.total_cp_world_size > 1 \
             and (prefill_use_trtllm or decode_use_trtllm):
             raise NotImplementedError(
                 "Trtllm not support lse, please use flash attention "
@@ -668,6 +669,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             # fall back to model dtype.
             self.q_data_type = self.model_config.dtype
 
+        # print(common_attn_metadata.slot_mapping)
         attn_metadata = FlashInferMetadata(
             num_actual_tokens=num_actual_tokens,
             q_data_type=self.q_data_type,
@@ -755,7 +757,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         "fixed_split_size": self.prefill_fixed_split_size,
                         "disable_split_kv": self.disable_split_kv,
                     }
-                    if total_cp_world_size > 1:
+                    if self.total_cp_world_size > 1:
                         assert type(attn_metadata.prefill_wrapper) == dict
                         attn_metadata.prefill_wrapper["context"].plan(
                             qo_indptr_cpu.to(self.device),
@@ -792,7 +794,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                                 causal=True,
                                 **common_kwargs,
                             )
-                        if self.dcp_world_size > 1:
+                        elif self.dcp_world_size > 1:
                             kv_query_indptr_cpu = qo_indptr_cpu.clone()
                             attn_metadata.prefill_wrapper["query"].plan(
                                 qo_indptr_cpu.to(self.device, non_blocking=True),
@@ -974,10 +976,16 @@ class FlashInferImpl(AttentionImpl):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        prefill_wrapper: BatchPrefillWithRaggedKVCacheWrapper,
+        prefill_wrapper: dict[str, BatchPrefillWithRaggedKVCacheWrapper],
         metadata: PrefillContextParallelMetadata,
         return_lse: bool = False,
     ):
+        """
+        For prompt with tokens [T0, T1, T2, T3], the query on PCP0 is [Q0, Q3]
+        and we all-gather full K as [K0, K1, K2, K3].
+        There are two attn ops. The "head" is [Q0]x[K0] and the "tail" is 
+        [Q3]x[K0, K1, K2, K3].
+        """
         q_head_indices = metadata.q_head_indices
         q_tail_indices = metadata.q_tail_indices
         kv_for_head_indices = metadata.kv_for_head_indices
@@ -1189,8 +1197,7 @@ class FlashInferImpl(AttentionImpl):
             assert prefill_wrapper is not None
 
             if not attn_metadata.prefill_use_trtllm:
-                if self.pcp_world_size * self.dcp_world_size > 1:
-                    assert type(prefill_wrapper) ==  dict
+                if self.total_cp_world_size > 1:
                     assert type(prefill_wrapper) == dict
                     for _, prefill_wrapper_i in prefill_wrapper.items():
                         assert prefill_wrapper_i._window_left == self.window_left
@@ -1232,13 +1239,14 @@ class FlashInferImpl(AttentionImpl):
                             value[num_decode_tokens:],
                             return_lse=True,
                         )
+                    lse_query = lse_query.transpose(0, 1).contiguous()
                         
                     merge_attn_states(
                         output[num_decode_tokens:],
                         output_context,
                         lse_context,
                         output_query,
-                        lse_query.transpose(0, 1).contiguous(),
+                        lse_query,
                     )
                 else:
                     assert prefill_wrapper._window_left == self.window_left
@@ -1328,9 +1336,9 @@ class FlashInferImpl(AttentionImpl):
                 assert decode_wrapper._logits_soft_cap == (self.logits_soft_cap or 0.0)
                 assert decode_wrapper._sm_scale == self.scale
 
-                if self.dcp_world_size * self.pcp_world_size > 1:
+                if self.total_cp_world_size > 1:
                     decode_query = get_dcp_group().all_gather(
-                        decode_query.contiguous(), dim=-2
+                        decode_query.contiguous(), dim=1
                     )
                     out, lse = decode_wrapper.run(
                         decode_query,
