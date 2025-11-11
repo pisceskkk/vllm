@@ -1197,11 +1197,29 @@ class FlashInferImpl(AttentionImpl):
             assert prefill_wrapper is not None
 
             if not attn_metadata.prefill_use_trtllm:
-                if self.total_cp_world_size > 1:
+                if self.pcp_world_size > 1:
+                    # TODO(qcs): To adapt chunked prefill, we need to reuse/reference
+                    # DCP's context calculation logic and implement the ring attention 
+                    # algorithm.
+                    assert attn_metadata.pcp_metadata is not None
+                    prefill_key = key[num_decode_tokens * self.pcp_world_size :]
+                    prefill_value = value[num_decode_tokens * self.pcp_world_size :]
+                    output_query, lse_query = self._attention_with_head_and_tail(
+                        prefill_query,
+                        prefill_key,
+                        prefill_value,
+                        prefill_wrapper,
+                        attn_metadata.pcp_metadata,
+                        return_lse=True,
+                    )
+                    output[num_decode_tokens:].copy_(output_query)
+                elif self.dcp_world_size > 1:
                     assert type(prefill_wrapper) == dict
                     for _, prefill_wrapper_i in prefill_wrapper.items():
                         assert prefill_wrapper_i._window_left == self.window_left
-                        assert prefill_wrapper_i._logits_soft_cap == (self.logits_soft_cap or 0.0)
+                        assert (
+                            prefill_wrapper_i._logits_soft_cap == (self.logits_soft_cap or 0.0)
+                        )
                         assert prefill_wrapper_i._sm_scale == self.scale
                     prefill_query_across_dcp = get_dcp_group().all_gather(
                         prefill_query.contiguous(), dim=1
@@ -1218,27 +1236,15 @@ class FlashInferImpl(AttentionImpl):
                     )
                     lse_context = lse_context.transpose(0, 1).contiguous()
 
-                    # NOTE(qcs): Allgather causes duplicate decoding tokens.
-                    prefill_key = key[num_decode_tokens * self.pcp_world_size :]
-                    prefill_value = value[num_decode_tokens * self.pcp_world_size :]
-                    if self.pcp_world_size > 1:
-                        assert attn_metadata.pcp_metadata is not None
-                        output_query, lse_query = self._attention_with_head_and_tail(
-                            prefill_query,
-                            prefill_key,
-                            prefill_value,
-                            prefill_wrapper,
-                            attn_metadata.pcp_metadata,
-                            return_lse=True,
-                        )
-                    else:
-                        output_query, lse_query = prefill_wrapper["query"].run(
-                            prefill_query,
-                            prefill_key,
-                            prefill_value,
-                            value[num_decode_tokens:],
-                            return_lse=True,
-                        )
+                    prefill_key = key[num_decode_tokens:]
+                    prefill_value = value[num_decode_tokens:]
+                    output_query, lse_query = prefill_wrapper["query"].run(
+                        prefill_query,
+                        prefill_key,
+                        prefill_value,
+                        value[num_decode_tokens:],
+                        return_lse=True,
+                    )
                     lse_query = lse_query.transpose(0, 1).contiguous()
                         
                     merge_attn_states(
