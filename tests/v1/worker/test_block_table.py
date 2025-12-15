@@ -19,7 +19,8 @@ KERNEL_BLOCK_SIZE = 16
 
 
 def create_block_table(dcp_world_size, dcp_rank, pcp_world_size, pcp_rank,
-                       cp_kv_cache_interleave_size):
+                       cp_kv_cache_interleave_size,
+                       mock_get_dcp_group, mock_get_pcp_group):
     """Helper function to create BlockTable with mocked distributed groups.
 
     Args:
@@ -28,41 +29,38 @@ def create_block_table(dcp_world_size, dcp_rank, pcp_world_size, pcp_rank,
         pcp_world_size: Number of PCP ranks
         pcp_rank: Current PCP rank
         cp_kv_cache_interleave_size: Interleave size for KV cache
+        mock_get_dcp_group: Mock for get_dcp_group function
+        mock_get_pcp_group: Mock for get_pcp_group function
 
     Returns:
         BlockTable instance with mocked distributed groups
     """
-    with patch('vllm.distributed.parallel_state.get_dcp_group'
-               ) as mock_get_dcp_group, \
-         patch('vllm.distributed.parallel_state.get_pcp_group'
-               ) as mock_get_pcp_group:
+    # Mock DCP group
+    mock_dcp_group = MagicMock(spec=GroupCoordinator)
+    mock_dcp_group.world_size = dcp_world_size
+    mock_dcp_group.rank_in_group = dcp_rank
+    mock_get_dcp_group.return_value = mock_dcp_group
 
-        # Mock DCP group
-        mock_dcp_group = MagicMock(spec=GroupCoordinator)
-        mock_dcp_group.world_size = dcp_world_size
-        mock_dcp_group.rank_in_group = dcp_rank
-        mock_get_dcp_group.return_value = mock_dcp_group
+    # Mock PCP group
+    mock_pcp_group = MagicMock(spec=GroupCoordinator)
+    mock_pcp_group.world_size = pcp_world_size
+    mock_pcp_group.rank_in_group = pcp_rank
+    mock_get_pcp_group.return_value = mock_pcp_group
 
-        # Mock PCP group
-        mock_pcp_group = MagicMock(spec=GroupCoordinator)
-        mock_pcp_group.world_size = pcp_world_size
-        mock_pcp_group.rank_in_group = pcp_rank
-        mock_get_pcp_group.return_value = mock_pcp_group
+    from vllm.v1.worker.block_table import BlockTable
 
-        from vllm.v1.worker.block_table import BlockTable
+    block_table = BlockTable(
+        block_size=BLOCK_SIZE,
+        max_num_reqs=MAX_NUM_REQS,
+        max_num_blocks_per_req=MAX_NUM_BLOCKS_PER_REQ,
+        max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
+        pin_memory=PIN_MEMORY,
+        device=DEVICE,
+        kernel_block_size=KERNEL_BLOCK_SIZE,
+        cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+    )
 
-        block_table = BlockTable(
-            block_size=BLOCK_SIZE,
-            max_num_reqs=MAX_NUM_REQS,
-            max_num_blocks_per_req=MAX_NUM_BLOCKS_PER_REQ,
-            max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
-            pin_memory=PIN_MEMORY,
-            device=DEVICE,
-            kernel_block_size=KERNEL_BLOCK_SIZE,
-            cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
-        )
-
-        return block_table
+    return block_table
 
 
 def setup_block_table_data(block_table, num_reqs=2):
@@ -79,7 +77,10 @@ def setup_block_table_data(block_table, num_reqs=2):
         block_table.add_row(block_ids, i)
 
 
-def test_compute_slot_mapping_dcp1_pcp1_interleave1():
+@patch('vllm.distributed.parallel_state.get_pcp_group')
+@patch('vllm.distributed.parallel_state.get_dcp_group')
+def test_compute_slot_mapping_dcp1_pcp1_interleave1(mock_get_dcp_group,
+                                                     mock_get_pcp_group):
     """Test compute_slot_mapping with DCP=1, PCP=1, interleave_size=1.
 
     With no parallelism (DCP=1, PCP=1), all tokens are local to the single
@@ -104,7 +105,9 @@ def test_compute_slot_mapping_dcp1_pcp1_interleave1():
                                      dcp_rank=0,
                                      pcp_world_size=1,
                                      pcp_rank=0,
-                                     cp_kv_cache_interleave_size=1)
+                                     cp_kv_cache_interleave_size=1,
+                                     mock_get_dcp_group=mock_get_dcp_group,
+                                     mock_get_pcp_group=mock_get_pcp_group)
 
     num_reqs = max(req_indices) + 1 if len(req_indices) > 0 else 1
     setup_block_table_data(block_table, num_reqs=num_reqs)
@@ -145,7 +148,11 @@ def test_compute_slot_mapping_dcp1_pcp1_interleave1():
         (1, 3,
          [-1, -1, -1, -1, -1, -1, -1, 0, -1, -1, -1, -1, -1, -1, -1, 1]),
     ])
-def test_compute_slot_mapping_dcp4_pcp2_interleave1(pcp_rank, dcp_rank,
+@patch('vllm.distributed.parallel_state.get_pcp_group')
+@patch('vllm.distributed.parallel_state.get_dcp_group')
+def test_compute_slot_mapping_dcp4_pcp2_interleave1(mock_get_dcp_group,
+                                                     mock_get_pcp_group,
+                                                     pcp_rank, dcp_rank,
                                                      expected_result):
     """Test compute_slot_mapping with DCP=4, PCP=2, interleave_size=1.
 
@@ -166,7 +173,9 @@ def test_compute_slot_mapping_dcp4_pcp2_interleave1(pcp_rank, dcp_rank,
                                      dcp_rank=dcp_rank,
                                      pcp_world_size=2,
                                      pcp_rank=pcp_rank,
-                                     cp_kv_cache_interleave_size=1)
+                                     cp_kv_cache_interleave_size=1,
+                                     mock_get_dcp_group=mock_get_dcp_group,
+                                     mock_get_pcp_group=mock_get_pcp_group)
 
     num_reqs = max(req_indices) + 1 if len(req_indices) > 0 else 1
     setup_block_table_data(block_table, num_reqs=num_reqs)
@@ -200,7 +209,11 @@ def test_compute_slot_mapping_dcp4_pcp2_interleave1(pcp_rank, dcp_rank,
         # Rank 7 gets no positions
         (1, 3, None),
     ])
-def test_compute_slot_mapping_dcp4_pcp2_interleave128(pcp_rank, dcp_rank,
+@patch('vllm.distributed.parallel_state.get_pcp_group')
+@patch('vllm.distributed.parallel_state.get_dcp_group')
+def test_compute_slot_mapping_dcp4_pcp2_interleave128(mock_get_dcp_group,
+                                                       mock_get_pcp_group,
+                                                       pcp_rank, dcp_rank,
                                                        expected_positions):
     """Test compute_slot_mapping with DCP=4, PCP=2, interleave_size=128.
 
@@ -224,7 +237,9 @@ def test_compute_slot_mapping_dcp4_pcp2_interleave128(pcp_rank, dcp_rank,
                                      dcp_rank=dcp_rank,
                                      pcp_world_size=2,
                                      pcp_rank=pcp_rank,
-                                     cp_kv_cache_interleave_size=128)
+                                     cp_kv_cache_interleave_size=128,
+                                     mock_get_dcp_group=mock_get_dcp_group,
+                                     mock_get_pcp_group=mock_get_pcp_group)
 
     num_reqs = max(req_indices) + 1 if len(req_indices) > 0 else 1
     setup_block_table_data(block_table, num_reqs=num_reqs)
