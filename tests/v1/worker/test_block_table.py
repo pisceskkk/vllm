@@ -77,8 +77,8 @@ def setup_block_table_data(block_table, num_reqs=2):
         block_table.add_row(block_ids, i)
 
 
-@patch('vllm.distributed.parallel_state.get_pcp_group')
-@patch('vllm.distributed.parallel_state.get_dcp_group')
+@patch('vllm.distributed.get_pcp_group')
+@patch('vllm.distributed.get_dcp_group')
 def test_compute_slot_mapping_dcp1_pcp1_interleave1(mock_get_dcp_group,
                                                      mock_get_pcp_group):
     """Test compute_slot_mapping with DCP=1, PCP=1, interleave_size=1.
@@ -114,7 +114,7 @@ def test_compute_slot_mapping_dcp1_pcp1_interleave1(mock_get_dcp_group,
 
     block_table.compute_slot_mapping(req_indices, positions)
 
-    actual_result = block_table.slot_mapping_np[:len(positions)]
+    actual_result = block_table.slot_mapping.np[:len(positions)]
     np.testing.assert_array_equal(
         actual_result, expected_result,
         f"DCP=1, PCP=1, interleave=1, dcp_rank=0, pcp_rank=0")
@@ -148,8 +148,8 @@ def test_compute_slot_mapping_dcp1_pcp1_interleave1(mock_get_dcp_group,
         (1, 3,
          [-1, -1, -1, -1, -1, -1, -1, 0, -1, -1, -1, -1, -1, -1, -1, 1]),
     ])
-@patch('vllm.distributed.parallel_state.get_pcp_group')
-@patch('vllm.distributed.parallel_state.get_dcp_group')
+@patch('vllm.distributed.get_pcp_group')
+@patch('vllm.distributed.get_dcp_group')
 def test_compute_slot_mapping_dcp4_pcp2_interleave1(mock_get_dcp_group,
                                                      mock_get_pcp_group,
                                                      pcp_rank, dcp_rank,
@@ -182,7 +182,7 @@ def test_compute_slot_mapping_dcp4_pcp2_interleave1(mock_get_dcp_group,
 
     block_table.compute_slot_mapping(req_indices, positions)
 
-    actual_result = block_table.slot_mapping_np[:len(positions)]
+    actual_result = block_table.slot_mapping.np[:len(positions)]
     np.testing.assert_array_equal(
         actual_result, expected_result,
         f"DCP=4, PCP=2, interleave=1, dcp_rank={dcp_rank}, pcp_rank={pcp_rank}"
@@ -209,8 +209,8 @@ def test_compute_slot_mapping_dcp4_pcp2_interleave1(mock_get_dcp_group,
         # Rank 7 gets no positions
         (1, 3, None),
     ])
-@patch('vllm.distributed.parallel_state.get_pcp_group')
-@patch('vllm.distributed.parallel_state.get_dcp_group')
+@patch('vllm.distributed.get_pcp_group')
+@patch('vllm.distributed.get_dcp_group')
 def test_compute_slot_mapping_dcp4_pcp2_interleave128(mock_get_dcp_group,
                                                        mock_get_pcp_group,
                                                        pcp_rank, dcp_rank,
@@ -246,7 +246,7 @@ def test_compute_slot_mapping_dcp4_pcp2_interleave128(mock_get_dcp_group,
 
     block_table.compute_slot_mapping(req_indices, positions)
 
-    actual_result = block_table.slot_mapping_np[:len(positions)]
+    actual_result = block_table.slot_mapping.np[:len(positions)]
 
     # Build expected result based on which positions this rank owns
     expected_result = np.full(num_positions, -1, dtype=np.int32)
