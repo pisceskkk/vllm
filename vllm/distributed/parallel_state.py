@@ -645,6 +645,11 @@ class GroupCoordinator:
         while self._async_send_buff and self._async_send_buff[0][0].is_completed():
             self._async_send_buff.popleft()
 
+    def _wait_send_buff(self):
+        while self._async_send_buff:
+            self._async_send_buff[0][0].wait()
+            self._async_send_buff.popleft()
+
     def _send(
         self,
         tensor: Tensor,
@@ -653,6 +658,7 @@ class GroupCoordinator:
         tag: int = 0,
         group_dst: int | None = None,
         is_async: bool = False,
+        wait_buffer: bool = False,
     ) -> Work | None:
         if not is_async:
             return torch.distributed.send(
@@ -662,7 +668,10 @@ class GroupCoordinator:
                 tag=tag,
                 group_dst=group_dst,
             )
-        self._release_completed_send_buff()
+        if wait_buffer:
+            self._wait_send_buff()
+        else:
+            self._release_completed_send_buff()
         work = torch.distributed.isend(
             tensor=tensor,
             dst=dst,
@@ -720,7 +729,7 @@ class GroupCoordinator:
 
         # Send object size
 
-        self._send(size_tensor, dst=self.ranks[dst], group=self.cpu_group, is_async=is_async)
+        self._send(size_tensor, dst=self.ranks[dst], group=self.cpu_group, is_async=is_async, wait_buffer=True)
 
         # Send object
         self._send(object_tensor, dst=self.ranks[dst], group=self.cpu_group, is_async=is_async)
