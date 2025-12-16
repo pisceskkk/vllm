@@ -44,6 +44,7 @@ from vllm.transformers_utils.utils import check_gguf_file
 from vllm.utils import (STR_DUAL_CHUNK_FLASH_ATTN_VAL, FlexibleArgumentParser,
                         GiB_bytes, get_ip, is_in_ray_actor)
 from vllm.v1.sample.logits_processor import LogitsProcessor
+from vllm.v1.core.sched.budget import BudgetType, TokenBudget
 
 # yapf: enable
 
@@ -461,6 +462,8 @@ class EngineArgs:
     enable_dcpp: bool = SchedulerConfig.enable_dcpp
     dcpp_min_chunk: Optional[int] = SchedulerConfig.dcpp_min_chunk
     dcpp_length_threshold: int = SchedulerConfig.dcpp_length_threshold
+
+    budget_type: BudgetType = "computational_load"
 
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
@@ -884,6 +887,8 @@ class EngineArgs:
                                      **scheduler_kwargs["dcpp_min_chunk"])
         scheduler_group.add_argument("--dcpp-length-threshold",
                                      **scheduler_kwargs["dcpp_length_threshold"])
+        scheduler_group.add_argument("--budget-type",
+                                    **scheduler_kwargs["budget_type"])
 
         # vLLM arguments
         vllm_kwargs = get_kwargs(VllmConfig)
@@ -1354,6 +1359,7 @@ class EngineArgs:
             enable_dcpp=self.enable_dcpp,
             dcpp_min_chunk=self.dcpp_min_chunk,
             dcpp_length_threshold=self.dcpp_length_threshold,
+            budget_type=self.budget_type,
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:

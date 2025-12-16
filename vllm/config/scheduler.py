@@ -24,6 +24,7 @@ logger = init_logger(__name__)
 
 PreemptionMode = Literal["swap", "recompute"]
 SchedulerPolicy = Literal["fcfs", "priority"]
+BudgetType = Literal["token", "computational_load"]
 
 
 @config
@@ -170,6 +171,14 @@ class SchedulerConfig:
     dcpp_length_threshold: int = 0
     """Input length threshold to trigger DCPP logic. Requests with prompt
     length below this value will not use DCPP even if enabled."""
+
+    budget_type: BudgetType = "computational_load"
+    """The budget type to use:\n
+    - "token" means each scheduling uses a fixed number of tokens to form a batch.\n
+    - "computational_load" means using computational load as a metric to determine
+        the number of tokens that can be allocated in the current batch during 
+        each scheduling operation.
+    """
 
     def compute_hash(self) -> str:
         """
