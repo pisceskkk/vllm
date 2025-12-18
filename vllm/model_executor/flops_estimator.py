@@ -44,6 +44,8 @@ class BaseModelEstimator(ABC):
         # Baseline and attention-equivalent tokens configured from scheduler
         self.attn_equiv_baseline_c: int = 0
         self.attn_equiv_tokens: int = 0
+        self.linear_coeff: int = 0
+        self.quadratic_coeff: int = 0
     
     def _parse_common_config(self):
         """Parse common configuration parameters"""
@@ -195,6 +197,81 @@ class BaseModelEstimator(ABC):
         # do not exceed remaining tokens
         dcpp_chunk = min(dcpp_chunk, seq_len - hist_seq_len)
         return dcpp_chunk, scheduled_chunk
+    
+    def calculate_current_flops(self, chunk_size:int, hist_seq_len:int, layer_idx: Optional[int] = None) -> int:
+        """
+        Compute total Flops of current chunk_size and hist_seq_len..
+        """
+        seq_len = hist_seq_len + chunk_size
+        
+        proj_flops, attn_flops = self.calculate_attention_flops(chunk_size, seq_len)
+        attn_flops = attn_flops * self.attn_flops_scale
+        ffn_flops = self.calculate_ffn_flops(chunk_size, layer_idx)
+        other_flops = self.calculate_other_flops(chunk_size)
+
+        total_flops = ffn_flops + other_flops + proj_flops + attn_flops
+        return total_flops
+
+    def compute_chunk_size_with_flops(self,
+                                      hist_seq_len: int,
+                                      target_flops: int,
+                                      block_size: int,
+                                      layer_idx: Optional[int] = None) -> int:
+        """                            
+        FLOPs = a·chunk_size + b·chunk_size·(chunk_size + hist_seq_len)
+        
+            chunk_size: Current chunk size
+            kv_cache_len: KV cache length (number of processed tokens)
+            layer_idx: Specific layer index 
+
+        Args:
+            hist_seq_len: KV cache length
+            target_flops: Current FLOPs
+            
+        Returns:
+            chunk_size: actual reduced chunk size to run this step
+        """
+        if self.linear_coeff == 0 or self.quadratic_coeff == 0:
+            chunk_small = block_size 
+            chunk_large = block_size + block_size
+            
+            flops_small = self.calculate_current_flops(chunk_small, hist_seq_len, layer_idx)
+            flops_large = self.calculate_current_flops(chunk_large, hist_seq_len, layer_idx)
+            
+            # FLOPs = a·chunk_size + b·chunk_size·(chunk_size + hist_seq_len)
+            # Compute linear_coeff and quadratic_coeff
+            denominator = chunk_small * chunk_large * (chunk_large - chunk_small)
+            self.quadratic_coeff = (chunk_small * flops_large - chunk_large * flops_small) / denominator
+            self.linear_coeff = (flops_small - self.quadratic_coeff * chunk_small * 
+                                (chunk_small + hist_seq_len)) / chunk_small
+
+        if self.linear_coeff <= 0 or self.quadratic_coeff <= 0:
+            # Fallback to linear model, maybe change to assert.
+            chunk_small = block_size
+            chunk_large = block_size + block_size
+            
+            flops_small = self.calculate_current_flops(chunk_small, hist_seq_len, layer_idx)
+            flops_large = self.calculate_current_flops(chunk_large, hist_seq_len, layer_idx)
+            
+            linear_coeff = (flops_large - flops_small) / (chunk_large - chunk_small)
+            chunk_size = target_flops / linear_coeff
+        else:
+            # quadratic_coeff * chunk_size * chunk_size + (linear_term_coeff + quadratic_term_coeff * hist_seq_len) * chunk_size - target_flops = 0
+            quadratic_coeff = self.quadratic_coeff
+            linear_coeff = self.linear_coeff + self.quadratic_coeff * hist_seq_len
+            constant_term = -target_flops
+            
+            discriminant = linear_coeff**2 - 4 * quadratic_coeff * constant_term
+            chunk_size = (-linear_coeff + discriminant**0.5) / (2 * quadratic_coeff)
+        print(f"===================================================================================")
+        print(f"==================hist_seq_len:{hist_seq_len}|target_flops:{target_flops}")
+        print(f"==================self.linear_coeff:{self.linear_coeff}|self.quadratic_coeff:{self.quadratic_coeff}")
+        print(f"==================chunk_size:{chunk_size}")
+        
+        chunk_size = max(block_size, int(chunk_size))
+        chunk_size = (chunk_size + block_size - 1) // block_size * block_size
+        
+        return chunk_size
     
     def estimate_flops_ratio(self, chunk_size: int, kv_cache_len: int, layer_idx: Optional[int] = None) -> float:
         """
