@@ -241,30 +241,77 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
 
         This function blocks until the copy is finished.
         """
+        logger.info(
+            "!!!!! AsyncGPUModelRunnerOutput.get_output.begin "
+            "sampled_token_ids_cpu_shape=%s invalid_req_count=%d has_logprobs=%s",
+            tuple(self.sampled_token_ids_cpu.shape),
+            len(self._invalid_req_indices),
+            self._logprobs_tensors_cpu is not None,
+        )
         max_gen_len = self.sampled_token_ids_cpu.shape[-1]
+        logger.info(
+            "!!!!! AsyncGPUModelRunnerOutput.get_output.sync.begin max_gen_len=%s",
+            max_gen_len,
+        )
         self.async_copy_ready_event.synchronize()
+        logger.info(
+            "!!!!! AsyncGPUModelRunnerOutput.get_output.sync.end max_gen_len=%s",
+            max_gen_len,
+        )
 
         # Release the device tensors once the copy has completed.
         del self._logprobs_tensors
         del self._sampled_token_ids
         if max_gen_len == 1:
+            logger.info(
+                "!!!!! AsyncGPUModelRunnerOutput.get_output.decode_single.begin "
+                "invalid_req_count=%d has_logprobs=%s",
+                len(self._invalid_req_indices),
+                self._logprobs_tensors_cpu is not None,
+            )
             valid_sampled_token_ids = self.sampled_token_ids_cpu.tolist()
             for i in self._invalid_req_indices:
                 valid_sampled_token_ids[i].clear()
             logprobs_lists = None
             if self._logprobs_tensors_cpu is not None:
                 logprobs_lists = self._logprobs_tensors_cpu.tolists()
+            logger.info(
+                "!!!!! AsyncGPUModelRunnerOutput.get_output.decode_single.end "
+                "num_rows=%d has_logprobs=%s",
+                len(valid_sampled_token_ids),
+                logprobs_lists is not None,
+            )
         else:
+            logger.info(
+                "!!!!! AsyncGPUModelRunnerOutput.get_output.rejection_parse.begin "
+                "max_gen_len=%s invalid_req_count=%d has_logprobs=%s",
+                max_gen_len,
+                len(self._invalid_req_indices),
+                self._logprobs_tensors_cpu is not None,
+            )
             valid_sampled_token_ids, logprobs_lists = RejectionSampler.parse_output(
                 self.sampled_token_ids_cpu,
                 self.vocab_size,
                 self._invalid_req_indices,
                 logprobs_tensors=self._logprobs_tensors_cpu,
             )
+            logger.info(
+                "!!!!! AsyncGPUModelRunnerOutput.get_output.rejection_parse.end "
+                "num_rows=%d has_logprobs=%s",
+                len(valid_sampled_token_ids),
+                logprobs_lists is not None,
+            )
 
         output = self._model_runner_output
         output.sampled_token_ids = valid_sampled_token_ids
         output.logprobs = logprobs_lists
+        logger.info(
+            "!!!!! AsyncGPUModelRunnerOutput.get_output.end "
+            "req_count=%d sampled_rows=%d has_logprobs=%s",
+            len(output.req_ids),
+            len(output.sampled_token_ids),
+            output.logprobs is not None,
+        )
         return output
 
 
