@@ -214,6 +214,7 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         self._invalid_req_indices = invalid_req_indices
 
         # Event on the copy stream so we can synchronize the non-blocking copy.
+        self.copy_submitted_event = torch.Event()
         self.async_copy_ready_event = torch.Event()
 
         # Keep a reference to the device tensor to avoid it being
@@ -226,15 +227,25 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         default_stream = torch.cuda.current_stream()
         logger.info(
             "!!!!! AsyncGPUModelRunnerOutput.init.begin "
-            "sampled_token_ids_shape=%s invalid_req_count=%d has_logprobs=%s",
+            "sampled_token_ids_shape=%s invalid_req_count=%d has_logprobs=%s "
+            "device=%s dtype=%s is_contiguous=%s stride=%s",
             tuple(self._sampled_token_ids.shape),
             len(self._invalid_req_indices),
             self._logprobs_tensors is not None,
+            self._sampled_token_ids.device,
+            self._sampled_token_ids.dtype,
+            self._sampled_token_ids.is_contiguous(),
+            self._sampled_token_ids.stride(),
         )
         with torch.cuda.stream(async_output_copy_stream):
             logger.info("!!!!! AsyncGPUModelRunnerOutput.init.wait_stream.begin")
             async_output_copy_stream.wait_stream(default_stream)
             logger.info("!!!!! AsyncGPUModelRunnerOutput.init.wait_stream.end")
+            logger.info(
+                "!!!!! AsyncGPUModelRunnerOutput.init.copy_submitted_event.begin"
+            )
+            self.copy_submitted_event.record()
+            logger.info("!!!!! AsyncGPUModelRunnerOutput.init.copy_submitted_event.end")
             logger.info("!!!!! AsyncGPUModelRunnerOutput.init.token_copy.begin")
             self.sampled_token_ids_cpu = self._sampled_token_ids.to(
                 "cpu", non_blocking=True
@@ -280,10 +291,34 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
             "!!!!! AsyncGPUModelRunnerOutput.get_output.sync.begin max_gen_len=%s",
             max_gen_len,
         )
-        self.async_copy_ready_event.synchronize()
+        sync_start = time.monotonic()
+        sync_wait_logged = False
+        sync_poll_count = 0
+        while not self.async_copy_ready_event.query():
+            if not sync_wait_logged:
+                logger.info(
+                    "!!!!! AsyncGPUModelRunnerOutput.get_output.sync.wait "
+                    "elapsed_ms=0 ready_event=%s copy_submitted_event=%s",
+                    self.async_copy_ready_event.query(),
+                    self.copy_submitted_event.query(),
+                )
+                sync_wait_logged = True
+            elif sync_poll_count < 10 or sync_poll_count % 10 == 0:
+                elapsed_ms = int((time.monotonic() - sync_start) * 1000)
+                logger.info(
+                    "!!!!! AsyncGPUModelRunnerOutput.get_output.sync.poll "
+                    "elapsed_ms=%d ready_event=%s copy_submitted_event=%s",
+                    elapsed_ms,
+                    self.async_copy_ready_event.query(),
+                    self.copy_submitted_event.query(),
+                )
+            time.sleep(0.1)
+            sync_poll_count += 1
         logger.info(
-            "!!!!! AsyncGPUModelRunnerOutput.get_output.sync.end max_gen_len=%s",
+            "!!!!! AsyncGPUModelRunnerOutput.get_output.sync.end max_gen_len=%s "
+            "elapsed_ms=%d",
             max_gen_len,
+            int((time.monotonic() - sync_start) * 1000),
         )
 
         # Release the device tensors once the copy has completed.

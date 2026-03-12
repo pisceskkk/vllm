@@ -930,26 +930,10 @@ class WorkerProc:
         it is passed to the async_output_busy_loop thread. Otherwise, it is
         enqueued directly to the worker_response_mq.
         """
-        logger.info(
-            "!!!!! WorkerProc handle_output.begin rank=%s rpc_id=%s "
-            "use_async_scheduling=%s output_type=%s",
-            self.rank,
-            rpc_id,
-            self.use_async_scheduling,
-            type(output).__name__,
-        )
         if self.use_async_scheduling:
             self.async_output_queue.put((rpc_id, output))
         else:
             self.enqueue_output(rpc_id, output)
-        logger.info(
-            "!!!!! WorkerProc handle_output.end rank=%s rpc_id=%s "
-            "use_async_scheduling=%s output_type=%s",
-            self.rank,
-            rpc_id,
-            self.use_async_scheduling,
-            type(output).__name__,
-        )
 
     def async_output_busy_loop(self):
         """Entrypoint for the thread which handles outputs asynchronously."""
@@ -980,15 +964,6 @@ class WorkerProc:
             )
             method_name = _get_rpc_method_name(method)
             will_reply = output_rank is None or self.rank == output_rank
-            logger.info(
-                "!!!!! WorkerProc busy_loop.dequeue rank=%s rpc_id=%s method=%s "
-                "output_rank=%s will_reply=%s",
-                self.rank,
-                rpc_id,
-                method_name,
-                output_rank,
-                will_reply,
-            )
             try:
                 if isinstance(method, str):
                     func = getattr(self.worker, method)

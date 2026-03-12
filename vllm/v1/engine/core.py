@@ -1455,25 +1455,7 @@ class DPEngineCoreProc(EngineCoreProc):
 
                 # We are in a running state and so must execute a dummy pass
                 # if the model didn't execute any ready requests.
-                logger.info(
-                    "!!!!! DPEngineCore run_busy_loop.execute_dummy_batch.begin "
-                    "dp_rank=%s local_unfinished_reqs=%s engines_running=%s "
-                    "batch_queue_len=%s",
-                    self.dp_rank,
-                    local_unfinished_reqs,
-                    self.engines_running,
-                    len(self.batch_queue) if self.batch_queue is not None else 0,
-                )
                 self.execute_dummy_batch()
-                logger.info(
-                    "!!!!! DPEngineCore run_busy_loop.execute_dummy_batch.end "
-                    "dp_rank=%s local_unfinished_reqs=%s engines_running=%s "
-                    "batch_queue_len=%s",
-                    self.dp_rank,
-                    local_unfinished_reqs,
-                    self.engines_running,
-                    len(self.batch_queue) if self.batch_queue is not None else 0,
-                )
 
             # 3) All-reduce operation to determine global unfinished reqs.
             self.engines_running = self._has_global_unfinished_reqs(
