@@ -90,66 +90,30 @@ class FutureWrapper(Future):
     def result(self, timeout=None):
         if timeout is not None:
             raise RuntimeError("timeout not implemented")
-        logger.info(
-            "!!!!! Executor future.result.begin rpc_id=%s method=%s pending_futures=%d",
-            self.rpc_id,
-            self.method_name,
-            len(self.futures_queue),
-        )
         # Drain any futures ahead of us in the queue.
         while not self.done():
             future, get_response = self.futures_queue.pop()
-            logger.info(
-                "!!!!! Executor future.result.drain.begin wait_rpc_id=%s "
-                "wait_method=%s draining_rpc_id=%s draining_method=%s "
-                "pending_remaining=%d",
-                self.rpc_id,
-                self.method_name,
-                future.rpc_id,
-                future.method_name,
-                len(self.futures_queue),
-            )
             future.wait_for_response(get_response)
             future_exception = future.exception()
-            logger.info(
-                "!!!!! Executor future.result.drain.end wait_rpc_id=%s "
-                "wait_method=%s draining_rpc_id=%s draining_method=%s "
-                "future_done=%s future_exception_type=%s",
-                self.rpc_id,
-                self.method_name,
-                future.rpc_id,
-                future.method_name,
-                future.done(),
-                type(future_exception).__name__
-                if future_exception is not None
-                else "None",
-            )
+            if future_exception is not None:
+                logger.info(
+                    "!!!!! Executor future.result.drain.failed wait_rpc_id=%s "
+                    "wait_method=%s draining_rpc_id=%s draining_method=%s "
+                    "future_exception_type=%s",
+                    self.rpc_id,
+                    self.method_name,
+                    future.rpc_id,
+                    future.method_name,
+                    type(future_exception).__name__,
+                )
         result = super().result()
-        logger.info(
-            "!!!!! Executor future.result.end rpc_id=%s method=%s result_type=%s",
-            self.rpc_id,
-            self.method_name,
-            type(result).__name__,
-        )
         return result
 
     def wait_for_response(self, get_response: Callable):
-        logger.info(
-            "!!!!! Executor future.wait_for_response.begin rpc_id=%s method=%s",
-            self.rpc_id,
-            self.method_name,
-        )
         try:
             response = self.aggregate(get_response())
             with suppress(InvalidStateError):
                 self.set_result(response)
-            logger.info(
-                "!!!!! Executor future.wait_for_response.end rpc_id=%s method=%s "
-                "result_type=%s",
-                self.rpc_id,
-                self.method_name,
-                type(response).__name__,
-            )
         except Exception as e:
             with suppress(InvalidStateError):
                 self.set_exception(e)
@@ -411,24 +375,7 @@ class MultiprocExecutor(Executor):
             send_method = method
         else:
             send_method = cloudpickle.dumps(method, protocol=pickle.HIGHEST_PROTOCOL)
-        logger.info(
-            "!!!!! Executor collective_rpc.enqueue.begin rpc_id=%s method=%s "
-            "non_block=%s output_rank=%s pending_futures=%d",
-            rpc_id,
-            method_name,
-            non_block,
-            output_rank,
-            len(self.futures_queue),
-        )
         self.rpc_broadcast_mq.enqueue((rpc_id, send_method, args, kwargs, output_rank))
-        logger.info(
-            "!!!!! Executor collective_rpc.enqueue.end rpc_id=%s method=%s "
-            "non_block=%s output_rank=%s",
-            rpc_id,
-            method_name,
-            non_block,
-            output_rank,
-        )
 
         response_mqs: Sequence[MessageQueue] = self.response_mqs
         if output_rank is not None:
@@ -437,26 +384,10 @@ class MultiprocExecutor(Executor):
         shutdown_event = self.shutdown_event
 
         def get_response():
-            logger.info(
-                "!!!!! Executor collective_rpc.wait_response.begin rpc_id=%s "
-                "method=%s output_rank=%s response_count=%d",
-                rpc_id,
-                method_name,
-                output_rank,
-                len(response_mqs),
-            )
             responses = []
             for response_index, mq in enumerate(response_mqs):
                 dequeue_timeout = (
                     None if deadline is None else (deadline - time.monotonic())
-                )
-                logger.info(
-                    "!!!!! Executor collective_rpc.wait_response.dequeue.begin "
-                    "rpc_id=%s method=%s response_index=%d timeout=%s",
-                    rpc_id,
-                    method_name,
-                    response_index,
-                    dequeue_timeout,
                 )
                 try:
                     response_rpc_id, status, result = mq.dequeue(
@@ -492,14 +423,6 @@ class MultiprocExecutor(Executor):
                     )
                 responses.append(result)
             response = responses[0] if output_rank is not None else responses
-            logger.info(
-                "!!!!! Executor collective_rpc.wait_response.end rpc_id=%s "
-                "method=%s response_total=%d return_type=%s",
-                rpc_id,
-                method_name,
-                len(responses),
-                type(response).__name__,
-            )
             return response
 
         if non_block:
@@ -510,57 +433,26 @@ class MultiprocExecutor(Executor):
                 method_name=method_name,
             )
             self.futures_queue.appendleft((future, get_response))
-            logger.info(
-                "!!!!! Executor collective_rpc.future_queued rpc_id=%s method=%s "
-                "pending_futures=%d",
-                rpc_id,
-                method_name,
-                len(self.futures_queue),
-            )
             return future
 
         # First drain any pending futures in the queue.
         while self.futures_queue:
             future, get_fut_response = self.futures_queue.pop()
-            logger.info(
-                "!!!!! Executor collective_rpc.drain_future.begin rpc_id=%s "
-                "method=%s draining_rpc_id=%s draining_method=%s "
-                "pending_remaining=%d",
-                rpc_id,
-                method_name,
-                future.rpc_id,
-                future.method_name,
-                len(self.futures_queue),
-            )
             future.wait_for_response(get_fut_response)
             future_exception = future.exception()
-            logger.info(
-                "!!!!! Executor collective_rpc.drain_future.end rpc_id=%s "
-                "method=%s draining_rpc_id=%s draining_method=%s "
-                "future_done=%s future_exception_type=%s",
-                rpc_id,
-                method_name,
-                future.rpc_id,
-                future.method_name,
-                future.done(),
-                type(future_exception).__name__
-                if future_exception is not None
-                else "None",
-            )
+            if future_exception is not None:
+                logger.info(
+                    "!!!!! Executor collective_rpc.drain_future.failed rpc_id=%s "
+                    "method=%s draining_rpc_id=%s draining_method=%s "
+                    "future_exception_type=%s",
+                    rpc_id,
+                    method_name,
+                    future.rpc_id,
+                    future.method_name,
+                    type(future_exception).__name__,
+                )
 
-        logger.info(
-            "!!!!! Executor collective_rpc.return.begin rpc_id=%s method=%s",
-            rpc_id,
-            method_name,
-        )
         response = aggregate(get_response())
-        logger.info(
-            "!!!!! Executor collective_rpc.return.end rpc_id=%s method=%s "
-            "result_type=%s",
-            rpc_id,
-            method_name,
-            type(response).__name__,
-        )
         return response
 
     @staticmethod
@@ -1103,12 +995,6 @@ class WorkerProc:
                 elif isinstance(method, bytes):
                     func = partial(cloudpickle.loads(method), self.worker)
 
-                logger.info(
-                    "!!!!! WorkerProc busy_loop.func.begin rank=%s rpc_id=%s method=%s",
-                    self.rank,
-                    rpc_id,
-                    method_name,
-                )
                 output = func(*args, **kwargs)
                 logger.info(
                     "!!!!! WorkerProc busy_loop.func.end rank=%s rpc_id=%s "
@@ -1136,23 +1022,7 @@ class WorkerProc:
                 # exception might not be serializable, so we convert it to
                 # string, only for logging purpose.
                 if will_reply:
-                    logger.info(
-                        "!!!!! WorkerProc busy_loop.handle_output.begin rank=%s "
-                        "rpc_id=%s method=%s output_type=%s",
-                        self.rank,
-                        rpc_id,
-                        method_name,
-                        type(e).__name__,
-                    )
                     self.handle_output(rpc_id, e)
-                    logger.info(
-                        "!!!!! WorkerProc busy_loop.handle_output.end rank=%s "
-                        "rpc_id=%s method=%s output_type=%s",
-                        self.rank,
-                        rpc_id,
-                        method_name,
-                        type(e).__name__,
-                    )
                 else:
                     logger.info(
                         "!!!!! WorkerProc busy_loop.skip_output rank=%s "
@@ -1166,23 +1036,7 @@ class WorkerProc:
                 continue
 
             if will_reply:
-                logger.info(
-                    "!!!!! WorkerProc busy_loop.handle_output.begin rank=%s "
-                    "rpc_id=%s method=%s output_type=%s",
-                    self.rank,
-                    rpc_id,
-                    method_name,
-                    type(output).__name__,
-                )
                 self.handle_output(rpc_id, output)
-                logger.info(
-                    "!!!!! WorkerProc busy_loop.handle_output.end rank=%s "
-                    "rpc_id=%s method=%s output_type=%s",
-                    self.rank,
-                    rpc_id,
-                    method_name,
-                    type(output).__name__,
-                )
             else:
                 logger.info(
                     "!!!!! WorkerProc busy_loop.skip_output rank=%s rpc_id=%s "

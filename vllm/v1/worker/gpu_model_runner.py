@@ -224,17 +224,44 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
 
         # Initiate the copy on a separate stream, but do not synchronize it.
         default_stream = torch.cuda.current_stream()
+        logger.info(
+            "!!!!! AsyncGPUModelRunnerOutput.init.begin "
+            "sampled_token_ids_shape=%s invalid_req_count=%d has_logprobs=%s",
+            tuple(self._sampled_token_ids.shape),
+            len(self._invalid_req_indices),
+            self._logprobs_tensors is not None,
+        )
         with torch.cuda.stream(async_output_copy_stream):
+            logger.info("!!!!! AsyncGPUModelRunnerOutput.init.wait_stream.begin")
             async_output_copy_stream.wait_stream(default_stream)
+            logger.info("!!!!! AsyncGPUModelRunnerOutput.init.wait_stream.end")
+            logger.info("!!!!! AsyncGPUModelRunnerOutput.init.token_copy.begin")
             self.sampled_token_ids_cpu = self._sampled_token_ids.to(
                 "cpu", non_blocking=True
+            )
+            logger.info("!!!!! AsyncGPUModelRunnerOutput.init.token_copy.end")
+            logger.info(
+                "!!!!! AsyncGPUModelRunnerOutput.init.logprobs_copy.begin enabled=%s",
+                self._logprobs_tensors is not None,
             )
             self._logprobs_tensors_cpu = (
                 self._logprobs_tensors.to_cpu_nonblocking()
                 if self._logprobs_tensors
                 else None
             )
+            logger.info(
+                "!!!!! AsyncGPUModelRunnerOutput.init.logprobs_copy.end enabled=%s",
+                self._logprobs_tensors_cpu is not None,
+            )
+            logger.info("!!!!! AsyncGPUModelRunnerOutput.init.event_record.begin")
             self.async_copy_ready_event.record()
+            logger.info("!!!!! AsyncGPUModelRunnerOutput.init.event_record.end")
+        logger.info(
+            "!!!!! AsyncGPUModelRunnerOutput.init.end "
+            "sampled_token_ids_cpu_shape=%s has_logprobs=%s",
+            tuple(self.sampled_token_ids_cpu.shape),
+            self._logprobs_tensors_cpu is not None,
+        )
 
     def get_output(self) -> ModelRunnerOutput:
         """Copy the device tensors to the host and return a ModelRunnerOutput.
@@ -263,43 +290,18 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         del self._logprobs_tensors
         del self._sampled_token_ids
         if max_gen_len == 1:
-            logger.info(
-                "!!!!! AsyncGPUModelRunnerOutput.get_output.decode_single.begin "
-                "invalid_req_count=%d has_logprobs=%s",
-                len(self._invalid_req_indices),
-                self._logprobs_tensors_cpu is not None,
-            )
             valid_sampled_token_ids = self.sampled_token_ids_cpu.tolist()
             for i in self._invalid_req_indices:
                 valid_sampled_token_ids[i].clear()
             logprobs_lists = None
             if self._logprobs_tensors_cpu is not None:
                 logprobs_lists = self._logprobs_tensors_cpu.tolists()
-            logger.info(
-                "!!!!! AsyncGPUModelRunnerOutput.get_output.decode_single.end "
-                "num_rows=%d has_logprobs=%s",
-                len(valid_sampled_token_ids),
-                logprobs_lists is not None,
-            )
         else:
-            logger.info(
-                "!!!!! AsyncGPUModelRunnerOutput.get_output.rejection_parse.begin "
-                "max_gen_len=%s invalid_req_count=%d has_logprobs=%s",
-                max_gen_len,
-                len(self._invalid_req_indices),
-                self._logprobs_tensors_cpu is not None,
-            )
             valid_sampled_token_ids, logprobs_lists = RejectionSampler.parse_output(
                 self.sampled_token_ids_cpu,
                 self.vocab_size,
                 self._invalid_req_indices,
                 logprobs_tensors=self._logprobs_tensors_cpu,
-            )
-            logger.info(
-                "!!!!! AsyncGPUModelRunnerOutput.get_output.rejection_parse.end "
-                "num_rows=%d has_logprobs=%s",
-                len(valid_sampled_token_ids),
-                logprobs_lists is not None,
             )
 
         output = self._model_runner_output
