@@ -3619,12 +3619,26 @@ class GPUModelRunner(
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
         ):
+            logger.info(
+                "!!!!! DefaultStream execute_model.forward.begin "
+                "num_tokens_padded=%s num_scheduled_tokens=%s is_last_pp=%s",
+                num_tokens_padded,
+                num_scheduled_tokens,
+                get_pp_group().is_last_rank,
+            )
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
+            )
+            logger.info(
+                "!!!!! DefaultStream execute_model.forward.end "
+                "num_tokens_padded=%s num_scheduled_tokens=%s output_type=%s",
+                num_tokens_padded,
+                num_scheduled_tokens,
+                type(model_output).__name__,
             )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
@@ -3655,7 +3669,18 @@ class GPUModelRunner(
                     )
 
                 sample_hidden_states = hidden_states[logits_indices]
+                logger.info(
+                    "!!!!! DefaultStream execute_model.compute_logits.begin "
+                    "sample_hidden_states_shape=%s",
+                    tuple(sample_hidden_states.shape),
+                )
                 logits = self.model.compute_logits(sample_hidden_states)
+                logger.info(
+                    "!!!!! DefaultStream execute_model.compute_logits.end "
+                    "logits_shape=%s logits_dtype=%s",
+                    tuple(logits.shape),
+                    logits.dtype,
+                )
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -3747,7 +3772,16 @@ class GPUModelRunner(
             )
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
+            logger.info(
+                "!!!!! DefaultStream sample_tokens.sample.begin logits_shape=%s",
+                tuple(logits.shape),
+            )
             sampler_output = self._sample(logits, spec_decode_metadata)
+            logger.info(
+                "!!!!! DefaultStream sample_tokens.sample.end "
+                "sampled_token_ids_shape=%s",
+                tuple(sampler_output.sampled_token_ids.shape),
+            )
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
@@ -3823,6 +3857,12 @@ class GPUModelRunner(
                 propose_drafts_after_bookkeeping = input_fits_in_drafter
 
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
+            logger.info(
+                "!!!!! DefaultStream sample_tokens.bookkeeping.begin "
+                "num_scheduled_tokens=%s sampled_token_ids_shape=%s",
+                scheduler_output.total_num_scheduled_tokens,
+                tuple(sampler_output.sampled_token_ids.shape),
+            )
             (
                 num_nans_in_logits,
                 logprobs_lists,
@@ -3838,6 +3878,12 @@ class GPUModelRunner(
                 hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
                 spec_decode_metadata,
+            )
+            logger.info(
+                "!!!!! DefaultStream sample_tokens.bookkeeping.end "
+                "valid_rows=%s invalid_req_count=%s",
+                len(valid_sampled_token_ids),
+                len(invalid_req_indices),
             )
 
         if propose_drafts_after_bookkeeping:
@@ -3876,6 +3922,12 @@ class GPUModelRunner(
         with record_function_or_nullcontext(
             "gpu_model_runner: AsyncGPUModelRunnerOutput"
         ):
+            logger.info(
+                "!!!!! DefaultStream sample_tokens.async_output.begin "
+                "sampled_token_ids_shape=%s invalid_req_count=%s",
+                tuple(sampler_output.sampled_token_ids.shape),
+                len(invalid_req_indices),
+            )
             async_output = AsyncGPUModelRunnerOutput(
                 model_runner_output=output,
                 sampled_token_ids=sampler_output.sampled_token_ids,
@@ -3883,6 +3935,11 @@ class GPUModelRunner(
                 invalid_req_indices=invalid_req_indices,
                 async_output_copy_stream=self.async_output_copy_stream,
                 vocab_size=self.input_batch.vocab_size,
+            )
+            logger.info(
+                "!!!!! DefaultStream sample_tokens.async_output.end "
+                "sampled_token_ids_cpu_shape=%s",
+                tuple(async_output.sampled_token_ids_cpu.shape),
             )
         with record_function_or_nullcontext(
             "gpu_model_runner: set_async_sampled_token_ids"
