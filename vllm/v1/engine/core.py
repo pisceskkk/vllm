@@ -340,6 +340,35 @@ class EngineCore:
         """
         self._scheduler_paused = False
 
+    @staticmethod
+    def _describe_scheduler_output(scheduler_output: SchedulerOutput | None) -> str:
+        if scheduler_output is None:
+            return "scheduler_output=None"
+
+        req_ids = list(scheduler_output.num_scheduled_tokens.keys())
+        return (
+            "scheduler_output("
+            "total_num_scheduled_tokens="
+            f"{scheduler_output.total_num_scheduled_tokens}, "
+            f"num_reqs={len(req_ids)}, "
+            f"pending_structured_output_tokens="
+            f"{scheduler_output.pending_structured_output_tokens}, "
+            f"req_ids={req_ids[:8]}"
+            ")"
+        )
+
+    @staticmethod
+    def _describe_future(future: Future[Any] | None) -> str:
+        if future is None:
+            return "future=None"
+        return (
+            "future("
+            f"id={id(future)}, "
+            f"type={type(future).__name__}, "
+            f"done={future.done()}"
+            ")"
+        )
+
     @contextmanager
     def log_error_detail(self, scheduler_output: SchedulerOutput):
         """Execute the model and log detailed info on failure."""
@@ -463,8 +492,20 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
+            logger.info(
+                "!!!!! EngineCore step_with_batch_queue.schedule "
+                "batch_queue_len=%d batch_queue_size=%d %s",
+                len(batch_queue),
+                self.batch_queue_size,
+                self._describe_scheduler_output(scheduler_output),
+            )
             exec_future = self.model_executor.execute_model(
                 scheduler_output, non_block=True
+            )
+            logger.info(
+                "!!!!! EngineCore step_with_batch_queue.execute_model_dispatched %s %s",
+                self._describe_scheduler_output(scheduler_output),
+                self._describe_future(cast(Future[Any], exec_future)),
             )
             if not self.is_ec_producer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
@@ -472,6 +513,7 @@ class EngineCore:
             if self.is_pooling_model or not model_executed:
                 # No sampling required (no requests scheduled).
                 future = cast(Future[ModelRunnerOutput], exec_future)
+                future_kind = "execute_model"
             else:
                 if not scheduler_output.pending_structured_output_tokens:
                     # We aren't waiting for any tokens, get any grammar output
@@ -482,14 +524,36 @@ class EngineCore:
                     future = self.model_executor.sample_tokens(
                         grammar_output, non_block=True
                     )
+                    future_kind = "sample_tokens"
+                    logger.info(
+                        "!!!!! EngineCore step_with_batch_queue."
+                        "sample_tokens_dispatched "
+                        "%s future=%s",
+                        self._describe_scheduler_output(scheduler_output),
+                        self._describe_future(cast(Future[Any], future)),
+                    )
                 else:
                     # We need to defer sampling until we have processed the model output
                     # from the prior step.
                     deferred_scheduler_output = scheduler_output
+                    future_kind = "deferred_sample_tokens"
+                    logger.info(
+                        "!!!!! EngineCore step_with_batch_queue.defer_sampling %s",
+                        self._describe_scheduler_output(scheduler_output),
+                    )
 
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
                 batch_queue.appendleft((future, scheduler_output, exec_future))
+                logger.info(
+                    "!!!!! EngineCore step_with_batch_queue.queue_push future_kind=%s "
+                    "batch_queue_len=%d %s queued_future=%s exec_future=%s",
+                    future_kind,
+                    len(batch_queue),
+                    self._describe_scheduler_output(scheduler_output),
+                    self._describe_future(cast(Future[Any], future)),
+                    self._describe_future(cast(Future[Any], exec_future)),
+                )
                 if (
                     model_executed
                     and len(batch_queue) < self.batch_queue_size
@@ -497,6 +561,13 @@ class EngineCore:
                 ):
                     # Don't block on next worker response unless the queue is full
                     # or there are no more requests to schedule.
+                    logger.info(
+                        "!!!!! EngineCore step_with_batch_queue.return_early "
+                        "batch_queue_len=%d %s oldest_future=%s",
+                        len(batch_queue),
+                        self._describe_scheduler_output(batch_queue[-1][1]),
+                        self._describe_future(cast(Future[Any], batch_queue[-1][0])),
+                    )
                     return None, True
 
         elif not batch_queue:
@@ -507,15 +578,48 @@ class EngineCore:
 
         # Block until the next result is available.
         future, scheduler_output, exec_model_fut = batch_queue.pop()
+        logger.info(
+            "!!!!! EngineCore step_with_batch_queue.queue_pop "
+            "batch_queue_len_after_pop=%d %s popped_future=%s exec_future=%s",
+            len(batch_queue),
+            self._describe_scheduler_output(scheduler_output),
+            self._describe_future(cast(Future[Any], future)),
+            self._describe_future(cast(Future[Any], exec_model_fut)),
+        )
         with (
             self.log_error_detail(scheduler_output),
             self.log_iteration_details(scheduler_output),
         ):
+            logger.info(
+                "!!!!! EngineCore step_with_batch_queue.future_result.begin "
+                "%s future=%s",
+                self._describe_scheduler_output(scheduler_output),
+                self._describe_future(cast(Future[Any], future)),
+            )
             model_output = future.result()
+            logger.info(
+                "!!!!! EngineCore step_with_batch_queue.future_result.end "
+                "%s future=%s model_output_type=%s",
+                self._describe_scheduler_output(scheduler_output),
+                self._describe_future(cast(Future[Any], future)),
+                type(model_output).__name__,
+            )
             if model_output is None:
                 # None from sample_tokens() implies that the original execute_model()
                 # call failed - raise that exception.
+                logger.info(
+                    "!!!!! EngineCore step_with_batch_queue.exec_model_result.begin "
+                    "%s exec_future=%s reason=model_output_none",
+                    self._describe_scheduler_output(scheduler_output),
+                    self._describe_future(cast(Future[Any], exec_model_fut)),
+                )
                 exec_model_fut.result()
+                logger.info(
+                    "!!!!! EngineCore step_with_batch_queue.exec_model_result.end "
+                    "%s exec_future=%s",
+                    self._describe_scheduler_output(scheduler_output),
+                    self._describe_future(cast(Future[Any], exec_model_fut)),
+                )
                 raise RuntimeError("unexpected error")
 
         # Before processing the model output, process any aborts that happened
@@ -548,6 +652,14 @@ class EngineCore:
             )
             future = self.model_executor.sample_tokens(grammar_output, non_block=True)
             batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
+            logger.info(
+                "!!!!! EngineCore step_with_batch_queue.deferred_queue_push "
+                "batch_queue_len=%d %s queued_future=%s exec_future=%s",
+                len(batch_queue),
+                self._describe_scheduler_output(deferred_scheduler_output),
+                self._describe_future(cast(Future[Any], future)),
+                self._describe_future(cast(Future[Any], exec_future)),
+            )
 
         return engine_core_outputs, model_executed
 
@@ -1416,6 +1528,15 @@ class DPEngineCoreProc(EngineCoreProc):
 
             # 2) Step the engine core.
             executed = self._process_engine_step()
+            logger.info(
+                "!!!!! DPEngineCore run_busy_loop.step_end dp_rank=%s executed=%s "
+                "engines_running=%s scheduler_has_unfinished=%s batch_queue_len=%s",
+                self.dp_rank,
+                executed,
+                self.engines_running,
+                self.scheduler.has_unfinished_requests(),
+                len(self.batch_queue) if self.batch_queue is not None else 0,
+            )
             self._maybe_publish_request_counts()
 
             local_unfinished_reqs = self.scheduler.has_unfinished_requests()
@@ -1426,11 +1547,43 @@ class DPEngineCoreProc(EngineCoreProc):
 
                 # We are in a running state and so must execute a dummy pass
                 # if the model didn't execute any ready requests.
+                logger.info(
+                    "!!!!! DPEngineCore run_busy_loop.execute_dummy_batch.begin "
+                    "dp_rank=%s local_unfinished_reqs=%s engines_running=%s "
+                    "batch_queue_len=%s",
+                    self.dp_rank,
+                    local_unfinished_reqs,
+                    self.engines_running,
+                    len(self.batch_queue) if self.batch_queue is not None else 0,
+                )
                 self.execute_dummy_batch()
+                logger.info(
+                    "!!!!! DPEngineCore run_busy_loop.execute_dummy_batch.end "
+                    "dp_rank=%s local_unfinished_reqs=%s engines_running=%s "
+                    "batch_queue_len=%s",
+                    self.dp_rank,
+                    local_unfinished_reqs,
+                    self.engines_running,
+                    len(self.batch_queue) if self.batch_queue is not None else 0,
+                )
 
             # 3) All-reduce operation to determine global unfinished reqs.
+            logger.info(
+                "!!!!! DPEngineCore run_busy_loop.has_unfinished_dp.begin "
+                "dp_rank=%s local_unfinished_reqs=%s engines_running=%s",
+                self.dp_rank,
+                local_unfinished_reqs,
+                self.engines_running,
+            )
             self.engines_running = self._has_global_unfinished_reqs(
                 local_unfinished_reqs
+            )
+            logger.info(
+                "!!!!! DPEngineCore run_busy_loop.has_unfinished_dp.end "
+                "dp_rank=%s local_unfinished_reqs=%s engines_running=%s",
+                self.dp_rank,
+                local_unfinished_reqs,
+                self.engines_running,
             )
 
             if not self.engines_running:
