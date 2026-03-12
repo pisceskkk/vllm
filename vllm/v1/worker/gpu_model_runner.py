@@ -209,9 +209,11 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         invalid_req_indices: list[int],
         async_output_copy_stream: torch.cuda.Stream,
         vocab_size: int,
+        stage_events: dict[str, torch.Event] | None = None,
     ):
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
+        self._stage_events = stage_events or {}
 
         # Event on the copy stream so we can synchronize the non-blocking copy.
         self.copy_submitted_event = torch.Event()
@@ -298,19 +300,23 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
             if not sync_wait_logged:
                 logger.info(
                     "!!!!! AsyncGPUModelRunnerOutput.get_output.sync.wait "
-                    "elapsed_ms=0 ready_event=%s copy_submitted_event=%s",
+                    "elapsed_ms=0 ready_event=%s copy_submitted_event=%s, "
+                    "stage_events=%s",
                     self.async_copy_ready_event.query(),
                     self.copy_submitted_event.query(),
+                    {name: event.query() for name, event in self._stage_events.items()},
                 )
                 sync_wait_logged = True
             elif sync_poll_count < 10 or sync_poll_count % 10 == 0:
                 elapsed_ms = int((time.monotonic() - sync_start) * 1000)
                 logger.info(
                     "!!!!! AsyncGPUModelRunnerOutput.get_output.sync.poll "
-                    "elapsed_ms=%d ready_event=%s copy_submitted_event=%s",
+                    "elapsed_ms=%d ready_event=%s copy_submitted_event=%s,"
+                    " stage_events=%s",
                     elapsed_ms,
                     self.async_copy_ready_event.query(),
                     self.copy_submitted_event.query(),
+                    {name: event.query() for name, event in self._stage_events.items()},
                 )
             time.sleep(0.1)
             sync_poll_count += 1
