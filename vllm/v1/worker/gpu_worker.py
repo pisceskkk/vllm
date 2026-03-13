@@ -219,6 +219,7 @@ class Worker(WorkerBase):
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
+        self._pp_send_work_keys: list[str] = []
 
     def sleep(self, level: int = 1) -> None:
         from vllm.device_allocator.cumem import CuMemAllocator
@@ -707,9 +708,25 @@ class Worker(WorkerBase):
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         # ensure any previous non-blocking PP sends are complete
         if self._pp_send_work:
-            for handle in self._pp_send_work:
+            for idx, handle in enumerate(self._pp_send_work):
+                key = (
+                    self._pp_send_work_keys[idx]
+                    if idx < len(self._pp_send_work_keys)
+                    else "<unknown>"
+                )
+                logger.info(
+                    "!!!!! PP send handle.wait.begin idx=%s key=%s",
+                    idx,
+                    key,
+                )
                 handle.wait()
+                logger.info(
+                    "!!!!! PP send handle.wait.end idx=%s key=%s",
+                    idx,
+                    key,
+                )
             self._pp_send_work = []
+            self._pp_send_work_keys = []
 
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
@@ -787,6 +804,21 @@ class Worker(WorkerBase):
         )
 
         # launch non-blocking send of intermediate tensors
+        self._pp_send_work_keys = [
+            key
+            for key, value in output.tensors.items()
+            if isinstance(value, torch.Tensor) and value.numel() > 0
+        ]
+        for idx, key in enumerate(self._pp_send_work_keys):
+            tensor = output.tensors[key]
+            logger.info(
+                "!!!!! PP send handle.map idx=%s key=%s shape=%s device=%s stride=%s",
+                idx,
+                key,
+                tuple(tensor.shape),
+                tensor.device,
+                tensor.stride(),
+            )
         self._pp_send_work = get_pp_group().isend_tensor_dict(
             output.tensors,
             all_gather_group=pp_all_gather_group,
