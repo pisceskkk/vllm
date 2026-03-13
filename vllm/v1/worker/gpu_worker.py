@@ -30,6 +30,7 @@ from vllm.distributed.kv_transfer import (
     has_kv_transfer_group,
 )
 from vllm.distributed.parallel_state import (
+    GroupCoordinator,
     Handle,
     get_pcp_group,
     get_pp_group,
@@ -724,10 +725,19 @@ class Worker(WorkerBase):
                 )
             }
 
+        tp_group = get_tp_group()
+        pp_all_gather_group: GroupCoordinator | None = tp_group
+        if tp_group is not None and tp_group.world_size == 1:
+            logger.info(
+                "!!!!! PP handoff disable_tp_all_gather tp_world_size=%s",
+                tp_group.world_size,
+            )
+            pp_all_gather_group = None
+
         if forward_pass and not get_pp_group().is_first_rank:
             tensor_dict, comm_handles, comm_postprocess = (
                 get_pp_group().irecv_tensor_dict(
-                    all_gather_group=get_tp_group(),
+                    all_gather_group=pp_all_gather_group,
                     all_gather_tensors=all_gather_tensors,
                 )
             )
@@ -757,7 +767,7 @@ class Worker(WorkerBase):
         # launch non-blocking send of intermediate tensors
         self._pp_send_work = get_pp_group().isend_tensor_dict(
             output.tensors,
-            all_gather_group=get_tp_group(),
+            all_gather_group=pp_all_gather_group,
             all_gather_tensors=all_gather_tensors,
         )
 

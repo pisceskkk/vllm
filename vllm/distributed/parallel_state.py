@@ -989,6 +989,15 @@ class GroupCoordinator:
                     slice_tensor = full_tensor.reshape(all_gather_size, -1)[
                         all_gather_rank
                     ]
+                    logger.info(
+                        "!!!!! PP irecv use_all_gather key=%s all_gather_size=%s "
+                        "slice_shape=%s orig_shape=%s device=%s",
+                        key,
+                        all_gather_size,
+                        tuple(slice_tensor.shape),
+                        tuple(orig_shape),
+                        slice_tensor.device,
+                    )
                     comm_group = metadata_group if slice_tensor.is_cpu else group
                     handle = torch.distributed.irecv(
                         slice_tensor, src=self.ranks[src], group=comm_group
@@ -1002,9 +1011,23 @@ class GroupCoordinator:
                         all_gather_group=all_gather_group,
                     ) -> None:
                         assert all_gather_group is not None
+                        logger.info(
+                            "!!!!! PP irecv postprocess.begin key=%s "
+                            "all_gather_world_size=%s slice_shape=%s "
+                            "orig_shape=%s",
+                            key,
+                            all_gather_group.world_size,
+                            tuple(slice_tensor.shape),
+                            orig_shape,
+                        )
                         tensor_dict[key] = all_gather_group.all_gather(
                             slice_tensor, dim=0
                         ).reshape(orig_shape)
+                        logger.info(
+                            "!!!!! PP irecv postprocess.end key=%s result_shape=%s",
+                            key,
+                            tuple(tensor_dict[key].shape),
+                        )
 
                     postprocess.append(_postprocess)
                     tensor_dict[key] = slice_tensor
