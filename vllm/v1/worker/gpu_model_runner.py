@@ -2714,35 +2714,48 @@ class GPUModelRunner(
 
         tp = self.vllm_config.parallel_config.tensor_parallel_size
         is_rs = is_residual_scattered_for_sp(self.vllm_config, num_tokens)
-        record_intermediate_probe("preprocess_intermediate_begin_done")
 
         # When sequence parallelism is enabled, the "residual" tensor is sharded
         # across tensor parallel ranks, so each rank only needs its own slice.
         if sync_self:
             assert intermediate_tensors is not None
+            if hasattr(intermediate_tensors, "wait_for_comm"):
+                logger.info(
+                    "!!!!! Intermediate hidden_states "
+                    "wait_for_comm.begin num_tokens=%s",
+                    num_tokens,
+                )
+                intermediate_tensors.wait_for_comm()
+                logger.info(
+                    "!!!!! Intermediate hidden_states wait_for_comm.end num_tokens=%s",
+                    num_tokens,
+                )
+                record_intermediate_probe("hidden_states_recv_comm_done")
             for k, v in intermediate_tensors.items():
                 is_scattered = k == "residual" and is_rs
                 copy_len = num_tokens // tp if is_scattered else num_tokens
-                logger.info(
-                    "!!!!! Intermediate sync copy.begin key=%s copy_len=%s "
-                    "is_scattered=%s src_shape=%s dst_shape=%s",
-                    k,
-                    copy_len,
-                    is_scattered,
-                    tuple(v.shape),
-                    tuple(self.intermediate_tensors[k].shape),
-                )
+                if k == "hidden_states":
+                    logger.info(
+                        "!!!!! Intermediate hidden_states copy.begin copy_len=%s "
+                        "src_shape=%s dst_shape=%s src_device=%s dst_device=%s "
+                        "src_stride=%s dst_stride=%s",
+                        copy_len,
+                        tuple(v.shape),
+                        tuple(self.intermediate_tensors[k].shape),
+                        v.device,
+                        self.intermediate_tensors[k].device,
+                        v.stride(),
+                        self.intermediate_tensors[k].stride(),
+                    )
                 self.intermediate_tensors[k][:copy_len].copy_(
                     v[:copy_len], non_blocking=True
                 )
-                logger.info(
-                    "!!!!! Intermediate sync copy.end key=%s copy_len=%s",
-                    k,
-                    copy_len,
-                )
-                record_intermediate_probe(f"preprocess_intermediate_{k}_done")
-
-        record_intermediate_probe("preprocess_intermediate_copy_loop_done")
+                if k == "hidden_states":
+                    logger.info(
+                        "!!!!! Intermediate hidden_states copy.end copy_len=%s",
+                        copy_len,
+                    )
+                    record_intermediate_probe("hidden_states_local_copy_done")
 
         result = IntermediateTensors(
             {
@@ -2752,7 +2765,6 @@ class GPUModelRunner(
                 for k, v in self.intermediate_tensors.items()
             }
         )
-        record_intermediate_probe("preprocess_intermediate_return_done")
         return result
 
     def eplb_step(self, is_dummy: bool = False, is_profile: bool = False) -> None:
@@ -2863,16 +2875,6 @@ class GPUModelRunner(
         dict[str, Any],
         ECConnectorOutput | None,
     ]:
-        stage_events = getattr(self, "_debug_stage_events", None)
-
-        def record_preprocess_probe(name: str) -> None:
-            if stage_events is None:
-                return
-            event = torch.Event()
-            event.record()
-            stage_events[name] = event
-
-        record_preprocess_probe("preprocess_begin_done")
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         is_first_rank = get_pp_group().is_first_rank
         is_encoder_decoder = self.model_config.is_encoder_decoder
@@ -2907,7 +2909,6 @@ class GPUModelRunner(
                 **self._init_model_kwargs(),
                 **self._extract_mm_kwargs(scheduler_output),
             }
-            record_preprocess_probe("preprocess_mm_inputs_done")
         elif self.enable_prompt_embeds and is_first_rank:
             # Get the input embeddings for the tokens that are not input embeds,
             # then put them into the appropriate positions.
@@ -2935,7 +2936,6 @@ class GPUModelRunner(
             inputs_embeds = self.inputs_embeds.gpu[:num_input_tokens]
             model_kwargs = self._init_model_kwargs()
             input_ids = None
-            record_preprocess_probe("preprocess_prompt_embeds_done")
         else:
             # For text-only models, we use token ids as input.
             # While it is possible to use embeddings as input just like the
@@ -2944,7 +2944,6 @@ class GPUModelRunner(
             input_ids = self.input_ids.gpu[:num_input_tokens]
             inputs_embeds = None
             model_kwargs = self._init_model_kwargs()
-            record_preprocess_probe("preprocess_text_inputs_done")
 
         if self.uses_mrope:
             positions = self.mrope_positions.gpu[:, :num_input_tokens]
@@ -2952,7 +2951,6 @@ class GPUModelRunner(
             positions = self.xdrope_positions.gpu[:, :num_input_tokens]
         else:
             positions = self.positions.gpu[:num_input_tokens]
-        record_preprocess_probe("preprocess_positions_done")
 
         if is_first_rank:
             intermediate_tensors = None
@@ -2961,7 +2959,6 @@ class GPUModelRunner(
             intermediate_tensors = self.sync_and_slice_intermediate_tensors(
                 num_input_tokens, intermediate_tensors, True
             )
-        record_preprocess_probe("preprocess_intermediate_done")
 
         if is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
             # Run the encoder, just like we do with other multimodal inputs.
@@ -2971,7 +2968,6 @@ class GPUModelRunner(
             # ever have a single encoder input.
             encoder_outputs = self._execute_mm_encoder(scheduler_output)
             model_kwargs.update({"encoder_outputs": encoder_outputs})
-        record_preprocess_probe("preprocess_encoder_done")
 
         return (
             input_ids,

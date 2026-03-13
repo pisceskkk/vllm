@@ -86,12 +86,46 @@ class AsyncIntermediateTensors(IntermediateTensors):
     def wait_for_comm(self) -> None:
         if self._comm_waited:
             return
+        logger.info(
+            "!!!!! AsyncIntermediateTensors.wait_for_comm.begin "
+            "handle_count=%s postprocess_count=%s",
+            0 if self._comm_handles is None else len(self._comm_handles),
+            0 if self._comm_postprocess is None else len(self._comm_postprocess),
+        )
         if self._comm_handles:
-            for handle in self._comm_handles:
+            for idx, handle in enumerate(self._comm_handles):
+                logger.info(
+                    "!!!!! AsyncIntermediateTensors.wait_for_comm.handle.begin idx=%s",
+                    idx,
+                )
                 handle.wait()
+                logger.info(
+                    "!!!!! AsyncIntermediateTensors.wait_for_comm.handle.end idx=%s",
+                    idx,
+                )
         if self._comm_postprocess:
-            for fn in self._comm_postprocess:
+            for idx, fn in enumerate(self._comm_postprocess):
+                logger.info(
+                    "!!!!! AsyncIntermediateTensors.wait_for_comm."
+                    "postprocess.begin idx=%s",
+                    idx,
+                )
                 fn()
+                logger.info(
+                    "!!!!! AsyncIntermediateTensors.wait_for_comm."
+                    "postprocess.end idx=%s",
+                    idx,
+                )
+        tensors = object.__getattribute__(self, "tensors")
+        hidden_states = tensors.get("hidden_states")
+        if hidden_states is not None:
+            logger.info(
+                "!!!!! AsyncIntermediateTensors.wait_for_comm.ready "
+                "hidden_states_shape=%s device=%s stride=%s",
+                tuple(hidden_states.shape),
+                hidden_states.device,
+                hidden_states.stride(),
+            )
         self._comm_waited = True
 
     def __getattribute__(self, name: str):
