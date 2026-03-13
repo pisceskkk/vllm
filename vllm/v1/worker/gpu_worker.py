@@ -84,6 +84,10 @@ class AsyncIntermediateTensors(IntermediateTensors):
         self._comm_waited = False
 
     def wait_for_comm(self) -> None:
+        logger.info(
+            "!!!!! AsyncIntermediateTensors.wait_for_comm.enter _comm_waited=%s",
+            self._comm_waited,
+        )
         if self._comm_waited:
             return
         logger.info(
@@ -131,6 +135,10 @@ class AsyncIntermediateTensors(IntermediateTensors):
     def __getattribute__(self, name: str):
         # ensure `.tensors` is ready before use
         if name == "tensors" and not object.__getattribute__(self, "_comm_waited"):
+            logger.info(
+                "!!!!! AsyncIntermediateTensors.tensors.first_access _comm_waited=%s",
+                object.__getattribute__(self, "_comm_waited"),
+            )
             object.__getattribute__(self, "wait_for_comm")()
         return object.__getattribute__(self, name)
 
