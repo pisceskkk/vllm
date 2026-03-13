@@ -2703,9 +2703,18 @@ class GPUModelRunner(
         sync_self: bool,
     ) -> IntermediateTensors:
         assert self.intermediate_tensors is not None
+        stage_events = getattr(self, "_debug_stage_events", None)
+
+        def record_intermediate_probe(name: str) -> None:
+            if stage_events is None:
+                return
+            event = torch.Event()
+            event.record()
+            stage_events[name] = event
 
         tp = self.vllm_config.parallel_config.tensor_parallel_size
         is_rs = is_residual_scattered_for_sp(self.vllm_config, num_tokens)
+        record_intermediate_probe("preprocess_intermediate_begin_done")
 
         # When sequence parallelism is enabled, the "residual" tensor is sharded
         # across tensor parallel ranks, so each rank only needs its own slice.
@@ -2714,11 +2723,28 @@ class GPUModelRunner(
             for k, v in intermediate_tensors.items():
                 is_scattered = k == "residual" and is_rs
                 copy_len = num_tokens // tp if is_scattered else num_tokens
+                logger.info(
+                    "!!!!! Intermediate sync copy.begin key=%s copy_len=%s "
+                    "is_scattered=%s src_shape=%s dst_shape=%s",
+                    k,
+                    copy_len,
+                    is_scattered,
+                    tuple(v.shape),
+                    tuple(self.intermediate_tensors[k].shape),
+                )
                 self.intermediate_tensors[k][:copy_len].copy_(
                     v[:copy_len], non_blocking=True
                 )
+                logger.info(
+                    "!!!!! Intermediate sync copy.end key=%s copy_len=%s",
+                    k,
+                    copy_len,
+                )
+                record_intermediate_probe(f"preprocess_intermediate_{k}_done")
 
-        return IntermediateTensors(
+        record_intermediate_probe("preprocess_intermediate_copy_loop_done")
+
+        result = IntermediateTensors(
             {
                 k: v[: num_tokens // tp]
                 if k == "residual" and is_rs
@@ -2726,6 +2752,8 @@ class GPUModelRunner(
                 for k, v in self.intermediate_tensors.items()
             }
         )
+        record_intermediate_probe("preprocess_intermediate_return_done")
+        return result
 
     def eplb_step(self, is_dummy: bool = False, is_profile: bool = False) -> None:
         """
