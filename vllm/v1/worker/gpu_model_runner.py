@@ -210,10 +210,12 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         async_output_copy_stream: torch.cuda.Stream,
         vocab_size: int,
         stage_events: dict[str, torch.Event] | None = None,
+        stage_debug_id: str | None = None,
     ):
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
         self._stage_events = stage_events or {}
+        self._stage_debug_id = stage_debug_id or "unknown"
 
         # Event on the copy stream so we can synchronize the non-blocking copy.
         self.copy_submitted_event = torch.Event()
@@ -229,8 +231,10 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         default_stream = torch.cuda.current_stream()
         logger.info(
             "!!!!! AsyncGPUModelRunnerOutput.init.begin "
-            "sampled_token_ids_shape=%s invalid_req_count=%d has_logprobs=%s "
+            "stage_debug_id=%s sampled_token_ids_shape=%s "
+            "invalid_req_count=%d has_logprobs=%s "
             "device=%s dtype=%s is_contiguous=%s stride=%s",
+            self._stage_debug_id,
             tuple(self._sampled_token_ids.shape),
             len(self._invalid_req_indices),
             self._logprobs_tensors is not None,
@@ -283,14 +287,18 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         """
         logger.info(
             "!!!!! AsyncGPUModelRunnerOutput.get_output.begin "
-            "sampled_token_ids_cpu_shape=%s invalid_req_count=%d has_logprobs=%s",
+            "stage_debug_id=%s sampled_token_ids_cpu_shape=%s "
+            "invalid_req_count=%d has_logprobs=%s",
+            self._stage_debug_id,
             tuple(self.sampled_token_ids_cpu.shape),
             len(self._invalid_req_indices),
             self._logprobs_tensors_cpu is not None,
         )
         max_gen_len = self.sampled_token_ids_cpu.shape[-1]
         logger.info(
-            "!!!!! AsyncGPUModelRunnerOutput.get_output.sync.begin max_gen_len=%s",
+            "!!!!! AsyncGPUModelRunnerOutput.get_output.sync.begin "
+            "stage_debug_id=%s max_gen_len=%s",
+            self._stage_debug_id,
             max_gen_len,
         )
         sync_start = time.monotonic()
@@ -300,8 +308,10 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
             if not sync_wait_logged:
                 logger.info(
                     "!!!!! AsyncGPUModelRunnerOutput.get_output.sync.wait "
-                    "elapsed_ms=0 ready_event=%s copy_submitted_event=%s, "
+                    "stage_debug_id=%s elapsed_ms=0 ready_event=%s "
+                    "copy_submitted_event=%s, "
                     "stage_events=%s",
+                    self._stage_debug_id,
                     self.async_copy_ready_event.query(),
                     self.copy_submitted_event.query(),
                     {name: event.query() for name, event in self._stage_events.items()},
@@ -311,8 +321,10 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
                 elapsed_ms = int((time.monotonic() - sync_start) * 1000)
                 logger.info(
                     "!!!!! AsyncGPUModelRunnerOutput.get_output.sync.poll "
-                    "elapsed_ms=%d ready_event=%s copy_submitted_event=%s,"
+                    "stage_debug_id=%s elapsed_ms=%d ready_event=%s "
+                    "copy_submitted_event=%s,"
                     " stage_events=%s",
+                    self._stage_debug_id,
                     elapsed_ms,
                     self.async_copy_ready_event.query(),
                     self.copy_submitted_event.query(),
@@ -321,8 +333,10 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
             time.sleep(0.1)
             sync_poll_count += 1
         logger.info(
-            "!!!!! AsyncGPUModelRunnerOutput.get_output.sync.end max_gen_len=%s "
+            "!!!!! AsyncGPUModelRunnerOutput.get_output.sync.end "
+            "stage_debug_id=%s max_gen_len=%s "
             "elapsed_ms=%d",
+            self._stage_debug_id,
             max_gen_len,
             int((time.monotonic() - sync_start) * 1000),
         )
@@ -2704,6 +2718,7 @@ class GPUModelRunner(
     ) -> IntermediateTensors:
         assert self.intermediate_tensors is not None
         stage_events = getattr(self, "_debug_stage_events", None)
+        stage_debug_id = getattr(self, "_debug_stage_debug_id", None)
 
         def record_intermediate_probe(name: str) -> None:
             if stage_events is None:
@@ -2722,12 +2737,15 @@ class GPUModelRunner(
             if hasattr(intermediate_tensors, "wait_for_comm"):
                 logger.info(
                     "!!!!! Intermediate hidden_states "
-                    "wait_for_comm.begin num_tokens=%s",
+                    "wait_for_comm.begin stage_debug_id=%s num_tokens=%s",
+                    stage_debug_id,
                     num_tokens,
                 )
                 intermediate_tensors.wait_for_comm()
                 logger.info(
-                    "!!!!! Intermediate hidden_states wait_for_comm.end num_tokens=%s",
+                    "!!!!! Intermediate hidden_states wait_for_comm.end "
+                    "stage_debug_id=%s num_tokens=%s",
+                    stage_debug_id,
                     num_tokens,
                 )
                 record_intermediate_probe("hidden_states_recv_comm_done")
@@ -2737,9 +2755,11 @@ class GPUModelRunner(
                 if k == "hidden_states":
                     logger.info(
                         "!!!!! Intermediate hidden_states copy.begin copy_len=%s "
-                        "src_shape=%s dst_shape=%s src_device=%s dst_device=%s "
+                        "stage_debug_id=%s src_shape=%s dst_shape=%s "
+                        "src_device=%s dst_device=%s "
                         "src_stride=%s dst_stride=%s",
                         copy_len,
+                        stage_debug_id,
                         tuple(v.shape),
                         tuple(self.intermediate_tensors[k].shape),
                         v.device,
@@ -2752,7 +2772,9 @@ class GPUModelRunner(
                 )
                 if k == "hidden_states":
                     logger.info(
-                        "!!!!! Intermediate hidden_states copy.end copy_len=%s",
+                        "!!!!! Intermediate hidden_states copy.end "
+                        "stage_debug_id=%s copy_len=%s",
+                        stage_debug_id,
                         copy_len,
                     )
                     record_intermediate_probe("hidden_states_local_copy_done")
