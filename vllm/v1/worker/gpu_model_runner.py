@@ -211,11 +211,15 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         vocab_size: int,
         stage_events: dict[str, torch.Event] | None = None,
         stage_debug_id: str | None = None,
+        prev_stage_events: dict[str, torch.Event] | None = None,
+        prev_stage_debug_id: str | None = None,
     ):
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
         self._stage_events = stage_events or {}
         self._stage_debug_id = stage_debug_id or "unknown"
+        self._prev_stage_events = prev_stage_events or {}
+        self._prev_stage_debug_id = prev_stage_debug_id or "none"
 
         # Event on the copy stream so we can synchronize the non-blocking copy.
         self.copy_submitted_event = torch.Event()
@@ -232,10 +236,11 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         logger.info(
             "!!!!! AsyncGPUModelRunnerOutput.init.begin "
             "stage_debug_id=%s sampled_token_ids_shape=%s "
-            "invalid_req_count=%d has_logprobs=%s "
+            "prev_stage_debug_id=%s invalid_req_count=%d has_logprobs=%s "
             "device=%s dtype=%s is_contiguous=%s stride=%s",
             self._stage_debug_id,
             tuple(self._sampled_token_ids.shape),
+            self._prev_stage_debug_id,
             len(self._invalid_req_indices),
             self._logprobs_tensors is not None,
             self._sampled_token_ids.device,
@@ -285,12 +290,19 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
 
         This function blocks until the copy is finished.
         """
+
+        def _query_stage_events(
+            stage_events: dict[str, torch.Event],
+        ) -> dict[str, bool]:
+            return {name: event.query() for name, event in stage_events.items()}
+
         logger.info(
             "!!!!! AsyncGPUModelRunnerOutput.get_output.begin "
             "stage_debug_id=%s sampled_token_ids_cpu_shape=%s "
-            "invalid_req_count=%d has_logprobs=%s",
+            "prev_stage_debug_id=%s invalid_req_count=%d has_logprobs=%s",
             self._stage_debug_id,
             tuple(self.sampled_token_ids_cpu.shape),
+            self._prev_stage_debug_id,
             len(self._invalid_req_indices),
             self._logprobs_tensors_cpu is not None,
         )
@@ -309,12 +321,14 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
                 logger.info(
                     "!!!!! AsyncGPUModelRunnerOutput.get_output.sync.wait "
                     "stage_debug_id=%s elapsed_ms=0 ready_event=%s "
-                    "copy_submitted_event=%s, "
-                    "stage_events=%s",
+                    "copy_submitted_event=%s stage_events=%s "
+                    "prev_stage_debug_id=%s prev_stage_events=%s",
                     self._stage_debug_id,
                     self.async_copy_ready_event.query(),
                     self.copy_submitted_event.query(),
-                    {name: event.query() for name, event in self._stage_events.items()},
+                    _query_stage_events(self._stage_events),
+                    self._prev_stage_debug_id,
+                    _query_stage_events(self._prev_stage_events),
                 )
                 sync_wait_logged = True
             elif sync_poll_count < 10 or sync_poll_count % 10 == 0:
@@ -322,13 +336,15 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
                 logger.info(
                     "!!!!! AsyncGPUModelRunnerOutput.get_output.sync.poll "
                     "stage_debug_id=%s elapsed_ms=%d ready_event=%s "
-                    "copy_submitted_event=%s,"
-                    " stage_events=%s",
+                    "copy_submitted_event=%s stage_events=%s "
+                    "prev_stage_debug_id=%s prev_stage_events=%s",
                     self._stage_debug_id,
                     elapsed_ms,
                     self.async_copy_ready_event.query(),
                     self.copy_submitted_event.query(),
-                    {name: event.query() for name, event in self._stage_events.items()},
+                    _query_stage_events(self._stage_events),
+                    self._prev_stage_debug_id,
+                    _query_stage_events(self._prev_stage_events),
                 )
             time.sleep(0.1)
             sync_poll_count += 1
