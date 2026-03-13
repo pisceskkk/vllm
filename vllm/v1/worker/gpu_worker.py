@@ -774,18 +774,14 @@ class Worker(WorkerBase):
             pp_all_gather_group = None
 
         if forward_pass and not get_pp_group().is_first_rank:
-            tensor_dict, comm_handles, comm_postprocess = (
-                get_pp_group().irecv_tensor_dict(
-                    all_gather_group=pp_all_gather_group,
-                    all_gather_tensors=all_gather_tensors,
-                )
+            logger.info("!!!!! PP sync recv.begin")
+            tensor_dict = get_pp_group().recv_tensor_dict(
+                all_gather_group=pp_all_gather_group,
+                all_gather_tensors=all_gather_tensors,
             )
             assert tensor_dict is not None
-            intermediate_tensors = AsyncIntermediateTensors(
-                tensor_dict,
-                comm_handles=comm_handles,
-                comm_postprocess=comm_postprocess,
-            )
+            logger.info("!!!!! PP sync recv.end")
+            intermediate_tensors = IntermediateTensors(tensor_dict)
 
         with self.annotate_profile(scheduler_output):
             output = self.model_runner.execute_model(
@@ -803,7 +799,6 @@ class Worker(WorkerBase):
             and not get_pp_group().is_last_rank
         )
 
-        # launch non-blocking send of intermediate tensors
         self._pp_send_work_keys = [
             key
             for key, value in output.tensors.items()
@@ -819,11 +814,15 @@ class Worker(WorkerBase):
                 tensor.device,
                 tensor.stride(),
             )
-        self._pp_send_work = get_pp_group().isend_tensor_dict(
+        logger.info("!!!!! PP sync send.begin")
+        get_pp_group().send_tensor_dict(
             output.tensors,
             all_gather_group=pp_all_gather_group,
             all_gather_tensors=all_gather_tensors,
         )
+        logger.info("!!!!! PP sync send.end")
+        self._pp_send_work = []
+        self._pp_send_work_keys = []
 
         return None
 
