@@ -2835,6 +2835,16 @@ class GPUModelRunner(
         dict[str, Any],
         ECConnectorOutput | None,
     ]:
+        stage_events = getattr(self, "_debug_stage_events", None)
+
+        def record_preprocess_probe(name: str) -> None:
+            if stage_events is None:
+                return
+            event = torch.Event()
+            event.record()
+            stage_events[name] = event
+
+        record_preprocess_probe("preprocess_begin_done")
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         is_first_rank = get_pp_group().is_first_rank
         is_encoder_decoder = self.model_config.is_encoder_decoder
@@ -2869,6 +2879,7 @@ class GPUModelRunner(
                 **self._init_model_kwargs(),
                 **self._extract_mm_kwargs(scheduler_output),
             }
+            record_preprocess_probe("preprocess_mm_inputs_done")
         elif self.enable_prompt_embeds and is_first_rank:
             # Get the input embeddings for the tokens that are not input embeds,
             # then put them into the appropriate positions.
@@ -2896,6 +2907,7 @@ class GPUModelRunner(
             inputs_embeds = self.inputs_embeds.gpu[:num_input_tokens]
             model_kwargs = self._init_model_kwargs()
             input_ids = None
+            record_preprocess_probe("preprocess_prompt_embeds_done")
         else:
             # For text-only models, we use token ids as input.
             # While it is possible to use embeddings as input just like the
@@ -2904,6 +2916,7 @@ class GPUModelRunner(
             input_ids = self.input_ids.gpu[:num_input_tokens]
             inputs_embeds = None
             model_kwargs = self._init_model_kwargs()
+            record_preprocess_probe("preprocess_text_inputs_done")
 
         if self.uses_mrope:
             positions = self.mrope_positions.gpu[:, :num_input_tokens]
@@ -2911,6 +2924,7 @@ class GPUModelRunner(
             positions = self.xdrope_positions.gpu[:, :num_input_tokens]
         else:
             positions = self.positions.gpu[:num_input_tokens]
+        record_preprocess_probe("preprocess_positions_done")
 
         if is_first_rank:
             intermediate_tensors = None
@@ -2919,6 +2933,7 @@ class GPUModelRunner(
             intermediate_tensors = self.sync_and_slice_intermediate_tensors(
                 num_input_tokens, intermediate_tensors, True
             )
+        record_preprocess_probe("preprocess_intermediate_done")
 
         if is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
             # Run the encoder, just like we do with other multimodal inputs.
@@ -2928,6 +2943,7 @@ class GPUModelRunner(
             # ever have a single encoder input.
             encoder_outputs = self._execute_mm_encoder(scheduler_output)
             model_kwargs.update({"encoder_outputs": encoder_outputs})
+        record_preprocess_probe("preprocess_encoder_done")
 
         return (
             input_ids,
