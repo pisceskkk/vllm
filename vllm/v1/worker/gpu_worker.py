@@ -83,54 +83,76 @@ class AsyncIntermediateTensors(IntermediateTensors):
         self._comm_handles = comm_handles
         self._comm_postprocess = comm_postprocess
         self._comm_waited = False
+        self._debug_stage_events: dict[str, torch.Event] | None = None
+        self._debug_stage_debug_id: str | None = None
+
+    def _record_debug_event(self, name: str) -> None:
+        if self._debug_stage_events is None:
+            return
+        event = torch.Event()
+        event.record()
+        self._debug_stage_events[name] = event
 
     def wait_for_comm(self) -> None:
         logger.info(
-            "!!!!! AsyncIntermediateTensors.wait_for_comm.enter _comm_waited=%s",
+            "!!!!! AsyncIntermediateTensors.wait_for_comm.enter "
+            "stage_debug_id=%s _comm_waited=%s",
+            self._debug_stage_debug_id,
             self._comm_waited,
         )
         if self._comm_waited:
             return
         logger.info(
             "!!!!! AsyncIntermediateTensors.wait_for_comm.begin "
-            "handle_count=%s postprocess_count=%s",
+            "stage_debug_id=%s handle_count=%s postprocess_count=%s",
+            self._debug_stage_debug_id,
             0 if self._comm_handles is None else len(self._comm_handles),
             0 if self._comm_postprocess is None else len(self._comm_postprocess),
         )
         if self._comm_handles:
             for idx, handle in enumerate(self._comm_handles):
                 logger.info(
-                    "!!!!! AsyncIntermediateTensors.wait_for_comm.handle.begin idx=%s",
+                    "!!!!! AsyncIntermediateTensors.wait_for_comm.handle.begin "
+                    "stage_debug_id=%s idx=%s",
+                    self._debug_stage_debug_id,
                     idx,
                 )
                 handle.wait()
                 logger.info(
-                    "!!!!! AsyncIntermediateTensors.wait_for_comm.handle.end idx=%s",
+                    "!!!!! AsyncIntermediateTensors.wait_for_comm.handle.end "
+                    "stage_debug_id=%s idx=%s",
+                    self._debug_stage_debug_id,
                     idx,
                 )
+                self._record_debug_event(f"hidden_states_handle_{idx}_wait_done")
         if self._comm_postprocess:
             for idx, fn in enumerate(self._comm_postprocess):
                 logger.info(
                     "!!!!! AsyncIntermediateTensors.wait_for_comm."
-                    "postprocess.begin idx=%s",
+                    "postprocess.begin stage_debug_id=%s idx=%s",
+                    self._debug_stage_debug_id,
                     idx,
                 )
                 fn()
                 logger.info(
                     "!!!!! AsyncIntermediateTensors.wait_for_comm."
-                    "postprocess.end idx=%s",
+                    "postprocess.end stage_debug_id=%s idx=%s",
+                    self._debug_stage_debug_id,
                     idx,
                 )
+                self._record_debug_event(f"hidden_states_postprocess_{idx}_done")
         tensors = object.__getattribute__(self, "tensors")
         hidden_states = tensors.get("hidden_states")
         if hidden_states is not None:
             logger.info(
                 "!!!!! AsyncIntermediateTensors.wait_for_comm.ready "
-                "hidden_states_shape=%s device=%s stride=%s",
+                "stage_debug_id=%s hidden_states_shape=%s device=%s stride=%s",
+                self._debug_stage_debug_id,
                 tuple(hidden_states.shape),
                 hidden_states.device,
                 hidden_states.stride(),
             )
+            self._record_debug_event("hidden_states_wait_ready_done")
         self._comm_waited = True
 
     def __getattribute__(self, name: str):

@@ -2751,6 +2751,11 @@ class GPUModelRunner(
         if sync_self:
             assert intermediate_tensors is not None
             if hasattr(intermediate_tensors, "wait_for_comm"):
+                if hasattr(intermediate_tensors, "_debug_stage_events"):
+                    intermediate_tensors._debug_stage_events = stage_events
+                if hasattr(intermediate_tensors, "_debug_stage_debug_id"):
+                    intermediate_tensors._debug_stage_debug_id = stage_debug_id
+                record_intermediate_probe("hidden_states_sync_enter_done")
                 logger.info(
                     "!!!!! Intermediate hidden_states "
                     "wait_for_comm.begin stage_debug_id=%s num_tokens=%s",
