@@ -15,6 +15,7 @@ def merge_attn_states(
     suffix_output: torch.Tensor,
     suffix_lse: torch.Tensor,
     output_lse: torch.Tensor | None = None,
+    lse_scale: float = 1.0,
 ) -> None:
     num_tokens = output.shape[0]
     num_query_heads = output.shape[1]
@@ -38,6 +39,7 @@ def merge_attn_states(
         head_size,
         padded_head_size,
         output_lse is not None,
+        lse_scale,
     )
 
 
@@ -54,6 +56,7 @@ def merge_attn_states_kernel(
     HEAD_SIZE: tl.constexpr,
     PADDED_HEAD_SIZE: tl.constexpr,
     OUTPUT_LSE: tl.constexpr,
+    lse_scale,
 ):
     token_idx = tl.program_id(0)
     num_tokens = tl.num_programs(0)
@@ -72,15 +75,15 @@ def merge_attn_states_kernel(
     s_lse = float("-inf") if s_lse == float("inf") else s_lse
 
     max_lse = tl.maximum(p_lse, s_lse)
-    p_lse = p_lse - max_lse
-    s_lse = s_lse - max_lse
+    p_lse = (p_lse - max_lse) * lse_scale
+    s_lse = (s_lse - max_lse) * lse_scale
     # Will reuse precomputed Exp values for scale factor computation.
     p_se = tl.exp(p_lse)
     s_se = tl.exp(s_lse)
     out_se = p_se + s_se
 
     if OUTPUT_LSE:
-        out_lse = tl.log(out_se) + max_lse
+        out_lse = tl.log(out_se) / lse_scale + max_lse
         tl.store(output_lse + head_idx * num_tokens + token_idx, out_lse)
 
     head_arange = tl.arange(0, PADDED_HEAD_SIZE)

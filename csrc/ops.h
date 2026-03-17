@@ -58,7 +58,7 @@ void merge_attn_states(torch::Tensor& output,
                        const torch::Tensor& prefix_output,
                        const torch::Tensor& prefix_lse,
                        const torch::Tensor& suffix_output,
-                       const torch::Tensor& suffix_lse);
+                       const torch::Tensor& suffix_lse, double lse_scale);
 #ifndef USE_ROCM
 void convert_vertical_slash_indexes(
     torch::Tensor& block_count,      // [BATCH, N_HEADS, NUM_ROWS]

@@ -189,9 +189,16 @@ def merge_attn_states(
     suffix_output: torch.Tensor,
     suffix_lse: torch.Tensor,
     output_lse: torch.Tensor | None = None,
+    lse_scale: float = 1.0,
 ) -> None:
     torch.ops._C.merge_attn_states(
-        output, output_lse, prefix_output, prefix_lse, suffix_output, suffix_lse
+        output,
+        output_lse,
+        prefix_output,
+        prefix_lse,
+        suffix_output,
+        suffix_lse,
+        lse_scale,
     )
 
 

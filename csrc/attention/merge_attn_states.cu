@@ -17,7 +17,7 @@ __global__ void merge_attn_states_kernel(
     const float* prefix_lse, const scalar_t* suffix_output,
     const float* suffix_lse, const uint num_tokens, const uint num_heads,
     const uint head_size, const uint prefix_head_stride,
-    const uint output_head_stride) {
+    const uint output_head_stride, const float lse_scale) {
   using pack_128b_t = uint4;
   const uint pack_size = 16 / sizeof(scalar_t);
   const uint threads_per_head = head_size / pack_size;
@@ -75,8 +75,8 @@ __global__ void merge_attn_states_kernel(
     return;
   }
 
-  p_lse = p_lse - max_lse;
-  s_lse = s_lse - max_lse;
+  p_lse = (p_lse - max_lse) * lse_scale;
+  s_lse = (s_lse - max_lse) * lse_scale;
   const float p_se = expf(p_lse);
   const float s_se = expf(s_lse);
   const float out_se = p_se + s_se;
@@ -111,7 +111,7 @@ __global__ void merge_attn_states_kernel(
   }
   // We only need to write to output_lse once per head.
   if (output_lse != nullptr && pack_idx == 0) {
-    float out_lse = logf(out_se) + max_lse;
+    float out_lse = logf(out_se) / lse_scale + max_lse;
     output_lse[head_idx * num_tokens + token_idx] = out_lse;
   }
 }
@@ -143,7 +143,8 @@ __global__ void merge_attn_states_kernel(
             reinterpret_cast<float*>(prefix_lse.data_ptr()),                \
             reinterpret_cast<scalar_t*>(suffix_output.data_ptr()),          \
             reinterpret_cast<float*>(suffix_lse.data_ptr()), num_tokens,    \
-            num_heads, head_size, prefix_head_stride, output_head_stride);  \
+            num_heads, head_size, prefix_head_stride, output_head_stride,   \
+            lse_scale);                                                     \
   }
 
 /*@brief Merges the attention states from prefix and suffix
@@ -164,7 +165,8 @@ void merge_attn_states_launcher(torch::Tensor& output,
                                 const torch::Tensor& prefix_output,
                                 const torch::Tensor& prefix_lse,
                                 const torch::Tensor& suffix_output,
-                                const torch::Tensor& suffix_lse) {
+                                const torch::Tensor& suffix_lse,
+                                const float lse_scale) {
   constexpr uint NUM_THREADS = 128;
   const uint num_tokens = output.size(0);
   const uint num_heads = output.size(1);
@@ -196,7 +198,7 @@ void merge_attn_states_launcher(torch::Tensor& output,
   {                                                                         \
     merge_attn_states_launcher<scalar_t>(output, output_lse, prefix_output, \
                                          prefix_lse, suffix_output,         \
-                                         suffix_lse);                       \
+                                         suffix_lse, lse_scale);            \
   }
 
 void merge_attn_states(torch::Tensor& output,
@@ -204,6 +206,7 @@ void merge_attn_states(torch::Tensor& output,
                        const torch::Tensor& prefix_output,
                        const torch::Tensor& prefix_lse,
                        const torch::Tensor& suffix_output,
-                       const torch::Tensor& suffix_lse) {
+                       const torch::Tensor& suffix_lse,
+                       const double lse_scale) {
   DISPATCH_BY_SCALAR_DTYPE(output.dtype(), CALL_MERGE_ATTN_STATES_LAUNCHER);
 }

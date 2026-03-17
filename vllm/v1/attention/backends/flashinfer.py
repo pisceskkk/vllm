@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashInfer."""
 
+import math
 from dataclasses import dataclass
 from functools import partial
 from typing import ClassVar
@@ -77,6 +78,7 @@ FP4_DTYPE = torch.uint8
 logger = init_logger(__name__)
 
 trtllm_gen_workspace_buffer = None
+FLASHINFER_LSE_SCALE = math.log(2.0)
 
 
 def _get_trtllm_gen_workspace_buffer():
@@ -282,6 +284,7 @@ class BatchDCPPrefillWrapper:
             lse_context,
             output_query,
             lse_query,
+            lse_scale=FLASHINFER_LSE_SCALE,
         )
         return out
 
@@ -551,14 +554,14 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         try:
             self.dcp_world_size = get_dcp_group().world_size
             self.dcp_rank = get_dcp_group().rank_in_group
-            self.dcp_kv_cache_interleave_size = (
-                vllm_config.parallel_config.dcp_kv_cache_interleave_size
+            self.cp_kv_cache_interleave_size = (
+                vllm_config.parallel_config.cp_kv_cache_interleave_size
             )
         except AssertionError:
             # DCP might not be initialized in testing
             self.dcp_world_size = 1
             self.dcp_rank = 0
-            self.dcp_kv_cache_interleave_size = 1
+            self.cp_kv_cache_interleave_size = 1
         self.use_dcp = self.dcp_world_size > 1
         self.dcp_a2a = (
             self.use_dcp and vllm_config.parallel_config.dcp_comm_backend == "a2a"
@@ -919,28 +922,40 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # Guard access to seq_lens_cpu, which may not always be needed
         # and can be expensive to retrieve in async mode.
         needs_seq_lens_cpu = self.use_dcp or use_cascade or not is_only_trtllm_decode
-        seq_lens_cpu = common_attn_metadata.seq_lens_cpu if needs_seq_lens_cpu else None
+        total_seq_lens_cpu = (
+            common_attn_metadata.seq_lens_cpu if needs_seq_lens_cpu else None
+        )
+        seq_lens_cpu = total_seq_lens_cpu
 
-        # Adjust seq_lens_cpu for DCP
         if self.use_dcp:
-            assert seq_lens_cpu is not None
-            if num_prefills > 0:
-                qo_indptr_prefill_cpu = (
-                    qo_indptr_cpu[num_decodes:] - qo_indptr_cpu[num_decodes]
+            assert total_seq_lens_cpu is not None
+            # Keep the shared metadata immutable for mixed decode/prefill batches.
+            seq_lens_cpu = total_seq_lens_cpu.clone()
+            dcp_local_seq_lens_cpu = common_attn_metadata.dcp_local_seq_lens_cpu
+            if dcp_local_seq_lens_cpu is None:
+                seq_lens_cpu = get_dcp_local_seq_lens(
+                    total_seq_lens_cpu,
+                    self.dcp_world_size,
+                    self.dcp_rank,
+                    self.cp_kv_cache_interleave_size,
                 )
-                query_lens_prefill_cpu = (
-                    qo_indptr_prefill_cpu[1:] - qo_indptr_prefill_cpu[:-1]
-                )
-                seq_lens_cpu[num_decodes:] = (
-                    seq_lens_cpu[num_decodes:] - query_lens_prefill_cpu
-                )
+            else:
+                seq_lens_cpu.copy_(dcp_local_seq_lens_cpu)
 
-            seq_lens_cpu = get_dcp_local_seq_lens(
-                seq_lens_cpu,
-                self.dcp_world_size,
-                self.dcp_rank,
-                self.dcp_kv_cache_interleave_size,
-            )
+            num_prefills = num_reqs - num_decodes
+            if num_prefills > 0:
+                query_lens_prefill = (
+                    qo_indptr_cpu[num_decodes + 1 :] - qo_indptr_cpu[num_decodes:-1]
+                )
+                context_lens_prefill = (
+                    total_seq_lens_cpu[num_decodes:] - query_lens_prefill
+                )
+                seq_lens_cpu[num_decodes:] = get_dcp_local_seq_lens(
+                    context_lens_prefill,
+                    self.dcp_world_size,
+                    self.dcp_rank,
+                    self.cp_kv_cache_interleave_size,
+                )
 
         seq_lens_np = seq_lens_cpu.numpy() if seq_lens_cpu is not None else None
         num_blocks_np = (
@@ -1028,15 +1043,20 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 qo_indptr_cpu[prefill_start:] - qo_indptr_cpu[prefill_start]
             )
             assert qo_indptr_prefill_cpu.shape[0] == num_prefills + 1
+            assert paged_kv_indices is not None
+            paged_kv_start = int(self.paged_kv_indptr.np[prefill_start])
+            paged_kv_end = int(self.paged_kv_indptr.np[num_reqs])
+            paged_kv_indices_prefill = paged_kv_indices[paged_kv_start:paged_kv_end]
 
             if prefill_use_trtllm:
                 # Create GPU versions
                 qo_indptr_prefill_gpu = (
                     qo_indptr[prefill_start:] - qo_indptr[prefill_start]
                 )
-                paged_kv_indptr_prefill_gpu = self.paged_kv_indptr.gpu[
-                    prefill_start : num_reqs + 1
-                ]
+                paged_kv_indptr_prefill_gpu = (
+                    self.paged_kv_indptr.gpu[prefill_start : num_reqs + 1]
+                    - paged_kv_start
+                )
                 # Compute max_q_len for prefill requests
                 query_lens_prefill_cpu = (
                     qo_indptr_prefill_cpu[1:] - qo_indptr_prefill_cpu[:-1]
@@ -1057,16 +1077,17 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     prefill_start:num_reqs
                 ]
                 assert paged_kv_last_page_len_prefill_cpu.shape[0] == num_prefills
-                paged_kv_indptr_prefill_cpu = self.paged_kv_indptr.cpu[
-                    prefill_start : num_reqs + 1
-                ]
+                paged_kv_indptr_prefill_cpu = (
+                    self.paged_kv_indptr.cpu[prefill_start : num_reqs + 1]
+                    - paged_kv_start
+                )
                 assert paged_kv_indptr_prefill_cpu.shape[0] == num_prefills + 1
                 if self.use_dcp:
                     assert isinstance(prefill_wrapper, BatchDCPPrefillWrapper)
                     prefill_wrapper.plan(
                         qo_indptr_cpu=qo_indptr_prefill_cpu,
                         paged_kv_indptr_cpu=paged_kv_indptr_prefill_cpu,
-                        paged_kv_indices=paged_kv_indices,
+                        paged_kv_indices=paged_kv_indices_prefill,
                         paged_kv_last_page_len_cpu=paged_kv_last_page_len_prefill_cpu,
                         page_size=self.page_size,
                         num_qo_heads=self.num_qo_heads,
@@ -1089,7 +1110,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     prefill_wrapper.plan(
                         qo_indptr=qo_indptr_prefill_cpu,
                         paged_kv_indptr=paged_kv_indptr_prefill_cpu,
-                        paged_kv_indices=paged_kv_indices,
+                        paged_kv_indices=paged_kv_indices_prefill,
                         paged_kv_last_page_len=paged_kv_last_page_len_prefill_cpu,
                         num_qo_heads=self.num_qo_heads,
                         num_kv_heads=self.num_kv_heads,
@@ -1595,6 +1616,10 @@ class FlashInferImpl(AttentionImpl):
                         lse=lse,
                         return_lse=True,
                     )
+                    # No extra LSE base conversion is needed here: dcp_combine
+                    # consumes FlashInfer's base-2 LSE directly and returns the
+                    # final reduced attention output without going through
+                    # merge_attn_states.
                     output[:num_decode_tokens] = self.dcp_combine(
                         output_tmp,
                         lse,

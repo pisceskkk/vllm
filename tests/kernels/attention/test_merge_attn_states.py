@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
+
 import pytest
 import torch
 
@@ -20,6 +22,7 @@ def merge_attn_states_torch(
     suffix_output: torch.Tensor,  # [NUM_TOKENS, NUM_HEADS, HEAD_SIZE]
     suffix_lse: torch.Tensor,  # [NUM_HEADS, NUM_TOKENS]
     output_lse: torch.Tensor | None = None,  # [NUM_HEADS, NUM_TOKENS]
+    lse_scale: float = 1.0,
 ):
     p_lse = prefix_lse
     s_lse = suffix_lse
@@ -28,13 +31,13 @@ def merge_attn_states_torch(
     s_lse[s_lse == torch.inf] = -torch.inf
     # max_lse [NUM_HEADS, NUM_TOKENS]
     max_lse = torch.maximum(p_lse, s_lse)
-    p_lse = p_lse - max_lse
-    s_lse = s_lse - max_lse
+    p_lse = (p_lse - max_lse) * lse_scale
+    s_lse = (s_lse - max_lse) * lse_scale
     p_lse_exp = torch.exp(p_lse)
     s_lse_exp = torch.exp(s_lse)
     out_se = p_lse_exp + s_lse_exp
     if output_lse is not None:
-        output_lse = torch.log(out_se) + max_lse
+        output_lse = torch.log(out_se) / lse_scale + max_lse
     p_scale = p_lse_exp / out_se  # [NUM_HEADS, NUM_TOKENS]
     s_scale = s_lse_exp / out_se  # [NUM_HEADS, NUM_TOKENS]
     p_scale = torch.transpose(p_scale, 0, 1).unsqueeze(2)  # [NUM_TOKENS, NUM_HEADS, 1]
@@ -317,3 +320,76 @@ def test_merge_attn_states(
         len(NUM_BATCH_TOKENS) * len(HEAD_SIZES) * len(NUM_QUERY_HEADS) * len(DTYPES)
     ):
         generate_markdown_table()
+
+
+@torch.inference_mode()
+def test_merge_attn_states_log2_lse():
+    if not current_platform.is_cuda():
+        pytest.skip("Currently only support CUDA merge_attn_states kernels")
+
+    num_tokens = 128
+    num_heads = 8
+    head_size = 64
+    output_dtype = torch.half
+    lse_scale = math.log(2.0)
+
+    prefix_output = torch.randn(
+        (num_tokens, num_heads, head_size), dtype=output_dtype, device="cuda"
+    )
+    suffix_output = torch.randn(
+        (num_tokens, num_heads, head_size), dtype=output_dtype, device="cuda"
+    )
+    prefix_lse_ln = torch.randn(
+        num_heads, num_tokens, dtype=torch.float32, device="cuda"
+    )
+    suffix_lse_ln = torch.randn(
+        num_heads, num_tokens, dtype=torch.float32, device="cuda"
+    )
+    prefix_lse = prefix_lse_ln / lse_scale
+    suffix_lse = suffix_lse_ln / lse_scale
+
+    output_ref, output_lse_ref = merge_attn_states_torch(
+        torch.empty_like(prefix_output),
+        prefix_output,
+        prefix_lse.clone(),
+        suffix_output,
+        suffix_lse.clone(),
+        torch.empty_like(prefix_lse),
+        lse_scale=lse_scale,
+    )
+
+    output_triton = torch.empty_like(prefix_output)
+    output_lse_triton = torch.empty_like(prefix_lse)
+    merge_attn_states_triton(
+        output_triton,
+        prefix_output,
+        prefix_lse,
+        suffix_output,
+        suffix_lse,
+        output_lse_triton,
+        lse_scale=lse_scale,
+    )
+    torch.testing.assert_close(
+        output_triton.float(), output_ref.float(), atol=1e-3, rtol=1e-3
+    )
+    torch.testing.assert_close(
+        output_lse_triton.float(), output_lse_ref.float(), atol=1e-3, rtol=1e-3
+    )
+
+    output_cuda = torch.empty_like(prefix_output)
+    output_lse_cuda = torch.empty_like(prefix_lse)
+    merge_attn_states_cuda(
+        output_cuda,
+        prefix_output,
+        prefix_lse,
+        suffix_output,
+        suffix_lse,
+        output_lse_cuda,
+        lse_scale=lse_scale,
+    )
+    torch.testing.assert_close(
+        output_cuda.float(), output_ref.float(), atol=1e-3, rtol=1e-3
+    )
+    torch.testing.assert_close(
+        output_lse_cuda.float(), output_lse_ref.float(), atol=1e-3, rtol=1e-3
+    )

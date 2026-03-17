@@ -73,7 +73,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "    Tensor prefix_output,"
       "    Tensor prefix_lse,"
       "    Tensor suffix_output,"
-      "    Tensor suffix_lse) -> ()");
+      "    Tensor suffix_lse,"
+      "    float lse_scale=1.) -> ()");
   ops.impl("merge_attn_states", torch::kCUDA, &merge_attn_states);
 #ifndef USE_ROCM
   ops.def(
