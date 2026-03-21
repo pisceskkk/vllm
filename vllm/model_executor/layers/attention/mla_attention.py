@@ -1224,6 +1224,8 @@ def use_flashinfer_prefill() -> bool:
     from vllm.config import get_current_vllm_config
 
     vllm_config = get_current_vllm_config()
+    if vllm_config.parallel_config.prefill_context_parallel_size > 1:
+        return False
     if not (
         not vllm_config.attention_config.disable_flashinfer_prefill
         and has_flashinfer()
@@ -1240,6 +1242,8 @@ def use_cudnn_prefill() -> bool:
     from vllm.config import get_current_vllm_config
 
     vllm_config = get_current_vllm_config()
+    if vllm_config.parallel_config.prefill_context_parallel_size > 1:
+        return False
     return (
         has_flashinfer()
         and vllm_config.attention_config.use_cudnn_prefill
@@ -1254,6 +1258,8 @@ def use_trtllm_ragged_deepseek_prefill() -> bool:
     from vllm.config import get_current_vllm_config
 
     vllm_config = get_current_vllm_config()
+    if vllm_config.parallel_config.prefill_context_parallel_size > 1:
+        return False
     if not (
         has_flashinfer()
         and vllm_config.attention_config.use_trtllm_ragged_deepseek_prefill
