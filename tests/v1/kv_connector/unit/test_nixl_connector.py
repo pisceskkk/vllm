@@ -429,12 +429,14 @@ def test_kv_transfer_handshake(dist_init):
                 kv_connector_metadata["remote_port"],
                 kv_connector_metadata["tp_size"],
                 kv_connector_metadata["remote_engine_id"],
+                kv_connector_metadata["dcp_size"],
             )
 
             received_metadata = mock_add_remote_agent.call_args.args
             assert received_metadata[0] == expected_agent_metadata
             assert received_metadata[1] == 0  # remote_tp_rank
             assert received_metadata[2] == 1  # remote_tp_size
+            assert kv_connector_metadata["dcp_size"] == 1
 
         # Need to shutdown the background thread to release NIXL side channel port
         scheduler_connector.shutdown()
@@ -466,9 +468,11 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
             engine_id=self.engine_id,
             remote_tp_size=self._tp_size,  # shared state
             remote_block_size=self._block_size,  # shared state
+            remote_dcp_size=self._dcp_size,  # shared state
             is_mla=self.use_mla,
             total_num_kv_heads=self.model_config.get_total_num_kv_heads(),
             attn_backends=self.attn_backends,
+            dcp_rank=self.dcp_rank,
             tensor_shape=test_shape,
         )
 
@@ -477,7 +481,12 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
         )
 
     def _nixl_handshake(
-        self, host: str, port: int, remote_tp_size: int, expected_engine_id: str
+        self,
+        host: str,
+        port: int,
+        remote_tp_size: int,
+        expected_engine_id: str,
+        remote_dcp_size: int = 1,
     ) -> dict[int, str]:
         # Mimic slow _nixl_handshake, as well as bypass zmq communication.
         time.sleep(self._hand_shake_latency)
@@ -505,11 +514,11 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
                 block_len * tp_ratio for block_len in remote_block_lens
             ]
 
-        # When remote tp_size > local tp_size, handshake with multiple
-        # remote ranks.
-        num_handshakes = 1 if tp_ratio > 0 else -tp_ratio
+        remote_tp_ranks = self.kv_topo.get_target_remote_ranks_for_handshake(
+            remote_tp_size, remote_dcp_size
+        )
         remote_agents: dict[int, str] = {}
-        for remote_tp_rank in range(num_handshakes):
+        for remote_tp_rank in remote_tp_ranks:
             remote_agent_name = self.add_remote_agent(
                 NixlAgentMetadata(
                     engine_id=self.REMOTE_ENGINE_ID,
@@ -523,6 +532,8 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
                     kv_cache_layout="HND",
                     block_size=self.block_size,
                     ssm_sizes=(0, 0),
+                    dcp_size=remote_dcp_size,
+                    dcp_rank=remote_tp_rank % remote_dcp_size,
                 ),
                 remote_tp_rank=remote_tp_rank,
                 remote_tp_size=remote_tp_size,
@@ -2422,9 +2433,11 @@ def test_handshake_decode_errors(default_vllm_config, dist_init, error_scenario)
         engine_id=decode_worker.engine_id,
         remote_tp_size=decode_worker._tp_size,  # shared state
         remote_block_size=decode_worker._block_size,  # shared state
+        remote_dcp_size=decode_worker._dcp_size,  # shared state
         is_mla=decode_worker.use_mla,
         total_num_kv_heads=decode_worker.model_config.get_total_num_kv_heads(),
         attn_backends=[backend],
+        dcp_rank=decode_worker.dcp_rank,
         tensor_shape=test_shape,
     )
 
