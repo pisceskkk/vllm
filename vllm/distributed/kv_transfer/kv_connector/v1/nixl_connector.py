@@ -46,6 +46,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     PromMetricT,
 )
 from vllm.distributed.parallel_state import (
+    get_dcp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
@@ -80,8 +81,9 @@ ReqId = str
 # Version History:
 #   1: Initial version with compatibility checking
 #   2: Add remote_request_id to kv_transfer_params
+#   3: Add DCP metadata to handshake and kv_transfer_params
 #
-NIXL_CONNECTOR_VERSION: int = 2
+NIXL_CONNECTOR_VERSION: int = 3
 
 GET_META_MSG = b"get_meta_msg"
 
@@ -152,6 +154,8 @@ class NixlAgentMetadata:
     block_lens: list[int]
     kv_cache_layout: str
     block_size: int
+    dcp_size: int = 1
+    dcp_rank: int = 0
 
 
 @dataclass
@@ -248,6 +252,7 @@ class ReqMeta:
     # To be used when logical block size does not match the kernel block size
     local_physical_block_ids: list[int]
     tp_size: int
+    dcp_size: int = 1
     remote: RemoteMeta | None = None
 
 
@@ -269,6 +274,7 @@ class NixlConnectorMetadata(KVConnectorMetadata):
             local_physical_block_ids=local_block_ids,
             # P workers don't need to receive tp_size from proxy here.
             tp_size=kv_transfer_params.get("tp_size", 1),
+            dcp_size=kv_transfer_params.get("dcp_size", 1),
         )
 
     def add_new_req_to_save(
@@ -848,6 +854,7 @@ class NixlConnectorScheduler:
             remote_host=self.side_channel_host,
             remote_port=self.side_channel_port,
             tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
+            dcp_size=self.vllm_config.parallel_config.decode_context_parallel_size,
         )
 
 
@@ -903,6 +910,22 @@ class NixlConnectorWorker:
         self.tp_rank = get_tensor_model_parallel_rank()
         self.world_size = get_tensor_model_parallel_world_size()
         self.tp_group = get_tp_group()
+        self.dcp_size = (
+            self.vllm_config.parallel_config.decode_context_parallel_size or 1
+        )
+        self.dcp_rank = 0
+        if self.dcp_size > 1:
+            try:
+                dcp_group = get_dcp_group()
+            except AssertionError:
+                logger.debug(
+                    "DCP size is %d in config but DCP group is not initialized; "
+                    "defaulting to dcp_rank=0 for NIXL handshake setup.",
+                    self.dcp_size,
+                )
+            else:
+                self.dcp_size = dcp_group.world_size
+                self.dcp_rank = dcp_group.rank_in_group
         self.num_blocks = 0
         self.enable_permute_local_kv = False
 
@@ -1035,6 +1058,7 @@ class NixlConnectorWorker:
         self.kv_topo: TpKVTopology | None = None
 
         self._tp_size: dict[EngineId, int] = {self.engine_id: self.world_size}
+        self._dcp_size: dict[EngineId, int] = {self.engine_id: self.dcp_size}
         self._block_size: dict[EngineId, int] = {self.engine_id: self.block_size}
         # With heterogeneous TP, P must wait for all assigned D TP workers to
         # finish reading before safely freeing the blocks.
@@ -1053,6 +1077,7 @@ class NixlConnectorWorker:
         port: int,
         remote_tp_size: int,
         expected_engine_id: str,
+        remote_dcp_size: int = 1,
     ) -> dict[int, str]:
         """Do a NIXL handshake with a remote instance."""
         # When target instance TP > local TP, we need to perform multiple
@@ -1061,7 +1086,9 @@ class NixlConnectorWorker:
         # local rank will read from. Note that With homogeneous TP,
         # this happens to be the same single rank_i.
         assert self.kv_topo is not None
-        p_remote_ranks = self.kv_topo.get_target_remote_ranks(remote_tp_size)
+        p_remote_ranks = self.kv_topo.get_target_remote_ranks_for_handshake(
+            remote_tp_size, remote_dcp_size
+        )
         remote_rank_to_agent_name = {}
         path = make_zmq_path("tcp", host, port)
 
@@ -1266,6 +1293,7 @@ class NixlConnectorWorker:
                 meta.remote.port,
                 meta.tp_size,
                 remote_engine_id,
+                meta.dcp_size,
             )
             self._handshake_futures[remote_engine_id] = fut
 
@@ -1311,10 +1339,12 @@ class NixlConnectorWorker:
             tp_rank=self.tp_rank,
             engine_id=self.engine_id,
             remote_tp_size=self._tp_size,  # shared state
+            remote_dcp_size=self._dcp_size,  # shared state
             remote_block_size=self._block_size,  # shared state
             is_mla=self.use_mla,
             total_num_kv_heads=self.model_config.get_total_num_kv_heads(),
             attn_backend=self.attn_backend,
+            dcp_rank=self.dcp_rank,
             tensor_shape=next(iter(kv_caches.values())).shape,
         )
         self.compat_hash = compute_nixl_compatibility_hash(
@@ -1488,6 +1518,8 @@ class NixlConnectorWorker:
             if not self.use_host_buffer
             else self.host_buffer_kv_cache_layout,
             block_size=self.block_size,
+            dcp_size=self.dcp_size,
+            dcp_rank=self.dcp_rank,
         )
         # Wrap metadata in payload with hash for defensive decoding
         assert self.compat_hash is not None
@@ -1612,6 +1644,8 @@ class NixlConnectorWorker:
         ### Register remote agent metadata
         if engine_id not in self._tp_size:
             self._tp_size[engine_id] = remote_tp_size
+        if engine_id not in self._dcp_size:
+            self._dcp_size[engine_id] = nixl_agent_meta.dcp_size
         if engine_id not in self._block_size:
             self._block_size[engine_id] = nixl_agent_meta.block_size
 
@@ -1755,6 +1789,7 @@ class NixlConnectorWorker:
         remote_engine_id = nixl_agent_meta.engine_id
 
         assert self._tp_size[remote_engine_id] == remote_tp_size
+        assert self._dcp_size[remote_engine_id] == nixl_agent_meta.dcp_size
         assert self.kv_topo is not None
 
         tp_ratio = self.kv_topo.tp_ratio_from_engine_id(remote_engine_id)
@@ -2168,8 +2203,10 @@ class NixlConnectorWorker:
 
     def _read_blocks_for_req(self, req_id: str, meta: ReqMeta):
         assert meta.remote is not None and self.kv_topo is not None
-        remote_ranks = self.kv_topo.get_target_remote_ranks_from_engine_id(
-            meta.remote.engine_id
+        remote_ranks = (
+            self.kv_topo.get_target_remote_ranks_for_handshake_from_engine_id(
+                meta.remote.engine_id
+            )
         )
         tp_ratio = self.kv_topo.tp_ratio_from_engine_id(meta.remote.engine_id)
         # D may have to perform multiple reads from different remote ranks.

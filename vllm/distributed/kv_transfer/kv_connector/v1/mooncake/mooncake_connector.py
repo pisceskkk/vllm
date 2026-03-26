@@ -562,6 +562,7 @@ class MooncakeConnectorWorker:
             engine_id=self.engine_id,
             remote_tp_size=self._tp_size,  # shared state
             remote_block_size=self._block_size,  # shared state
+            remote_dcp_size={self.engine_id: 1},
             is_mla=self.use_mla,
             total_num_kv_heads=self.model_config.get_total_num_kv_heads(),
             attn_backend=backend,

@@ -4,8 +4,9 @@
 KV cache helper for store.
 """
 
+import math
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import torch
@@ -315,6 +316,8 @@ class TpKVTopology:
     attn_backend: type[AttentionBackend]
     engine_id: EngineId
     remote_block_size: dict[EngineId, int]
+    dcp_rank: int = 0
+    remote_dcp_size: dict[EngineId, int] = field(default_factory=dict)
     tensor_shape: torch.Size | None = None
 
     def __post_init__(self):
@@ -382,6 +385,10 @@ class TpKVTopology:
         return self.remote_block_size[self.engine_id]
 
     @property
+    def dcp_size(self) -> int:
+        return self.remote_dcp_size.get(self.engine_id, 1)
+
+    @property
     def cross_layers_blocks(self) -> bool:
         return self._cross_layers_blocks
 
@@ -442,6 +449,12 @@ class TpKVTopology:
         remote_block_size = self.remote_block_size[remote_engine_id]
         return self.block_size_ratio(remote_block_size)
 
+    def dcp_size_from_engine_id(
+        self,
+        remote_engine_id: EngineId,
+    ) -> int:
+        return self.remote_dcp_size.get(remote_engine_id, 1)
+
     def is_kv_replicated(self, engine_id: EngineId) -> bool:
         """
         Whether the KV cache is replicated across TP workers due to the
@@ -470,6 +483,79 @@ class TpKVTopology:
         # P TP > D TP case, D reads from |tp_ratio| remote workers.
         tp_ratio = -tp_ratio
         return [self.tp_rank * tp_ratio + i for i in range(tp_ratio)]
+
+    def get_head_overlapping_remote_ranks(
+        self,
+        remote_tp_size: int,
+    ) -> list[int]:
+        """Return remote TP ranks that overlap in KV head ownership.
+
+        For MLA, the KV cache is replicated across TP workers, so every remote
+        TP rank is a candidate. For non-MLA, reuse the existing TP-based
+        mapping, which already captures the supported head-overlap cases.
+        """
+        if self.is_mla:
+            return list(range(remote_tp_size))
+        return self.get_target_remote_ranks(remote_tp_size)
+
+    def remote_dcp_rank_from_tp_rank(
+        self,
+        remote_tp_rank: int,
+        remote_dcp_size: int,
+    ) -> int:
+        """Infer the remote DCP rank from the worker's TP rank.
+
+        Today the NIXL side channel addresses remote workers by TP rank. Under
+        TP+DCP deployments without PCP, that TP rank also identifies the worker
+        position within the DCP interleave, so the DCP rank is the TP rank
+        modulo the DCP world size.
+        """
+        if remote_dcp_size <= 1:
+            return 0
+        return remote_tp_rank % remote_dcp_size
+
+    def has_overlapping_dcp_shard(
+        self,
+        remote_tp_rank: int,
+        remote_dcp_size: int,
+    ) -> bool:
+        """Whether local and remote workers can own overlapping DCP shards."""
+        if self.dcp_size <= 1 and remote_dcp_size <= 1:
+            return True
+
+        modulus = math.gcd(self.dcp_size, remote_dcp_size)
+        remote_dcp_rank = self.remote_dcp_rank_from_tp_rank(
+            remote_tp_rank, remote_dcp_size
+        )
+        return (self.dcp_rank % modulus) == (remote_dcp_rank % modulus)
+
+    def get_target_remote_ranks_for_handshake(
+        self,
+        remote_tp_size: int,
+        remote_dcp_size: int = 1,
+    ) -> list[int]:
+        """Return remote workers that overlap in both heads and DCP shards."""
+        if self.is_mla and remote_dcp_size <= 1:
+            # Preserve the legacy MLA TP partition when the remote side does
+            # not split KV cache by DCP. This avoids turning TP-only MLA
+            # deployments into an all-to-all handshake.
+            candidate_ranks = self.get_target_remote_ranks(remote_tp_size)
+        else:
+            candidate_ranks = self.get_head_overlapping_remote_ranks(remote_tp_size)
+        return [
+            remote_tp_rank
+            for remote_tp_rank in candidate_ranks
+            if self.has_overlapping_dcp_shard(remote_tp_rank, remote_dcp_size)
+        ]
+
+    def get_target_remote_ranks_for_handshake_from_engine_id(
+        self,
+        remote_engine_id: EngineId,
+    ) -> list[int]:
+        return self.get_target_remote_ranks_for_handshake(
+            self.remote_tp_size[remote_engine_id],
+            self.dcp_size_from_engine_id(remote_engine_id),
+        )
 
     def get_target_remote_ranks_from_engine_id(
         self,
