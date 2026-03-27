@@ -273,6 +273,15 @@ class ReqMeta:
     remote: RemoteMeta | None = None
 
 
+@dataclass
+class RemoteReadPlan:
+    remote_engine_id: EngineId
+    remote_tp_ranks: list[int]
+    duplicate_remote_tp_ranks_by_primary: dict[int, list[int]]
+    tp_ratio: int
+    remote_dcp_size: int
+
+
 class NixlConnectorMetadata(KVConnectorMetadata):
     def __init__(self):
         self.reqs_to_recv: dict[ReqId, ReqMeta] = {}
@@ -1097,6 +1106,7 @@ class NixlConnectorWorker:
         self.nixl_wrapper = NixlWrapper(str(uuid.uuid4()), config)
         # Map of engine_id -> {rank0: agent_name0, rank1: agent_name1..}.
         self._remote_agents: dict[EngineId, dict[int, str]] = defaultdict(dict)
+        self._remote_dcp_ranks: dict[EngineId, dict[int, int]] = defaultdict(dict)
 
         # Metadata.
         self.engine_id: EngineId = engine_id
@@ -1203,6 +1213,7 @@ class NixlConnectorWorker:
         # [req_id -> list[handle]]
         self._recving_metadata: dict[ReqId, ReqMeta] = {}
         self._recving_transfers = defaultdict[ReqId, list[TransferHandle]](list)
+        self._done_recving_without_xfer: set[ReqId] = set()
         # Track the expiration time of requests that are waiting to be sent.
         self._reqs_to_send: dict[ReqId, float] = {}
         # Set of requests that have been part of a batch, regardless of status.
@@ -1251,6 +1262,7 @@ class NixlConnectorWorker:
         # With heterogeneous TP, P must wait for all assigned D TP workers to
         # finish reading before safely freeing the blocks.
         self.consumer_notification_counts_by_req = defaultdict[ReqId, int](int)
+        self.expected_consumer_notifications_by_req = defaultdict[ReqId, int](int)
         self.xfer_stats = NixlKVConnectorStats()
 
         self._physical_blocks_per_logical_kv_block = 1
@@ -1308,23 +1320,23 @@ class NixlConnectorWorker:
         # local rank will read from. Note that With homogeneous TP,
         # this happens to be the same single rank_i.
         assert self.kv_topo is not None
-        p_remote_ranks = self.kv_topo.get_target_remote_ranks_for_handshake(
+        remote_tp_ranks_to_handshake = self.kv_topo.get_overlapping_remote_tp_ranks(
             remote_tp_size, remote_dcp_size
         )
         remote_rank_to_agent_name = {}
         path = make_zmq_path("tcp", host, port)
 
         with zmq_ctx(zmq.REQ, path) as sock:
-            for remote_rank in p_remote_ranks:
+            for remote_tp_rank in remote_tp_ranks_to_handshake:
                 logger.debug(
                     "Querying metadata on path: %s at remote tp rank %s",
                     path,
-                    remote_rank,
+                    remote_tp_rank,
                 )
 
                 start_time = time.perf_counter()
                 # Send query for the request.
-                msg = msgspec.msgpack.encode((GET_META_MSG, remote_rank))
+                msg = msgspec.msgpack.encode((GET_META_MSG, remote_tp_rank))
                 # Set receive timeout to 5 seconds to avoid hanging on dead server
                 sock.setsockopt(zmq.RCVTIMEO, 5000)  # milliseconds
                 sock.send(msg)
@@ -1392,14 +1404,14 @@ class NixlConnectorWorker:
 
                 # Register Remote agent.
                 remote_agent_name = self.add_remote_agent(
-                    metadata, remote_rank, remote_tp_size
+                    metadata, remote_tp_rank, remote_tp_size
                 )
                 setup_agent_time = time.perf_counter()
                 logger.debug(
                     "NIXL handshake: add agent took: %s",
                     setup_agent_time - got_metadata_time,
                 )
-                remote_rank_to_agent_name[remote_rank] = remote_agent_name
+                remote_rank_to_agent_name[remote_tp_rank] = remote_agent_name
         return remote_rank_to_agent_name
 
     def initialize_host_xfer_buffer(self, kv_caches: dict[str, torch.Tensor]) -> None:
@@ -1506,6 +1518,174 @@ class NixlConnectorWorker:
             context,
             exc_info=error is not None,
             stacklevel=2,
+        )
+
+    @staticmethod
+    def _compute_block_positions(
+        block_ids: BlockIds,
+        dcp_size: int,
+        dcp_rank: int,
+    ) -> list[int]:
+        # With block-aligned DCP interleave, a request block at logical
+        # position `block_pos` is globally identified by the physical block
+        # position it maps to across the full DCP ring.
+        pos_mapper = lambda block_pos: dcp_size * block_pos + dcp_rank
+        return pos_mapper(np.arange(len(block_ids[0]))).tolist()
+
+    def _compute_remote_block_global_positions(
+        self,
+        meta: ReqMeta,
+        remote_rank: int,
+    ) -> list[int]:
+        assert meta.remote is not None and self.kv_topo is not None
+
+        remote_engine_id = meta.remote.engine_id
+        remote_dcp_size = self.kv_topo.dcp_size_from_engine_id(remote_engine_id)
+        remote_dcp_rank = self._get_remote_worker_dcp_rank(
+            remote_engine_id,
+            remote_rank,
+        )
+        return self._compute_block_positions(
+            meta.remote.block_ids,
+            remote_dcp_size,
+            remote_dcp_rank,
+        )
+
+    @staticmethod
+    def _make_notif_id(request_id: str, expected_consumers: int) -> bytes:
+        return f"{request_id}:{expected_consumers}".encode()
+
+    def _expected_consumers_per_remote_rank(
+        self,
+        remote_engine_id: str,
+        remote_rank: int,
+    ) -> int:
+        assert self.kv_topo is not None
+        expected = self.kv_topo.get_local_consumer_count_for_remote_tp_rank(
+            remote_engine_id,
+            remote_rank,
+        )
+        assert expected > 0, (
+            f"Expected at least one consumer for remote rank {remote_rank} "
+            f"on engine {remote_engine_id}."
+        )
+        return expected
+
+    def _get_remote_worker_dcp_rank(
+        self,
+        remote_engine_id: EngineId,
+        remote_tp_rank: int,
+    ) -> int:
+        assert self.kv_topo is not None
+
+        cached_remote_dcp_rank = self._remote_dcp_ranks[remote_engine_id].get(
+            remote_tp_rank
+        )
+        if cached_remote_dcp_rank is not None:
+            return cached_remote_dcp_rank
+
+        remote_dcp_size = self.kv_topo.dcp_size_from_engine_id(remote_engine_id)
+        return self.kv_topo.dcp_rank_for_remote_tp_rank(
+            remote_tp_rank,
+            remote_dcp_size,
+        )
+
+    def _build_remote_read_plan(
+        self,
+        req_id: str,
+        meta: ReqMeta,
+    ) -> RemoteReadPlan:
+        assert meta.remote is not None and self.kv_topo is not None
+
+        remote_engine_id = meta.remote.engine_id
+        remote_tp_ranks = self.kv_topo.get_overlapping_remote_tp_ranks_from_engine_id(
+            remote_engine_id
+        )
+        tp_ratio = self.kv_topo.tp_ratio_from_engine_id(remote_engine_id)
+        remote_dcp_size = self.kv_topo.dcp_size_from_engine_id(remote_engine_id)
+        duplicate_remote_tp_ranks_by_primary: dict[int, list[int]] = defaultdict(list)
+
+        if self.use_mla and tp_ratio < 0:
+            primary_remote_tp_rank_by_dcp_rank: dict[int, int] = {}
+            deduped_remote_tp_ranks: list[int] = []
+            for remote_tp_rank in remote_tp_ranks:
+                remote_dcp_rank = self._get_remote_worker_dcp_rank(
+                    remote_engine_id,
+                    remote_tp_rank,
+                )
+                primary_remote_tp_rank = primary_remote_tp_rank_by_dcp_rank.get(
+                    remote_dcp_rank
+                )
+                if primary_remote_tp_rank is None:
+                    primary_remote_tp_rank_by_dcp_rank[remote_dcp_rank] = remote_tp_rank
+                    deduped_remote_tp_ranks.append(remote_tp_rank)
+                else:
+                    duplicate_remote_tp_ranks_by_primary[primary_remote_tp_rank].append(
+                        remote_tp_rank
+                    )
+            remote_tp_ranks = deduped_remote_tp_ranks
+
+        return RemoteReadPlan(
+            remote_engine_id=remote_engine_id,
+            remote_tp_ranks=remote_tp_ranks,
+            duplicate_remote_tp_ranks_by_primary=dict(
+                duplicate_remote_tp_ranks_by_primary
+            ),
+            tp_ratio=tp_ratio,
+            remote_dcp_size=remote_dcp_size,
+        )
+
+    def _match_blocks_by_global_positions(
+        self,
+        meta: ReqMeta,
+        remote_rank: int,
+        req_id: str | None = None,
+    ) -> tuple[BlockIds, BlockIds]:
+        assert meta.remote is not None and self.kv_topo is not None
+
+        remote_engine_id = meta.remote.engine_id
+        block_size_ratio = self.kv_topo.block_size_ratio_from_engine_id(
+            remote_engine_id
+        )
+        if block_size_ratio != 1:
+            return meta.local_block_ids, meta.remote.block_ids
+
+        local_global_positions = self._compute_block_positions(
+            meta.local_block_ids,
+            self.dcp_size,
+            self.dcp_rank,
+        )
+        remote_global_positions = self._compute_remote_block_global_positions(
+            meta,
+            remote_rank,
+        )
+
+        local_blocks_by_position = {
+            global_pos: block_id
+            for global_pos, block_id in zip(
+                local_global_positions,
+                meta.local_block_ids,
+            )
+        }
+        remote_blocks_by_position = {
+            global_pos: block_id
+            for global_pos, block_id in zip(
+                remote_global_positions,
+                meta.remote.block_ids,
+            )
+        }
+        matched_positions = sorted(
+            set(local_blocks_by_position) & set(remote_blocks_by_position)
+        )
+        matched_local_block_ids = [
+            local_blocks_by_position[pos] for pos in matched_positions
+        ]
+        matched_remote_block_ids = [
+            remote_blocks_by_position[pos] for pos in matched_positions
+        ]
+        return (
+            matched_local_block_ids,
+            matched_remote_block_ids,
         )
 
     def _background_nixl_handshake(
@@ -1932,6 +2112,7 @@ class NixlConnectorWorker:
             self._dcp_size[engine_id] = nixl_agent_meta.dcp_size
         if engine_id not in self._block_size:
             self._block_size[engine_id] = nixl_agent_meta.block_size
+        self._remote_dcp_ranks[engine_id][remote_tp_rank] = nixl_agent_meta.dcp_rank
 
         remote_agent_name = self.nixl_wrapper.add_remote_agent(
             nixl_agent_meta.agent_metadata
@@ -2114,6 +2295,12 @@ class NixlConnectorWorker:
         assert self._tp_size[remote_engine_id] == remote_tp_size
         assert self._dcp_size[remote_engine_id] == nixl_agent_meta.dcp_size
         assert self.kv_topo is not None
+
+        if self.dcp_size > 1 or nixl_agent_meta.dcp_size > 1:
+            assert nixl_agent_meta.block_size == self.block_size, (
+                "NIXL DCP requires matching local/remote block_size, got "
+                f"local={self.block_size} and remote={nixl_agent_meta.block_size}."
+            )
 
         tp_ratio = self.kv_topo.tp_ratio_from_engine_id(remote_engine_id)
         block_size_ratio = self.kv_topo.block_size_ratio_from_engine_id(
@@ -2313,6 +2500,9 @@ class NixlConnectorWorker:
         done_sending = self._get_new_notifs()
         done_recving = self._pop_done_transfers(self._recving_transfers)
 
+        done_recving.update(self._done_recving_without_xfer)
+        self._done_recving_without_xfer.clear()
+
         # add requests that skipped transfer to done_recving
         done_recving.update(self._failed_recv_reqs)
         self._failed_recv_reqs.clear()
@@ -2360,6 +2550,7 @@ class NixlConnectorWorker:
             if now < expires:
                 break
             count = self.consumer_notification_counts_by_req.pop(req_id, 0)
+            self.expected_consumer_notifications_by_req.pop(req_id, None)
             self.xfer_stats.record_kv_expired_req()
             logger.warning(
                 "Releasing expired KV blocks for request %s which were "
@@ -2384,7 +2575,7 @@ class NixlConnectorWorker:
         notified_req_ids: set[str] = set()
         for notifs in self.nixl_wrapper.get_new_notifs().values():
             for notif in notifs:
-                req_id, tp_size = notif.decode("utf-8").rsplit(":", 1)
+                req_id, expected_consumers = notif.decode("utf-8").rsplit(":", 1)
                 if (
                     req_id not in self._reqs_to_send
                     and req_id not in self._reqs_to_process
@@ -2397,14 +2588,12 @@ class NixlConnectorWorker:
                     )
                     continue
 
-                # NOTE: `tp_ratio` is the opposite when swapping local<>remote
-                n_consumers = int(tp_size)
-                tp_ratio = self.kv_topo.tp_ratio(n_consumers)
-
-                # Number of reads *per producer* to wait for.
-                # When remote D TP > local P TP we expect `tp_ratio` reads.
-                consumers_per_producer = (
-                    -tp_ratio if n_consumers > self.world_size else 1
+                consumers_per_producer = max(
+                    self.expected_consumer_notifications_by_req[req_id],
+                    int(expected_consumers),
+                )
+                self.expected_consumer_notifications_by_req[req_id] = (
+                    consumers_per_producer
                 )
 
                 self.consumer_notification_counts_by_req[req_id] += 1
@@ -2415,6 +2604,7 @@ class NixlConnectorWorker:
                 ):
                     notified_req_ids.add(req_id)
                     del self.consumer_notification_counts_by_req[req_id]
+                    del self.expected_consumer_notifications_by_req[req_id]
                     self._reqs_to_process.remove(req_id)
                     self._reqs_to_send.pop(req_id, None)
         return notified_req_ids
@@ -2542,34 +2732,40 @@ class NixlConnectorWorker:
 
     def _read_blocks_for_req(self, req_id: str, meta: ReqMeta):
         assert meta.remote is not None and self.kv_topo is not None
-        remote_ranks = (
-            self.kv_topo.get_target_remote_ranks_for_handshake_from_engine_id(
-                meta.remote.engine_id
-            )
-        )
-        tp_ratio = self.kv_topo.tp_ratio_from_engine_id(meta.remote.engine_id)
-        # D may have to perform multiple reads from different remote ranks.
-        for i, remote_rank in enumerate(remote_ranks):
-            if self.use_mla and tp_ratio < 0 and i > 0:
-                # MLA opt: when P TP > D TP, only a single read is executed for
-                # the first remote rank (cache is duplicated)..
-                break
+        read_plan = self._build_remote_read_plan(req_id, meta)
+        remote_engine_id = read_plan.remote_engine_id
 
-            remote_block_size = self.kv_topo.remote_block_size[meta.remote.engine_id]
+        # D may have to perform multiple reads from different remote ranks.
+        launched_read = False
+        for i, remote_tp_rank in enumerate(read_plan.remote_tp_ranks):
+            local_block_ids, remote_block_ids = self._match_blocks_by_global_positions(
+                meta,
+                remote_tp_rank,
+                req_id=req_id,
+            )
+            if local_block_ids:
+                launched_read = True
+            local_physical_block_ids = self._logical_to_kernel_block_ids(
+                local_block_ids
+            )
+
+            remote_block_size = self.kv_topo.remote_block_size[remote_engine_id]
             logger.debug(
                 "Remote agent %s available, calling _read_blocks"
                 " on remote rank %s with remote block size %s for req %s",
-                meta.remote.engine_id,
-                remote_rank,
+                remote_engine_id,
+                remote_tp_rank,
                 remote_block_size,
                 req_id,
             )
             # Get side handles.
-            if tp_ratio < 0 and not self.use_mla:
+            if read_plan.tp_ratio < 0 and not self.use_mla:
                 assert remote_block_size == self.block_size
                 # Remote tp_size > local tp_size: we must perform multiple
                 # reads. Get the memory chunk onto which we will write to.
-                local_xfer_side_handle = self.src_xfer_handles_by_tp_ratio[tp_ratio][i]
+                local_xfer_side_handle = self.src_xfer_handles_by_tp_ratio[
+                    read_plan.tp_ratio
+                ][i]
             else:
                 # Single read from remote, we write to the whole memory region.
                 # Also handle remote block size different from local block size.
@@ -2578,28 +2774,43 @@ class NixlConnectorWorker:
                 ]
 
             # Destination handle: remote_engine_id -> remote_rank -> handle.
-            remote_xfer_side_handle = self.dst_xfer_side_handles[meta.remote.engine_id][
-                remote_rank
+            remote_xfer_side_handle = self.dst_xfer_side_handles[remote_engine_id][
+                remote_tp_rank
             ]
             self._read_blocks(
                 request_id=req_id,
-                dst_engine_id=meta.remote.engine_id,
+                dst_engine_id=remote_engine_id,
                 remote_request_id=meta.remote.request_id,
-                local_block_ids=meta.local_physical_block_ids,
-                remote_block_ids=meta.remote.block_ids,
-                remote_rank=remote_rank,
+                local_block_ids=local_physical_block_ids,
+                remote_block_ids=remote_block_ids,
+                remote_rank=remote_tp_rank,
                 local_xfer_side_handle=local_xfer_side_handle,
                 remote_xfer_side_handle=remote_xfer_side_handle,
             )
 
-            if self.use_mla and tp_ratio < 0:
-                # ..but we still need to notify the other remote ranks that we
-                # have the blocks we need so they can update the request state.
-                notif_id = f"{req_id}:{self.world_size}".encode()
-                remote_agents = self._remote_agents[meta.remote.engine_id]
-                for rank_to_notify, agent in remote_agents.items():
-                    if rank_to_notify != remote_rank:
-                        self.nixl_wrapper.send_notif(agent, notif_msg=notif_id)
+            if self.use_mla and read_plan.tp_ratio < 0:
+                # Notify TP-duplicate remote ranks that share the same DCP shard.
+                remote_agents = self._remote_agents[remote_engine_id]
+                for (
+                    duplicate_remote_tp_rank
+                ) in read_plan.duplicate_remote_tp_ranks_by_primary.get(
+                    remote_tp_rank,
+                    [],
+                ):
+                    notif_id = self._make_notif_id(
+                        meta.remote.request_id,
+                        self._expected_consumers_per_remote_rank(
+                            remote_engine_id,
+                            duplicate_remote_tp_rank,
+                        ),
+                    )
+                    self.nixl_wrapper.send_notif(
+                        remote_agents[duplicate_remote_tp_rank],
+                        notif_msg=notif_id,
+                    )
+
+        if not launched_read and req_id not in self._failed_recv_reqs:
+            self._done_recving_without_xfer.add(req_id)
 
     def _read_blocks(
         self,
@@ -2652,9 +2863,16 @@ class NixlConnectorWorker:
         # NOTE(rob): according to nvidia the staging blocks are used to
         # saturate IB with heterogeneous TP sizes.
 
-        # Number of D TP workers that will read from dst P. Propagate info
-        # on notification so that dst worker can wait before freeing blocks.
-        notif_id = f"{remote_request_id}:{self.world_size}".encode()
+        # Propagate the exact number of consumer workers that will notify this
+        # producer rank so the sender can free blocks only after every
+        # overlapping read on this rank is done.
+        expected_consumers = self._expected_consumers_per_remote_rank(
+            dst_engine_id, remote_rank
+        )
+        notif_id = self._make_notif_id(
+            remote_request_id,
+            expected_consumers,
+        )
 
         # Full prefix cache hit: do not need to read remote blocks,
         # just notify P worker that we have the blocks we need.
