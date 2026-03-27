@@ -487,83 +487,154 @@ class TpKVTopology:
         (on D) will read from. When remote tp_size > local tp_size, we
         read from multiple remote ranks.
         """
+        return self._get_target_remote_ranks_for_local_tp_rank(
+            self.tp_rank, remote_tp_size
+        )
+
+    def _get_target_remote_ranks_for_local_tp_rank(
+        self,
+        local_tp_rank: int,
+        remote_tp_size: int,
+    ) -> list[int]:
         tp_ratio = self.tp_ratio(remote_tp_size)
         if tp_ratio > 0:
-            return [self.tp_rank // tp_ratio]
+            return [local_tp_rank // tp_ratio]
 
         # P TP > D TP case, D reads from |tp_ratio| remote workers.
         tp_ratio = -tp_ratio
-        return [self.tp_rank * tp_ratio + i for i in range(tp_ratio)]
+        return [local_tp_rank * tp_ratio + i for i in range(tp_ratio)]
 
-    def get_head_overlapping_remote_ranks(
+    def _get_head_overlapping_remote_ranks_for_local_tp_rank(
         self,
+        local_tp_rank: int,
         remote_tp_size: int,
     ) -> list[int]:
-        """Return remote TP ranks that overlap in KV head ownership.
-
-        For MLA, the KV cache is replicated across TP workers, so every remote
-        TP rank is a candidate. For non-MLA, reuse the existing TP-based
-        mapping, which already captures the supported head-overlap cases.
-        """
         if self.is_mla:
             return list(range(remote_tp_size))
-        return self.get_target_remote_ranks(remote_tp_size)
+        return self._get_target_remote_ranks_for_local_tp_rank(
+            local_tp_rank, remote_tp_size
+        )
 
-    def remote_dcp_rank_from_tp_rank(
+    def _dcp_rank_for_local_tp_rank(
+        self,
+        local_tp_rank: int,
+    ) -> int:
+        """Infer the local worker's DCP rank from its TP rank.
+
+        This matches the current NIXL rank-addressing model, where remote
+        workers are identified through their TP rank and PCP is not part of the
+        KV ownership mapping.
+        """
+        if self.dcp_size <= 1:
+            return 0
+        return local_tp_rank % self.dcp_size
+
+    def dcp_rank_for_remote_tp_rank(
         self,
         remote_tp_rank: int,
         remote_dcp_size: int,
     ) -> int:
-        """Infer the remote DCP rank from the worker's TP rank.
+        """Infer the remote worker's DCP rank from its TP rank.
 
-        Today the NIXL side channel addresses remote workers by TP rank. Under
-        TP+DCP deployments without PCP, that TP rank also identifies the worker
-        position within the DCP interleave, so the DCP rank is the TP rank
-        modulo the DCP world size.
+        Under the current PCP-disabled NIXL topology, a remote worker's TP rank
+        also identifies its position in the DCP interleave.
         """
         if remote_dcp_size <= 1:
             return 0
         return remote_tp_rank % remote_dcp_size
 
-    def has_overlapping_dcp_shard(
+    def _shares_dcp_shard_with_remote_tp_rank(
         self,
         remote_tp_rank: int,
         remote_dcp_size: int,
+        local_dcp_rank: int | None = None,
     ) -> bool:
-        """Whether local and remote workers can own overlapping DCP shards."""
+        """Whether the local worker and a remote TP worker overlap in DCP."""
         if self.dcp_size <= 1 and remote_dcp_size <= 1:
             return True
 
+        if local_dcp_rank is None:
+            local_dcp_rank = self.dcp_rank
         modulus = math.gcd(self.dcp_size, remote_dcp_size)
-        remote_dcp_rank = self.remote_dcp_rank_from_tp_rank(
+        remote_dcp_rank = self.dcp_rank_for_remote_tp_rank(
             remote_tp_rank, remote_dcp_size
         )
-        return (self.dcp_rank % modulus) == (remote_dcp_rank % modulus)
+        return (local_dcp_rank % modulus) == (remote_dcp_rank % modulus)
 
-    def get_target_remote_ranks_for_handshake(
+    def get_overlapping_remote_tp_ranks(
         self,
         remote_tp_size: int,
         remote_dcp_size: int = 1,
     ) -> list[int]:
-        """Return remote workers that overlap in both heads and DCP shards."""
+        """Return remote TP workers overlapping in both heads and DCP shards."""
+        return self._get_overlapping_remote_tp_ranks_for_local_tp_rank(
+            self.tp_rank,
+            remote_tp_size,
+            remote_dcp_size,
+            local_dcp_rank=self.dcp_rank,
+        )
+
+    def _get_overlapping_remote_tp_ranks_for_local_tp_rank(
+        self,
+        local_tp_rank: int,
+        remote_tp_size: int,
+        remote_dcp_size: int = 1,
+        local_dcp_rank: int | None = None,
+    ) -> list[int]:
+        """Return remote TP workers whose KV ownership overlaps this worker.
+
+        This helper intentionally captures the exact worker set used by both
+        NIXL handshakes and NIXL KV reads under the currently supported
+        PCP-disabled TP/DCP layouts.
+        """
         if self.is_mla and remote_dcp_size <= 1:
             # Preserve the legacy MLA TP partition when the remote side does
             # not split KV cache by DCP. This avoids turning TP-only MLA
             # deployments into an all-to-all handshake.
-            candidate_ranks = self.get_target_remote_ranks(remote_tp_size)
+            candidate_remote_tp_ranks = self._get_target_remote_ranks_for_local_tp_rank(
+                local_tp_rank, remote_tp_size
+            )
         else:
-            candidate_ranks = self.get_head_overlapping_remote_ranks(remote_tp_size)
+            candidate_remote_tp_ranks = (
+                self._get_head_overlapping_remote_ranks_for_local_tp_rank(
+                    local_tp_rank, remote_tp_size
+                )
+            )
+        if local_dcp_rank is None:
+            local_dcp_rank = self._dcp_rank_for_local_tp_rank(local_tp_rank)
         return [
             remote_tp_rank
-            for remote_tp_rank in candidate_ranks
-            if self.has_overlapping_dcp_shard(remote_tp_rank, remote_dcp_size)
+            for remote_tp_rank in candidate_remote_tp_ranks
+            if self._shares_dcp_shard_with_remote_tp_rank(
+                remote_tp_rank,
+                remote_dcp_size,
+                local_dcp_rank=local_dcp_rank,
+            )
         ]
 
-    def get_target_remote_ranks_for_handshake_from_engine_id(
+    def get_local_consumer_count_for_remote_tp_rank(
+        self,
+        remote_engine_id: EngineId,
+        remote_tp_rank: int,
+    ) -> int:
+        """Count local workers that notify a given remote TP worker."""
+        remote_tp_size = self.remote_tp_size[remote_engine_id]
+        remote_dcp_size = self.dcp_size_from_engine_id(remote_engine_id)
+        return sum(
+            remote_tp_rank
+            in self._get_overlapping_remote_tp_ranks_for_local_tp_rank(
+                local_tp_rank,
+                remote_tp_size,
+                remote_dcp_size,
+            )
+            for local_tp_rank in range(self.tp_size)
+        )
+
+    def get_overlapping_remote_tp_ranks_from_engine_id(
         self,
         remote_engine_id: EngineId,
     ) -> list[int]:
-        return self.get_target_remote_ranks_for_handshake(
+        return self.get_overlapping_remote_tp_ranks(
             self.remote_tp_size[remote_engine_id],
             self.dcp_size_from_engine_id(remote_engine_id),
         )
