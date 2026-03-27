@@ -467,7 +467,7 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
                 block_len * tp_ratio for block_len in remote_block_lens
             ]
 
-        remote_tp_ranks = self.kv_topo.get_target_remote_ranks_for_handshake(
+        remote_tp_ranks = self.kv_topo.get_overlapping_remote_tp_ranks(
             remote_tp_size, remote_dcp_size
         )
         remote_agents: dict[int, str] = {}
@@ -763,6 +763,432 @@ class TestNixlHandshake:
         )
 
         assert set(remote_agents.keys()) == {1, 3}
+
+    @patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector.NixlWrapper",
+        FakeNixlWrapper,
+    )
+    def test_read_blocks_for_req_matches_blocks_by_global_position(
+        self, default_vllm_config, dist_init
+    ):
+        vllm_config = create_vllm_config()
+        vllm_config.parallel_config.decode_context_parallel_size = 2
+
+        connector = NixlConnector(vllm_config, KVConnectorRole.WORKER)
+        connector.connector_worker = FakeNixlConnectorWorker(
+            vllm_config, connector.engine_id, hand_shake_latency=0
+        )
+        worker = connector.connector_worker
+        worker.use_mla = True
+        worker.dcp_rank = 1
+        worker.dcp_size = 2
+        worker._tp_size = {
+            worker.engine_id: 1,
+            worker.REMOTE_ENGINE_ID: 4,
+        }
+        worker._dcp_size = {
+            worker.engine_id: 2,
+            worker.REMOTE_ENGINE_ID: 4,
+        }
+        worker._block_size = {
+            worker.engine_id: worker.block_size,
+            worker.REMOTE_ENGINE_ID: worker.block_size,
+        }
+        worker._remote_dcp_ranks[worker.REMOTE_ENGINE_ID] = {
+            1: 1,
+            3: 3,
+        }
+        worker.dst_xfer_side_handles[worker.REMOTE_ENGINE_ID] = {1: 11, 3: 13}
+        worker.kv_topo = TpKVTopology(
+            tp_rank=worker.tp_rank,
+            engine_id=worker.engine_id,
+            remote_tp_size=worker._tp_size,
+            remote_dcp_size=worker._dcp_size,
+            remote_block_size=worker._block_size,
+            is_mla=True,
+            total_num_kv_heads=worker.model_config.get_total_num_kv_heads(),
+            attn_backend=worker.attn_backend,
+            dcp_rank=worker.dcp_rank,
+            tensor_shape=worker.kv_topo.tensor_shape,
+        )
+
+        metadata = NixlConnectorMetadata()
+        metadata.add_new_req_to_recv(
+            request_id="id",
+            local_block_ids=[101, 102],
+            local_block_positions=[2, 3],
+            kv_transfer_params={
+                "remote_block_ids": [201, 202],
+                "remote_block_positions": [1, 2],
+                "remote_engine_id": worker.REMOTE_ENGINE_ID,
+                "remote_request_id": "prefill-id",
+                "remote_host": "localhost",
+                "remote_port": 1234,
+                "tp_size": 4,
+                "dcp_size": 4,
+            },
+        )
+        meta = metadata.reqs_to_recv["id"]
+        meta.local_block_global_positions = worker._compute_global_block_positions(
+            meta.local_block_positions,
+            worker.dcp_size,
+            worker.dcp_rank,
+        )
+
+        with patch.object(worker, "_read_blocks") as mock_read_blocks:
+            worker._read_blocks_for_req("id", meta)
+
+        assert mock_read_blocks.call_count == 2
+        first_call = mock_read_blocks.call_args_list[0].kwargs
+        second_call = mock_read_blocks.call_args_list[1].kwargs
+        assert first_call["remote_rank"] == 1
+        assert first_call["local_block_ids"] == [101]
+        assert first_call["remote_block_ids"] == [201]
+        assert second_call["remote_rank"] == 3
+        assert second_call["local_block_ids"] == [102]
+        assert second_call["remote_block_ids"] == [201]
+
+    @patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector.NixlWrapper",
+        FakeNixlWrapper,
+    )
+    def test_start_load_kv_marks_zero_xfer_request_finished(
+        self, default_vllm_config, dist_init
+    ):
+        vllm_config = create_vllm_config()
+        vllm_config.parallel_config.tensor_parallel_size = 4
+        vllm_config.parallel_config.decode_context_parallel_size = 4
+
+        connector = NixlConnector(vllm_config, KVConnectorRole.WORKER)
+        connector.connector_worker = FakeNixlConnectorWorker(
+            vllm_config, connector.engine_id, hand_shake_latency=0
+        )
+        worker = connector.connector_worker
+        worker.use_mla = True
+        worker.world_size = 4
+        worker.tp_rank = 2
+        worker.dcp_rank = 2
+        worker.dcp_size = 4
+        worker._tp_size = {
+            worker.engine_id: 4,
+            worker.REMOTE_ENGINE_ID: 2,
+        }
+        worker._dcp_size = {
+            worker.engine_id: 4,
+            worker.REMOTE_ENGINE_ID: 2,
+        }
+        worker._block_size = {
+            worker.engine_id: worker.block_size,
+            worker.REMOTE_ENGINE_ID: worker.block_size,
+        }
+        worker._remote_agents[worker.REMOTE_ENGINE_ID] = {0: "agent-0"}
+        worker._remote_dcp_ranks[worker.REMOTE_ENGINE_ID] = {0: 0}
+        worker.dst_xfer_side_handles[worker.REMOTE_ENGINE_ID] = {0: 11}
+        worker.kv_topo = TpKVTopology(
+            tp_rank=worker.tp_rank,
+            engine_id=worker.engine_id,
+            remote_tp_size=worker._tp_size,
+            remote_dcp_size=worker._dcp_size,
+            remote_block_size=worker._block_size,
+            is_mla=True,
+            total_num_kv_heads=worker.model_config.get_total_num_kv_heads(),
+            attn_backend=worker.attn_backend,
+            dcp_rank=worker.dcp_rank,
+            tensor_shape=worker.kv_topo.tensor_shape,
+        )
+
+        metadata = NixlConnectorMetadata()
+        metadata.add_new_req_to_recv(
+            request_id="id",
+            local_block_ids=[],
+            local_block_positions=[],
+            kv_transfer_params={
+                "remote_block_ids": [201],
+                "remote_block_positions": [0],
+                "remote_engine_id": worker.REMOTE_ENGINE_ID,
+                "remote_request_id": "prefill-id",
+                "remote_host": "localhost",
+                "remote_port": 1234,
+                "tp_size": 2,
+                "dcp_size": 2,
+            },
+        )
+
+        with patch.object(worker.nixl_wrapper, "send_notif") as mock_send_notif:
+            worker.start_load_kv(metadata)
+            done_sending, done_recving = worker.get_finished()
+
+        assert not done_sending
+        assert done_recving == {"id"}
+        mock_send_notif.assert_called_once_with("agent-0", notif_msg=b"prefill-id:2")
+
+    @patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector.NixlWrapper",
+        FakeNixlWrapper,
+    )
+    def test_dcp_handshake_requires_matching_block_size(
+        self, default_vllm_config, dist_init
+    ):
+        vllm_config = create_vllm_config(block_size=16)
+        vllm_config.parallel_config.decode_context_parallel_size = 2
+
+        connector = NixlConnector(vllm_config, KVConnectorRole.WORKER)
+        connector.connector_worker = FakeNixlConnectorWorker(
+            vllm_config, connector.engine_id, hand_shake_latency=0
+        )
+        worker = connector.connector_worker
+        worker.use_mla = True
+        worker.dcp_rank = 0
+        worker.dcp_size = 2
+        worker._tp_size = {worker.engine_id: 1}
+        worker._dcp_size = {worker.engine_id: 2}
+        worker._block_size = {worker.engine_id: worker.block_size}
+        worker.kv_topo = TpKVTopology(
+            tp_rank=worker.tp_rank,
+            engine_id=worker.engine_id,
+            remote_tp_size=worker._tp_size,
+            remote_dcp_size=worker._dcp_size,
+            remote_block_size=worker._block_size,
+            is_mla=True,
+            total_num_kv_heads=worker.model_config.get_total_num_kv_heads(),
+            attn_backend=worker.attn_backend,
+            dcp_rank=worker.dcp_rank,
+            tensor_shape=worker.kv_topo.tensor_shape,
+        )
+        worker.slot_size_per_layer = [4096]
+        worker.block_len_per_layer = [4096 * worker.block_size]
+        worker.num_blocks = 1
+        worker.dst_num_blocks[worker.engine_id] = worker.num_blocks
+        worker.src_blocks_data = [(0, worker.block_len_per_layer[0], worker.tp_rank)]
+
+        with pytest.raises(
+            AssertionError,
+            match="NIXL DCP requires matching local/remote block_size",
+        ):
+            worker.add_remote_agent(
+                NixlAgentMetadata(
+                    engine_id=worker.REMOTE_ENGINE_ID,
+                    agent_metadata=FakeNixlWrapper.AGENT_METADATA,
+                    kv_caches_base_addr=[0],
+                    device_id=0,
+                    num_blocks=1,
+                    block_lens=list(worker.block_len_per_layer),
+                    kv_cache_layout="HND",
+                    block_size=8,
+                    dcp_size=4,
+                    dcp_rank=0,
+                ),
+                remote_tp_rank=0,
+                remote_tp_size=4,
+            )
+
+    @patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector.NixlWrapper",
+        FakeNixlWrapper,
+    )
+    def test_read_blocks_for_req_duplicate_rank_notifications_use_remote_request_id(
+        self, default_vllm_config, dist_init
+    ):
+        vllm_config = create_vllm_config()
+
+        connector = NixlConnector(vllm_config, KVConnectorRole.WORKER)
+        connector.connector_worker = FakeNixlConnectorWorker(
+            vllm_config, connector.engine_id, hand_shake_latency=0
+        )
+        worker = connector.connector_worker
+        worker.use_mla = True
+        worker.tp_rank = 0
+        worker.dcp_rank = 0
+        worker.dcp_size = 1
+        worker._tp_size = {
+            worker.engine_id: 1,
+            worker.REMOTE_ENGINE_ID: 4,
+        }
+        worker._dcp_size = {
+            worker.engine_id: 1,
+            worker.REMOTE_ENGINE_ID: 2,
+        }
+        worker._block_size = {
+            worker.engine_id: worker.block_size,
+            worker.REMOTE_ENGINE_ID: worker.block_size,
+        }
+        worker._remote_agents[worker.REMOTE_ENGINE_ID] = {
+            0: "agent-0",
+            2: "agent-2",
+        }
+        worker._remote_dcp_ranks[worker.REMOTE_ENGINE_ID] = {
+            0: 0,
+            2: 0,
+        }
+        worker.dst_xfer_side_handles[worker.REMOTE_ENGINE_ID] = {0: 11}
+        worker.kv_topo = TpKVTopology(
+            tp_rank=worker.tp_rank,
+            engine_id=worker.engine_id,
+            remote_tp_size=worker._tp_size,
+            remote_dcp_size=worker._dcp_size,
+            remote_block_size=worker._block_size,
+            is_mla=True,
+            total_num_kv_heads=worker.model_config.get_total_num_kv_heads(),
+            attn_backend=worker.attn_backend,
+            dcp_rank=worker.dcp_rank,
+            tensor_shape=worker.kv_topo.tensor_shape,
+        )
+
+        metadata = NixlConnectorMetadata()
+        metadata.add_new_req_to_recv(
+            request_id="decode-id",
+            local_block_ids=[101],
+            local_block_positions=[0],
+            kv_transfer_params={
+                "remote_block_ids": [201, 202],
+                "remote_block_positions": [0, 1],
+                "remote_engine_id": worker.REMOTE_ENGINE_ID,
+                "remote_request_id": "prefill-id",
+                "remote_host": "localhost",
+                "remote_port": 1234,
+                "tp_size": 4,
+                "dcp_size": 2,
+            },
+        )
+        meta = metadata.reqs_to_recv["decode-id"]
+        meta.local_block_global_positions = worker._compute_global_block_positions(
+            meta.local_block_positions,
+            worker.dcp_size,
+            worker.dcp_rank,
+        )
+
+        with (
+            patch.object(worker, "_read_blocks") as mock_read_blocks,
+            patch.object(worker.nixl_wrapper, "send_notif") as mock_send_notif,
+        ):
+            worker._read_blocks_for_req("decode-id", meta)
+
+        mock_read_blocks.assert_called_once()
+        assert mock_read_blocks.call_args.kwargs["remote_rank"] == 0
+        mock_send_notif.assert_called_once_with(
+            "agent-2",
+            notif_msg=b"prefill-id:1",
+        )
+
+    @patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector.NixlWrapper",
+        FakeNixlWrapper,
+    )
+    def test_read_blocks_notifies_with_dcp_aware_consumer_count(
+        self, default_vllm_config, dist_init
+    ):
+        vllm_config = create_vllm_config()
+        vllm_config.parallel_config.tensor_parallel_size = 8
+
+        connector = NixlConnector(vllm_config, KVConnectorRole.WORKER)
+        connector.connector_worker = FakeNixlConnectorWorker(
+            vllm_config, connector.engine_id, hand_shake_latency=0
+        )
+        worker = connector.connector_worker
+        worker.use_mla = True
+        worker.world_size = 8
+        worker.tp_rank = 0
+        worker.dcp_rank = 0
+        worker.dcp_size = 1
+        worker._tp_size = {
+            worker.engine_id: 8,
+            worker.REMOTE_ENGINE_ID: 4,
+        }
+        worker._dcp_size = {
+            worker.engine_id: 1,
+            worker.REMOTE_ENGINE_ID: 4,
+        }
+        worker._block_size = {
+            worker.engine_id: worker.block_size,
+            worker.REMOTE_ENGINE_ID: worker.block_size,
+        }
+        worker._remote_agents[worker.REMOTE_ENGINE_ID] = {0: "agent-0"}
+        worker.kv_topo = TpKVTopology(
+            tp_rank=worker.tp_rank,
+            engine_id=worker.engine_id,
+            remote_tp_size=worker._tp_size,
+            remote_dcp_size=worker._dcp_size,
+            remote_block_size=worker._block_size,
+            is_mla=True,
+            total_num_kv_heads=worker.model_config.get_total_num_kv_heads(),
+            attn_backend=worker.attn_backend,
+            dcp_rank=worker.dcp_rank,
+            tensor_shape=worker.kv_topo.tensor_shape,
+        )
+
+        with patch.object(worker.nixl_wrapper, "send_notif") as mock_send_notif:
+            worker._read_blocks(
+                request_id="decode-id",
+                dst_engine_id=worker.REMOTE_ENGINE_ID,
+                remote_request_id="prefill-id",
+                local_block_ids=[],
+                remote_block_ids=[10, 11],
+                remote_rank=0,
+                local_xfer_side_handle=1,
+                remote_xfer_side_handle=2,
+            )
+
+        mock_send_notif.assert_called_once_with(
+            "agent-0",
+            notif_msg=b"prefill-id:8",
+        )
+
+    @patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector.NixlWrapper",
+        FakeNixlWrapper,
+    )
+    def test_connector_rejects_pcp_rank_matching_assumptions(
+        self, default_vllm_config, dist_init
+    ):
+        vllm_config = create_vllm_config()
+        vllm_config.parallel_config.prefill_context_parallel_size = 2
+
+        with pytest.raises(
+            NotImplementedError,
+            match="prefill_context_parallel_size == 1",
+        ):
+            NixlConnector(vllm_config, KVConnectorRole.WORKER)
+
+    @patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector.NixlWrapper",
+        FakeNixlWrapper,
+    )
+    def test_get_new_notifs_waits_for_explicit_consumer_count(
+        self, default_vllm_config, dist_init
+    ):
+        vllm_config = create_vllm_config()
+
+        connector = NixlConnector(vllm_config, KVConnectorRole.WORKER)
+        connector.connector_worker = FakeNixlConnectorWorker(
+            vllm_config, connector.engine_id, hand_shake_latency=0
+        )
+        worker = connector.connector_worker
+
+        req_id = "req-dcp"
+        worker._reqs_to_send[req_id] = time.perf_counter() + 10.0
+        worker._reqs_to_process.add(req_id)
+
+        expected_consumers = 8
+        worker.nixl_wrapper.get_new_notifs = lambda: {
+            "agent": [f"{req_id}:{expected_consumers}".encode()]
+            * (expected_consumers - 1)
+        }  # type: ignore[method-assign]
+        assert worker._get_new_notifs() == set()
+        assert worker.consumer_notification_counts_by_req[req_id] == (
+            expected_consumers - 1
+        )
+        assert worker.expected_consumer_notifications_by_req[req_id] == (
+            expected_consumers
+        )
+        assert req_id in worker._reqs_to_send
+        assert req_id in worker._reqs_to_process
+
+        worker.nixl_wrapper.get_new_notifs = lambda: {
+            "agent": [f"{req_id}:{expected_consumers}".encode()]
+        }  # type: ignore[method-assign]
+        assert worker._get_new_notifs() == {req_id}
+        assert req_id not in worker._reqs_to_send
+        assert req_id not in worker._reqs_to_process
 
     @patch(
         "vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector.NixlWrapper",

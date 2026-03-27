@@ -11,7 +11,9 @@ from pydantic import ValidationError
 
 from vllm.compilation.backends import VllmBackend
 from vllm.config import (
+    CacheConfig,
     CompilationConfig,
+    KVTransferConfig,
     ModelConfig,
     ParallelConfig,
     PoolerConfig,
@@ -56,6 +58,24 @@ def test_async_scheduling_with_pipeline_parallelism_is_allowed():
         ),
     )
     assert cfg.scheduler_config.async_scheduling is True
+
+
+def test_disaggregated_kv_transfer_resets_dcp_interleave_to_block_size():
+    cfg = VllmConfig(
+        cache_config=CacheConfig(block_size=16),
+        parallel_config=ParallelConfig(
+            decode_context_parallel_size=2,
+            dcp_kv_cache_interleave_size=4,
+            cp_kv_cache_interleave_size=8,
+        ),
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="NixlConnector",
+            kv_role="kv_consumer",
+        ),
+    )
+
+    assert cfg.parallel_config.dcp_kv_cache_interleave_size == 16
+    assert cfg.parallel_config.cp_kv_cache_interleave_size == 16
 
 
 @dataclass
