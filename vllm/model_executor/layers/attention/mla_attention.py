@@ -256,6 +256,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
 from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
+    get_empty_dcp_decode_token_mask,
     get_per_layer_parameters,
     infer_global_hyperparameters,
     split_decodes_and_prefills,
@@ -688,6 +689,14 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
             # correct dcp attn_out with lse.
             if self.impl.dcp_world_size > 1:
+                assert attn_metadata.decode is not None
+                assert lse is not None, "DCP decode requires per-rank LSE values."
+                # Empty local KV shards must contribute zero weight to the
+                # cross-rank LSE merge.
+                if attn_metadata.decode.dcp_empty_token_mask is not None:
+                    empty_token_mask = attn_metadata.decode.dcp_empty_token_mask
+                    attn_out[empty_token_mask] = 0
+                    lse[empty_token_mask] = float("-inf")
                 if self.dcp_a2a:
                     attn_out = dcp_a2a_lse_reduce(
                         attn_out,
@@ -1207,6 +1216,7 @@ class MLACommonDecodeMetadata:
     block_table: torch.Tensor
     seq_lens: torch.Tensor
     dcp_tot_seq_lens: torch.Tensor | None
+    dcp_empty_token_mask: torch.Tensor | None = None
 
 
 D = TypeVar("D", bound=MLACommonDecodeMetadata)
@@ -1665,11 +1675,13 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         query_start_loc_device: torch.Tensor,
         num_decode_tokens: int,
         dcp_tot_seq_lens_device: torch.Tensor | None,
+        dcp_empty_token_mask: torch.Tensor | None,
     ) -> MLACommonDecodeMetadata:
         return MLACommonDecodeMetadata(
             block_table=block_table_tensor,
             seq_lens=seq_lens_device,
             dcp_tot_seq_lens=dcp_tot_seq_lens_device,
+            dcp_empty_token_mask=dcp_empty_token_mask,
         )
 
     def build_for_cudagraph_capture(
@@ -1925,6 +1937,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         decode_metadata = None
         if num_decodes > 0:
             dcp_tot_seq_lens_device = None
+            dcp_empty_token_mask = None
             if self.dcp_world_size > 1:
                 dcp_tot_seq_lens_device = seq_lens[:num_decodes]
                 seq_lens = dcp_local_seq_lens
@@ -1938,6 +1951,12 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 max_seq_len = (
                     (max_seq_len + num_partitions - 1) // num_partitions
                 ) * self.cp_kv_cache_interleave_size
+                dcp_empty_token_mask = get_empty_dcp_decode_token_mask(
+                    query_start_loc=query_start_loc[: num_decodes + 1],
+                    num_decodes=num_decodes,
+                    num_decode_tokens=num_decode_tokens,
+                    local_seq_lens=seq_lens[:num_decodes],
+                )
 
             decode_metadata = self._build_decode(
                 block_table_tensor=block_table_tensor[:num_decodes, ...],
@@ -1947,6 +1966,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 query_start_loc_device=query_start_loc[: num_decodes + 1],
                 num_decode_tokens=num_decode_tokens,
                 dcp_tot_seq_lens_device=dcp_tot_seq_lens_device,
+                dcp_empty_token_mask=dcp_empty_token_mask,
             )
 
         attn_metadata = self.metadata_cls(
