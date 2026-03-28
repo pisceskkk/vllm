@@ -823,6 +823,43 @@ class TestNixlHandshake:
         assert set(remote_agents.keys()) == {1, 3}
 
     @patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector.current_platform"
+    )
+    def test_scheduler_tracks_local_num_computed_tokens_for_remote_prefill(
+        self, mock_platform
+    ):
+        mock_platform.device_type = "cpu"
+
+        block_size = 16
+        vllm_config = create_vllm_config(block_size=block_size)
+        vllm_config.parallel_config.decode_context_parallel_size = 2
+        scheduler = NixlConnectorScheduler(
+            vllm_config=vllm_config,
+            engine_id="test-engine",
+            kv_cache_config=make_kv_cache_config(block_size=block_size),
+        )
+
+        request = create_request(
+            num_tokens=128,
+            do_remote_prefill=True,
+            block_size=block_size,
+        )
+        blocks = MagicMock()
+        blocks.get_unhashed_block_ids_all_groups.return_value = [[10, 11, 12]]
+
+        scheduler.update_state_after_alloc(
+            request,
+            blocks,
+            num_external_tokens=48,
+            num_computed_tokens=64,
+        )
+        metadata = scheduler.build_connector_meta(MagicMock())
+
+        req_meta = metadata.reqs_to_recv[request.request_id]
+        assert req_meta.local_num_computed_tokens == 64
+        assert req_meta.local_block_ids == [[10, 11, 12]]
+
+    @patch(
         "vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector.NixlWrapper",
         FakeNixlWrapper,
     )
@@ -873,11 +910,10 @@ class TestNixlHandshake:
         metadata = NixlConnectorMetadata()
         metadata.add_new_req_to_recv(
             request_id="id",
-            local_block_ids=[101, 102],
-            local_block_positions=[2, 3],
+            local_block_ids=([101, 102],),
+            local_num_computed_tokens=2 * worker.block_size * worker.dcp_size,
             kv_transfer_params={
-                "remote_block_ids": [201, 202],
-                "remote_block_positions": [1, 2],
+                "remote_block_ids": ([201, 202],),
                 "remote_engine_id": worker.REMOTE_ENGINE_ID,
                 "remote_request_id": "prefill-id",
                 "remote_host": "localhost",
@@ -887,11 +923,6 @@ class TestNixlHandshake:
             },
         )
         meta = metadata.reqs_to_recv["id"]
-        meta.local_block_global_positions = worker._compute_block_positions(
-            meta.local_block_positions,
-            worker.dcp_size,
-            worker.dcp_rank,
-        )
 
         with patch.object(worker, "_read_blocks") as mock_read_blocks:
             worker._read_blocks_for_req("id", meta)
@@ -958,11 +989,9 @@ class TestNixlHandshake:
         metadata = NixlConnectorMetadata()
         metadata.add_new_req_to_recv(
             request_id="id",
-            local_block_ids=[],
-            local_block_positions=[],
+            local_block_ids=(),
             kv_transfer_params={
-                "remote_block_ids": [201],
-                "remote_block_positions": [0],
+                "remote_block_ids": ([201],),
                 "remote_engine_id": worker.REMOTE_ENGINE_ID,
                 "remote_request_id": "prefill-id",
                 "remote_host": "localhost",
@@ -1095,11 +1124,9 @@ class TestNixlHandshake:
         metadata = NixlConnectorMetadata()
         metadata.add_new_req_to_recv(
             request_id="decode-id",
-            local_block_ids=[101],
-            local_block_positions=[0],
+            local_block_ids=([101],),
             kv_transfer_params={
-                "remote_block_ids": [201, 202],
-                "remote_block_positions": [0, 1],
+                "remote_block_ids": ([201, 202],),
                 "remote_engine_id": worker.REMOTE_ENGINE_ID,
                 "remote_request_id": "prefill-id",
                 "remote_host": "localhost",
@@ -1108,18 +1135,12 @@ class TestNixlHandshake:
                 "dcp_size": 2,
             },
         )
-        meta = metadata.reqs_to_recv["decode-id"]
-        meta.local_block_global_positions = worker._compute_block_positions(
-            meta.local_block_positions,
-            worker.dcp_size,
-            worker.dcp_rank,
-        )
 
         with (
             patch.object(worker, "_read_blocks") as mock_read_blocks,
             patch.object(worker.nixl_wrapper, "send_notif") as mock_send_notif,
         ):
-            worker._read_blocks_for_req("decode-id", meta)
+            worker._read_blocks_for_req("decode-id", metadata.reqs_to_recv["decode-id"])
 
         mock_read_blocks.assert_called_once()
         assert mock_read_blocks.call_args.kwargs["remote_rank"] == 0

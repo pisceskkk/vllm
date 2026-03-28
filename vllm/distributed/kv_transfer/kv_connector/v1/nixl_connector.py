@@ -270,6 +270,7 @@ class ReqMeta:
     local_physical_block_ids: BlockIds
     tp_size: int
     dcp_size: int = 1
+    local_num_computed_tokens: int = 0
     remote: RemoteMeta | None = None
 
 
@@ -294,6 +295,7 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         self,
         local_block_ids: BlockIds,
         kv_transfer_params: dict[str, Any],
+        local_num_computed_tokens: int = 0,
     ) -> ReqMeta:
         return ReqMeta(
             local_block_ids=local_block_ids,
@@ -301,6 +303,7 @@ class NixlConnectorMetadata(KVConnectorMetadata):
             # P workers don't need to receive tp_size from proxy here.
             tp_size=kv_transfer_params.get("tp_size", 1),
             dcp_size=kv_transfer_params.get("dcp_size", 1),
+            local_num_computed_tokens=local_num_computed_tokens,
         )
 
     def add_new_req_to_save(
@@ -318,8 +321,13 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         request_id: ReqId,
         local_block_ids: BlockIds,
         kv_transfer_params: dict[str, Any],
+        local_num_computed_tokens: int = 0,
     ):
-        req = self._add_new_req(local_block_ids, kv_transfer_params)
+        req = self._add_new_req(
+            local_block_ids,
+            kv_transfer_params,
+            local_num_computed_tokens=local_num_computed_tokens,
+        )
         req.remote = RemoteMeta(
             block_ids=kv_transfer_params["remote_block_ids"],
             engine_id=kv_transfer_params["remote_engine_id"],
@@ -418,11 +426,15 @@ class NixlConnector(KVConnectorBase_V1, SupportsHMA):
         )
 
     def update_state_after_alloc(
-        self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
+        self,
+        request: "Request",
+        blocks: "KVCacheBlocks",
+        num_external_tokens: int,
+        num_computed_tokens: int | None = None,
     ):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.update_state_after_alloc(
-            request, blocks, num_external_tokens
+            request, blocks, num_external_tokens, num_computed_tokens
         )
 
     def build_connector_meta(
@@ -605,7 +617,7 @@ class NixlConnectorScheduler:
         # Requests that need to start recv/send.
         # New requests are added by update_state_after_alloc in
         # the scheduler. Used to make metadata passed to Worker.
-        self._reqs_need_recv: dict[ReqId, tuple[Request, BlockIds]] = {}
+        self._reqs_need_recv: dict[ReqId, tuple[Request, BlockIds, int]] = {}
         self._reqs_need_save: dict[ReqId, Request] = {}
         # Reqs to send and their expiration time
         self._reqs_need_send: dict[ReqId, float] = {}
@@ -812,13 +824,19 @@ class NixlConnectorScheduler:
         return 0, False
 
     def update_state_after_alloc(
-        self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
+        self,
+        request: "Request",
+        blocks: "KVCacheBlocks",
+        num_external_tokens: int,
+        num_computed_tokens: int | None = None,
     ):
         params = request.kv_transfer_params
         logger.debug(
             "NIXLConnector update_state_after_alloc: "
-            "num_external_tokens=%s, kv_transfer_params=%s",
+            "num_external_tokens=%s num_computed_tokens=%s, "
+            "kv_transfer_params=%s",
             num_external_tokens,
+            num_computed_tokens,
             params,
         )
 
@@ -860,6 +878,7 @@ class NixlConnectorScheduler:
                     self._reqs_need_recv[request.request_id] = (
                         request,
                         local_block_ids,
+                        num_computed_tokens or 0,
                     )
 
                 else:
@@ -915,12 +934,17 @@ class NixlConnectorScheduler:
         meta = NixlConnectorMetadata()
 
         # Loop through scheduled reqs and convert to ReqMeta.
-        for req_id, (req, block_ids) in self._reqs_need_recv.items():
+        for req_id, (
+            req,
+            block_ids,
+            local_num_computed_tokens,
+        ) in self._reqs_need_recv.items():
             assert req.kv_transfer_params is not None
             meta.add_new_req_to_recv(
                 request_id=req_id,
                 local_block_ids=block_ids,
                 kv_transfer_params=req.kv_transfer_params,
+                local_num_computed_tokens=local_num_computed_tokens,
             )
 
         if self.use_host_buffer:
@@ -967,7 +991,7 @@ class NixlConnectorScheduler:
             # To avoid stranding the prefill blocks in the prefill instance,
             # we must add empty block_ids to _reqs_need_recv so that our
             # worker side will notify and free blocks in the prefill instance.
-            self._reqs_need_recv[request.request_id] = (request, [])
+            self._reqs_need_recv[request.request_id] = (request, [], 0)
             params["do_remote_prefill"] = False
             return False, None
 
@@ -1521,22 +1545,53 @@ class NixlConnectorWorker:
         )
 
     @staticmethod
+    def _flatten_block_group(block_ids: BlockIds | list[int]) -> list[int]:
+        if isinstance(block_ids, np.ndarray):
+            return cast(list[int], block_ids.tolist())
+        if isinstance(block_ids, tuple):
+            block_ids = list(block_ids)
+        if not block_ids:
+            return []
+        if isinstance(block_ids[0], (int, np.integer)):
+            return cast(list[int], list(block_ids))
+        return cast(list[list[int]], block_ids)[0]
+
+    def _local_logical_block_size(self) -> int:
+        return (
+            self.block_size * self._physical_blocks_per_logical_kv_block * self.dcp_size
+        )
+
+    @staticmethod
+    def _num_block_groups(block_ids: BlockIds | list[int]) -> int:
+        if isinstance(block_ids, np.ndarray):
+            return 1
+        if isinstance(block_ids, tuple):
+            block_ids = list(block_ids)
+        if not block_ids:
+            return 0
+        if isinstance(block_ids[0], (int, np.integer)):
+            return 1
+        return len(cast(list[list[int]], block_ids))
+
+    @staticmethod
     def _compute_block_positions(
-        block_ids: BlockIds,
+        block_ids: BlockIds | list[int],
         dcp_size: int,
         dcp_rank: int,
+        position_offset: int = 0,
     ) -> list[int]:
         # With block-aligned DCP interleave, a request block at logical
         # position `block_pos` is globally identified by the physical block
         # position it maps to across the full DCP ring.
-        pos_mapper = lambda block_pos: dcp_size * block_pos + dcp_rank
-        return pos_mapper(np.arange(len(block_ids[0]))).tolist()
+        flat_block_ids = NixlConnectorWorker._flatten_block_group(block_ids)
+        pos_mapper = lambda block_pos: dcp_size * block_pos + dcp_rank + position_offset
+        return pos_mapper(np.arange(len(flat_block_ids))).tolist()
 
     def _compute_remote_block_global_positions(
         self,
         meta: ReqMeta,
         remote_rank: int,
-    ) -> list[int]:
+    ) -> tuple[list[int], int]:
         assert meta.remote is not None and self.kv_topo is not None
 
         remote_engine_id = meta.remote.engine_id
@@ -1545,11 +1600,13 @@ class NixlConnectorWorker:
             remote_engine_id,
             remote_rank,
         )
-        return self._compute_block_positions(
+        remote_block_positions = self._compute_block_positions(
             meta.remote.block_ids,
             remote_dcp_size,
             remote_dcp_rank,
         )
+        total_num_blocks = len(remote_block_positions) * remote_dcp_size
+        return remote_block_positions, total_num_blocks
 
     @staticmethod
     def _make_notif_id(request_id: str, expected_consumers: int) -> bytes:
@@ -1647,31 +1704,42 @@ class NixlConnectorWorker:
         block_size_ratio = self.kv_topo.block_size_ratio_from_engine_id(
             remote_engine_id
         )
-        if block_size_ratio != 1:
+        if (
+            block_size_ratio != 1
+            or self._num_block_groups(meta.local_block_ids) > 1
+            or self._num_block_groups(meta.remote.block_ids) > 1
+        ):
             return meta.local_block_ids, meta.remote.block_ids
 
-        local_global_positions = self._compute_block_positions(
-            meta.local_block_ids,
-            self.dcp_size,
-            self.dcp_rank,
-        )
-        remote_global_positions = self._compute_remote_block_global_positions(
+        local_block_ids = self._flatten_block_group(meta.local_block_ids)
+        remote_block_ids = self._flatten_block_group(meta.remote.block_ids)
+        remote_global_positions, _ = self._compute_remote_block_global_positions(
             meta,
             remote_rank,
+        )
+        local_prefix_blocks = (
+            meta.local_num_computed_tokens // self._local_logical_block_size()
+        )
+        local_position_offset = local_prefix_blocks * self.dcp_size
+        local_global_positions = self._compute_block_positions(
+            local_block_ids,
+            self.dcp_size,
+            self.dcp_rank,
+            position_offset=local_position_offset,
         )
 
         local_blocks_by_position = {
             global_pos: block_id
             for global_pos, block_id in zip(
                 local_global_positions,
-                meta.local_block_ids,
+                local_block_ids,
             )
         }
         remote_blocks_by_position = {
             global_pos: block_id
             for global_pos, block_id in zip(
                 remote_global_positions,
-                meta.remote.block_ids,
+                remote_block_ids,
             )
         }
         matched_positions = sorted(
@@ -1683,9 +1751,11 @@ class NixlConnectorWorker:
         matched_remote_block_ids = [
             remote_blocks_by_position[pos] for pos in matched_positions
         ]
+        if not matched_local_block_ids:
+            return (), ()
         return (
-            matched_local_block_ids,
-            matched_remote_block_ids,
+            (matched_local_block_ids,),
+            (matched_remote_block_ids,),
         )
 
     def _background_nixl_handshake(
