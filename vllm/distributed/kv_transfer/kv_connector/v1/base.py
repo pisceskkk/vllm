@@ -527,6 +527,17 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
+    def get_num_computed_tokens_after_recv(self, request: "Request") -> int | None:
+        """
+        Optionally return a connector-corrected number of computed tokens after
+        an async KV recv completes.
+
+        Connectors can use this hook to reconcile optimistic scheduler-side
+        accounting with the actual prefix length materialized by the worker.
+        Returning None keeps the current scheduler-side value unchanged.
+        """
+        return None
+
     def request_finished(
         self,
         request: "Request",

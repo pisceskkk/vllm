@@ -39,6 +39,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorHandshakeMetadata,
     KVConnectorMetadata,
     KVConnectorRole,
+    KVConnectorWorkerMetadata,
     SupportsHMA,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
@@ -67,6 +68,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.metrics.utils import create_metric_per_engine
+from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.worker.block_table import BlockTable
 from vllm.v1.worker.utils import select_common_block_size
 
@@ -367,6 +369,21 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         self.reqs_to_recv[request_id] = req
 
 
+@dataclass
+class NixlConnectorWorkerMetadata(KVConnectorWorkerMetadata):
+    loaded_global_positions_by_req: dict[ReqId, set[int]]
+
+    def aggregate(self, other: KVConnectorWorkerMetadata) -> KVConnectorWorkerMetadata:
+        assert isinstance(other, NixlConnectorWorkerMetadata)
+        merged: dict[ReqId, set[int]] = {
+            req_id: set(positions)
+            for req_id, positions in self.loaded_global_positions_by_req.items()
+        }
+        for req_id, positions in other.loaded_global_positions_by_req.items():
+            merged.setdefault(req_id, set()).update(positions)
+        return NixlConnectorWorkerMetadata(loaded_global_positions_by_req=merged)
+
+
 class NixlConnector(KVConnectorBase_V1, SupportsHMA):
     @property
     def prefer_cross_layer_blocks(self) -> bool:
@@ -529,6 +546,11 @@ class NixlConnector(KVConnectorBase_V1, SupportsHMA):
             return None
         return self.connector_worker.get_kv_connector_stats()
 
+    def build_connector_worker_meta(self) -> KVConnectorWorkerMetadata | None:
+        if self.connector_worker is None:
+            return None
+        return self.connector_worker.build_connector_worker_meta()
+
     @classmethod
     def build_kv_connector_stats(
         cls, data: dict[str, Any] | None = None
@@ -595,6 +617,15 @@ class NixlConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         return self.connector_worker.xfer_handshake_metadata
 
+    def update_connector_output(self, connector_output: KVConnectorOutput):
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.update_connector_output(connector_output)
+
+    def get_num_computed_tokens_after_recv(self, request: "Request") -> int | None:
+        if self.connector_scheduler is None:
+            return None
+        return self.connector_scheduler.get_num_computed_tokens_after_recv(request)
+
 
 class NixlConnectorScheduler:
     """Implementation of Scheduler side methods"""
@@ -653,6 +684,8 @@ class NixlConnectorScheduler:
         # Reqs to remove from processed set because they're not to send after
         # remote prefill or aborted.
         self._reqs_not_processed: set[ReqId] = set()
+        # Actual global block positions reported by workers after async recv.
+        self._loaded_global_positions_by_req: dict[ReqId, set[int]] = {}
 
         # Gather Sliding Window sizes for each kv cache group (if any) in number of
         # blocks per KV cache group. This is used to clip the local attention window.
@@ -673,6 +706,39 @@ class NixlConnectorScheduler:
         if not self.log_block_matching:
             return
         logger.info("NIXL block match [%s] %s", event, kwargs)
+
+    def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
+        worker_meta = connector_output.kv_connector_worker_meta
+        if worker_meta is None:
+            return
+        assert isinstance(worker_meta, NixlConnectorWorkerMetadata)
+        for req_id, positions in worker_meta.loaded_global_positions_by_req.items():
+            self._loaded_global_positions_by_req[req_id] = set(positions)
+
+    def get_num_computed_tokens_after_recv(self, request: "Request") -> int | None:
+        loaded_positions = self._loaded_global_positions_by_req.pop(
+            request.request_id, None
+        )
+        if loaded_positions is None:
+            return None
+
+        base_loaded_tokens = max(
+            request.num_computed_tokens - request.num_external_computed_tokens, 0
+        )
+        if request.num_external_computed_tokens <= 0:
+            return base_loaded_tokens
+
+        base_loaded_blocks = base_loaded_tokens // self.block_size
+        contiguous_blocks = 0
+        all_loaded_positions = set(range(base_loaded_blocks))
+        all_loaded_positions.update(loaded_positions)
+        while contiguous_blocks in all_loaded_positions:
+            contiguous_blocks += 1
+
+        return min(
+            request.num_tokens,
+            max(base_loaded_tokens, contiguous_blocks * self.block_size),
+        )
 
     @staticmethod
     def _get_request_block_positions(block_ids: BlockIds | list[int]) -> list[int]:
@@ -898,6 +964,7 @@ class NixlConnectorScheduler:
             # prefilled blocks need to be saved to host memory before transfer.
             self._reqs_need_save[request.request_id] = request
         elif params.get("do_remote_prefill"):
+            self._loaded_global_positions_by_req.pop(request.request_id, None)
             if params.get("remote_block_ids"):
                 if all(
                     p in params
@@ -1317,6 +1384,8 @@ class NixlConnectorWorker:
         self._recving_metadata: dict[ReqId, ReqMeta] = {}
         self._recving_transfers = defaultdict[ReqId, list[TransferHandle]](list)
         self._done_recving_without_xfer: set[ReqId] = set()
+        self._loaded_global_positions_by_req = defaultdict[ReqId, set[int]](set)
+        self._finished_loaded_global_positions_by_req: dict[ReqId, set[int]] = {}
         # Track the expiration time of requests that are waiting to be sent.
         self._reqs_to_send: dict[ReqId, float] = {}
         # Set of requests that have been part of a batch, regardless of status.
@@ -1750,6 +1819,10 @@ class NixlConnectorWorker:
             remote_engine_id
         )
         if block_size_ratio != 1:
+            if req_id is not None:
+                self._loaded_global_positions_by_req[req_id].update(
+                    meta.local_block_global_positions
+                )
             self._log_block_matching(
                 "worker_match_fallback",
                 engine_id=self.engine_id,
@@ -1803,6 +1876,8 @@ class NixlConnectorWorker:
         matched_remote_block_ids = [
             remote_blocks_by_position[pos] for pos in matched_positions
         ]
+        if req_id is not None:
+            self._loaded_global_positions_by_req[req_id].update(matched_positions)
         self._log_block_matching(
             "worker_match",
             engine_id=self.engine_id,
@@ -1895,6 +1970,7 @@ class NixlConnectorWorker:
                     req_meta := self._recving_metadata.get(req_id)
                 ) and not self._is_hma_required:
                     self._invalid_block_ids.update(req_meta.local_block_ids[0])
+                self._loaded_global_positions_by_req.pop(req_id, None)
                 self._failed_recv_reqs.add(req_id)
 
         fut.add_done_callback(request_ready)
@@ -2678,6 +2754,9 @@ class NixlConnectorWorker:
             # clean up metadata for completed requests
             meta = self._recving_metadata.pop(req_id, None)
             assert meta is not None, f"{req_id} not found in recving_metadata list"
+            self._finished_loaded_global_positions_by_req[req_id] = set(
+                self._loaded_global_positions_by_req.pop(req_id, set())
+            )
             assert meta.remote is not None
             if self.use_host_buffer:
                 self.sync_recved_kv_to_device(req_id, meta)
@@ -2721,6 +2800,20 @@ class NixlConnectorWorker:
             done_sending.add(req_id)
 
         return done_sending, done_recving
+
+    def build_connector_worker_meta(self) -> KVConnectorWorkerMetadata | None:
+        if not self._finished_loaded_global_positions_by_req:
+            return None
+        metadata = NixlConnectorWorkerMetadata(
+            loaded_global_positions_by_req={
+                req_id: set(positions)
+                for req_id, positions in (
+                    self._finished_loaded_global_positions_by_req.items()
+                )
+            }
+        )
+        self._finished_loaded_global_positions_by_req = {}
+        return metadata
 
     def _get_new_notifs(self) -> set[str]:
         """
@@ -2826,6 +2919,7 @@ class NixlConnectorWorker:
         # TODO (NickLucche) handle failed transfer for HMA.
         if (meta := self._recving_metadata.get(req_id)) and not self._is_hma_required:
             self._invalid_block_ids.update(meta.local_block_ids[0])
+        self._loaded_global_positions_by_req.pop(req_id, None)
         self.nixl_wrapper.release_xfer_handle(handle)
         self.xfer_stats.record_failed_transfer()
 
@@ -2835,6 +2929,8 @@ class NixlConnectorWorker:
         We check for these trnxs to complete in each step().
         """
         for req_id, meta in metadata.reqs_to_recv.items():
+            self._loaded_global_positions_by_req.pop(req_id, None)
+            self._finished_loaded_global_positions_by_req.pop(req_id, None)
             remote_logical_block_ids = (
                 list(meta.remote.block_ids) if meta.remote else []
             )
@@ -3161,6 +3257,7 @@ class NixlConnectorWorker:
             self.xfer_stats.record_failed_transfer()
             if handle is not None:
                 self.nixl_wrapper.release_xfer_handle(handle)
+            self._loaded_global_positions_by_req.pop(request_id, None)
             self._failed_recv_reqs.add(request_id)
 
     def get_mapped_blocks(

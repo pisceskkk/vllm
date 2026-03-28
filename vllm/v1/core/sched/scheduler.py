@@ -2041,6 +2041,8 @@ class Scheduler(SchedulerInterface):
         assert self.connector is not None
 
         if request.request_id in self.failed_recving_kv_req_ids:
+            # Discard any connector-side recv metadata for failed requests.
+            _ = self.connector.get_num_computed_tokens_after_recv(request)
             # Request had KV load failures; num_computed_tokens was already
             # updated in _update_requests_with_invalid_blocks
             if request.num_computed_tokens:
@@ -2053,6 +2055,11 @@ class Scheduler(SchedulerInterface):
 
             self.failed_recving_kv_req_ids.remove(request.request_id)
         else:
+            corrected_num_computed_tokens = (
+                self.connector.get_num_computed_tokens_after_recv(request)
+            )
+            if corrected_num_computed_tokens is not None:
+                request.num_computed_tokens = corrected_num_computed_tokens
             # Now that the blocks are ready, actually cache them.
             # This will cache the blocks iff caching is enabled.
             self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
