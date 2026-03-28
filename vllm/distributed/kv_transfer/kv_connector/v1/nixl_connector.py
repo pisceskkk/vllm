@@ -1116,6 +1116,10 @@ class NixlConnectorScheduler:
 class NixlConnectorWorker:
     """Implementation of Worker side methods"""
 
+    @staticmethod
+    def _has_any_blocks(block_ids: BlockIds) -> bool:
+        return any(len(group) > 0 for group in block_ids)
+
     def __init__(
         self, vllm_config: VllmConfig, engine_id: str, kv_cache_config: "KVCacheConfig"
     ):
@@ -1816,6 +1820,9 @@ class NixlConnectorWorker:
             matched_local_block_ids=matched_local_block_ids,
             matched_remote_block_ids=matched_remote_block_ids,
         )
+
+        if not matched_positions:
+            return [], []
 
         return [matched_local_block_ids], [matched_remote_block_ids]
 
@@ -2915,7 +2922,7 @@ class NixlConnectorWorker:
                 remote_tp_rank,
                 req_id=req_id,
             )
-            if local_block_ids:
+            if self._has_any_blocks(local_block_ids):
                 launched_read = True
             local_physical_block_ids = self._logical_to_kernel_block_ids(
                 local_block_ids
@@ -3070,7 +3077,7 @@ class NixlConnectorWorker:
 
         # Full prefix cache hit: do not need to read remote blocks,
         # just notify P worker that we have the blocks we need.
-        if len(local_block_ids) == 0:
+        if not self._has_any_blocks(local_block_ids):
             # A full prefix cache hit is indicated with an empty list.
             agent_name = self._remote_agents[dst_engine_id][remote_rank]
             try:
