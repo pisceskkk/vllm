@@ -1674,8 +1674,8 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         query_start_loc_cpu: torch.Tensor,
         query_start_loc_device: torch.Tensor,
         num_decode_tokens: int,
-        dcp_tot_seq_lens_device: torch.Tensor | None,
-        dcp_empty_token_mask: torch.Tensor | None,
+        dcp_tot_seq_lens_device: torch.Tensor | None = None,
+        dcp_empty_token_mask: torch.Tensor | None = None,
     ) -> MLACommonDecodeMetadata:
         return MLACommonDecodeMetadata(
             block_table=block_table_tensor,
