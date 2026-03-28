@@ -850,6 +850,31 @@ def get_dcp_local_seq_lens(
     return dcp_local_seq_lens.squeeze(1)
 
 
+def get_empty_dcp_decode_token_mask(
+    query_start_loc: torch.Tensor,
+    num_decodes: int,
+    num_decode_tokens: int,
+    local_seq_lens: torch.Tensor,
+) -> torch.Tensor | None:
+    """Build a token-level mask for decode requests with empty local DCP KV."""
+    if num_decodes == 0:
+        return None
+
+    empty_req_mask = local_seq_lens[:num_decodes] == 0
+    if not torch.any(empty_req_mask):
+        return None
+
+    if num_decode_tokens == num_decodes:
+        empty_token_mask = empty_req_mask
+    else:
+        query_lens = (
+            query_start_loc[1 : num_decodes + 1] - query_start_loc[:num_decodes]
+        )
+        empty_token_mask = torch.repeat_interleave(empty_req_mask, query_lens)
+
+    return empty_token_mask[:num_decode_tokens]
+
+
 def mamba_get_block_table_tensor(
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
