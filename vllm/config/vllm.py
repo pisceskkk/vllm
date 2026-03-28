@@ -672,6 +672,13 @@ class VllmConfig:
         # This is the same for all backends
         self.kv_transfer_config.kv_role = "kv_both"
 
+    def _uses_disaggregated_kv_transfer(self) -> bool:
+        kv_transfer_config = self.kv_transfer_config
+        return (
+            kv_transfer_config is not None
+            and kv_transfer_config.is_kv_transfer_instance
+        )
+
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
 
@@ -1704,6 +1711,18 @@ class VllmConfig:
                     "_interleave_size. And dcp-kv-cache-interleave-size will be "
                     "deprecated when PCP is fully supported."
                 )
+
+            if self._uses_disaggregated_kv_transfer():
+                block_size = self.cache_config.block_size
+                if block_size != self.parallel_config.cp_kv_cache_interleave_size:
+                    logger.warning_once(
+                        "Disaggregated KV transfer with DCP requires "
+                        "block-aligned KV ownership. Resetting "
+                        "dcp_kv_cache_interleave_size to block_size=%d.",
+                        block_size,
+                    )
+                    self.parallel_config.cp_kv_cache_interleave_size = block_size
+
             assert (
                 self.parallel_config.cp_kv_cache_interleave_size <= block_size
                 and block_size % self.parallel_config.cp_kv_cache_interleave_size == 0
