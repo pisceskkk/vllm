@@ -86,7 +86,7 @@ class FlashAttnMLABackend(MLACommonBackend):
         return None
 
 
-@dataclass
+@dataclass(kw_only=True)
 class FlashAttnMLADecodeMetadata(MLACommonDecodeMetadata):
     query_start_loc: torch.Tensor
     max_query_len: int
@@ -190,7 +190,8 @@ class FlashAttnMLAMetadataBuilder(MLACommonMetadataBuilder[FlashAttnMLAMetadata]
         query_start_loc_cpu: torch.Tensor,
         query_start_loc_device: torch.Tensor,
         num_decode_tokens: int,
-        dcp_tot_seq_lens_device: torch.Tensor | None,
+        dcp_tot_seq_lens_device: torch.Tensor | None = None,
+        dcp_empty_token_mask: torch.Tensor | None = None,
     ) -> FlashAttnMLADecodeMetadata:
         query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
         max_query_len = query_lens_cpu.max().item()
@@ -239,6 +240,7 @@ class FlashAttnMLAMetadataBuilder(MLACommonMetadataBuilder[FlashAttnMLAMetadata]
         metadata = FlashAttnMLADecodeMetadata(
             block_table=block_table_tensor,
             seq_lens=seq_lens_device,
+            dcp_empty_token_mask=dcp_empty_token_mask,
             query_start_loc=query_start_loc_device,
             max_query_len=max_query_len,
             max_seq_len=max_seq_len,
