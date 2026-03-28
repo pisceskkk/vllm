@@ -672,6 +672,13 @@ class VllmConfig:
         # This is the same for all backends
         self.kv_transfer_config.kv_role = "kv_both"
 
+    def _uses_disaggregated_kv_transfer(self) -> bool:
+        kv_transfer_config = self.kv_transfer_config
+        return (
+            kv_transfer_config is not None
+            and kv_transfer_config.is_kv_transfer_instance
+        )
+
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
 
@@ -1694,7 +1701,7 @@ class VllmConfig:
         if self.parallel_config.decode_context_parallel_size > 1:
             if self.parallel_config.dcp_kv_cache_interleave_size > 1 and (
                 self.parallel_config.cp_kv_cache_interleave_size
-                != self.parallel_config.dcp_kv_cache_interleave_size
+                < self.parallel_config.dcp_kv_cache_interleave_size
             ):
                 self.parallel_config.cp_kv_cache_interleave_size = (
                     self.parallel_config.dcp_kv_cache_interleave_size
@@ -1704,6 +1711,23 @@ class VllmConfig:
                     "_interleave_size. And dcp-kv-cache-interleave-size will be "
                     "deprecated when PCP is fully supported."
                 )
+
+            if self._uses_disaggregated_kv_transfer():
+                block_size = self.cache_config.block_size
+                if block_size != self.parallel_config.cp_kv_cache_interleave_size:
+                    raise ValueError(
+                        "Disaggregated KV transfer with DCP requires "
+                        "block-aligned KV ownership, but got "
+                        f"block_size={block_size} and "
+                        f"cp_kv_cache_interleave_size="
+                        f"{self.parallel_config.cp_kv_cache_interleave_size}. "
+                        "Please restart with "
+                        f"--cp-kv-cache-interleave-size {block_size}. "
+                        "If you still use the deprecated "
+                        "--dcp-kv-cache-interleave-size flag, set it to the "
+                        "same value or remove it."
+                    )
+
             assert (
                 self.parallel_config.cp_kv_cache_interleave_size <= block_size
                 and block_size % self.parallel_config.cp_kv_cache_interleave_size == 0

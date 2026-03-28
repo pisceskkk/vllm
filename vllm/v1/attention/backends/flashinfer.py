@@ -581,7 +581,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self.dcp_world_size = get_dcp_group().world_size
             self.dcp_rank = get_dcp_group().rank_in_group
             self.dcp_kv_cache_interleave_size = (
-                vllm_config.parallel_config.dcp_kv_cache_interleave_size
+                vllm_config.parallel_config.cp_kv_cache_interleave_size
             )
         except AssertionError:
             # DCP might not be initialized in testing
