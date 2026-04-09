@@ -2297,7 +2297,7 @@ class NixlConnectorWorker:
             self._transfer_configs[engine_id] = HeteroTPTransferConfig(
                 tp_ratio=tp_ratio,
                 K=kv_topo.total_num_kv_heads,
-                d_tp=self.world_size,
+                d_tp=self.tp_size,
                 p_tp=remote_tp_size,
                 d_rank=self.tp_rank,
                 use_mla=self.use_mla,
@@ -3042,9 +3042,7 @@ class NixlConnectorWorker:
             if any(len(group) > 0 for group in local_ids):
                 launched_read = True
             # Expand logical → kernel block IDs.
-            local_ids = self._logical_to_kernel_block_ids(
-                local_ids
-            )
+            local_ids = self._logical_to_kernel_block_ids(local_ids)
             remote_ids = self._logical_to_remote_kernel_block_ids(
                 meta.remote.block_ids,
                 self._mamba_phys_ratio[meta.remote.engine_id] if self._has_mamba else 1,
@@ -3106,12 +3104,8 @@ class NixlConnectorWorker:
                 # notify other ranks
                 # as this rank doesn't need data from this remote_worker_key.
                 has_valid_blocks = (
-                    local_block_ids
-                    and any(local_block_ids[i] for i in range(len(local_block_ids)))
-                ) or (
-                    remote_block_ids
-                    and any(remote_block_ids[i] for i in range(len(remote_block_ids)))
-                )
+                    local_ids and any(local_ids[i] for i in range(len(local_ids)))
+                ) or (remote_ids and any(remote_ids[i] for i in range(len(remote_ids))))
 
                 if has_valid_blocks:
                     # When we successfully read from this remote_worker_key,
