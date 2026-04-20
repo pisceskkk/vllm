@@ -483,7 +483,11 @@ class Worker(WorkerBase):
         return int(self.available_kv_cache_memory_bytes)
 
     def get_kv_connector_handshake_metadata(self) -> dict | None:
-        """Get KV connector metadata from this worker if available."""
+        """Get KV connector metadata from this worker if available.
+
+        Returns metadata keyed by unified worker rank:
+        ``worker_rank = tp_rank * dcp_size + dcp_rank``.
+        """
 
         if not has_kv_transfer_group():
             return None
@@ -496,10 +500,17 @@ class Worker(WorkerBase):
 
         tp_rank = get_tp_group().rank_in_group
         try:
-            dcp_rank = get_dcp_group().rank_in_group
+            dcp_group = get_dcp_group()
+            dcp_rank = dcp_group.rank_in_group
+            dcp_size = dcp_group.world_size
         except AssertionError:
             dcp_rank = 0
-        return {(tp_rank, dcp_rank): metadata}
+            dcp_size = 1
+
+        # Encode worker identity as a single rank for connector handshake APIs:
+        # unified_worker_rank = tp_rank * dcp_size + dcp_rank.
+        unified_worker_rank = tp_rank * dcp_size + dcp_rank
+        return {unified_worker_rank: metadata}
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()

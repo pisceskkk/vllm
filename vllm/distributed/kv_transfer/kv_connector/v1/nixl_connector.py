@@ -86,6 +86,23 @@ if TYPE_CHECKING:
 TransferHandle = int
 ReqId = str
 RemoteWorkerKey = tuple[int, int]
+UnifiedWorkerRank = int
+
+
+def _encode_unified_worker_rank(tp_rank: int, dcp_rank: int, dcp_size: int) -> int:
+    """Encode (tp_rank, dcp_rank) into a single stable int worker rank."""
+    if dcp_size <= 0:
+        raise ValueError(f"dcp_size must be positive, got {dcp_size}.")
+    if tp_rank < 0 or dcp_rank < 0:
+        raise ValueError(
+            f"tp_rank and dcp_rank must be non-negative, got {(tp_rank, dcp_rank)}."
+        )
+    if dcp_rank >= dcp_size:
+        raise ValueError(
+            f"dcp_rank must be less than dcp_size, got dcp_rank={dcp_rank}, "
+            f"dcp_size={dcp_size}."
+        )
+    return tp_rank * dcp_size + dcp_rank
 
 #
 # NIXL Connector Version
@@ -443,7 +460,7 @@ class NixlConnector(KVConnectorBase_V1, SupportsHMA):
     ):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.update_state_after_alloc(
-            request, blocks, num_external_tokens, num_computed_tokens
+            request, blocks, num_external_tokens
         )
 
     def build_connector_meta(
@@ -476,7 +493,8 @@ class NixlConnector(KVConnectorBase_V1, SupportsHMA):
         Set the KV connector handshake metadata for this connector.
 
         Args:
-            metadata (dict): the handshake metadata to set.
+            metadata: Handshake metadata keyed by unified int worker rank,
+                where ``worker_rank = tp_rank * dcp_size + dcp_rank``.
         """
         assert self.connector_scheduler is not None
         self.connector_scheduler.set_xfer_handshake_metadata(metadata)
@@ -627,6 +645,10 @@ class NixlConnectorScheduler:
         # New requests are added by update_state_after_alloc in
         # the scheduler. Used to make metadata passed to Worker.
         self._reqs_need_recv: dict[ReqId, tuple[Request, BlockIds, int]] = {}
+        # Cache num_computed_tokens from get_num_new_matched_tokens().
+        # update_state_after_alloc() is called after that method, so we can
+        # recover the local prefix offset without extending the base API.
+        self._num_computed_tokens_by_req: dict[ReqId, int] = {}
         self._reqs_need_save: dict[ReqId, Request] = {}
         # Reqs to send and their expiration time
         self._reqs_need_send: dict[ReqId, float] = {}
@@ -690,30 +712,28 @@ class NixlConnectorScheduler:
         Set the KV connector handshake metadata for this connector.
 
         Args:
-            metadata (dict): the handshake metadata to set.
+            metadata: Mapping from a unified int worker rank to handshake
+                metadata. The rank is encoded as:
+                ``tp_rank * dcp_size + dcp_rank``.
         """
-        encoded_data: dict[RemoteWorkerKey, bytes] = {}
+        encoded_data: dict[UnifiedWorkerRank, bytes] = {}
         encoder = msgspec.msgpack.Encoder()
-        for worker_key, rank_metadata in metadata.items():
+        for worker_rank, rank_metadata in metadata.items():
             if not isinstance(rank_metadata, NixlHandshakePayload):
                 raise ValueError(
                     "NixlConnectorScheduler expects NixlHandshakePayload for "
                     "handshake metadata."
                 )
-            if (
-                not isinstance(worker_key, tuple)
-                or len(worker_key) != 2
-                or not all(isinstance(rank, int) for rank in worker_key)
-            ):
+            if not isinstance(worker_rank, int):
                 raise ValueError(
                     "NixlConnectorScheduler expects handshake metadata keyed by "
-                    "(tp_rank, dcp_rank)."
+                    "a unified int worker rank."
                 )
-            encoded_data[worker_key] = encoder.encode(rank_metadata)
+            encoded_data[worker_rank] = encoder.encode(rank_metadata)
             logger.debug(
-                "Worker key %s: encoded NixlHandshakePayload size: %s bytes",
-                worker_key,
-                str(len(encoded_data[worker_key])),
+                "Worker rank %s: encoded NixlHandshakePayload size: %s bytes",
+                worker_rank,
+                str(len(encoded_data[worker_rank])),
             )
 
         # Only start the listener when we have metadata to serve.
@@ -735,7 +755,7 @@ class NixlConnectorScheduler:
 
     @staticmethod
     def _nixl_handshake_listener(
-        encoded_data: dict[RemoteWorkerKey, Any],
+        encoded_data: dict[UnifiedWorkerRank, Any],
         ready_event: threading.Event,
         stop_event: threading.Event,
         port: int,
@@ -758,18 +778,13 @@ class NixlConnectorScheduler:
                     if stop_event.is_set():
                         break
                     continue
-                # Decode the message which contains
-                # (GET_META_MSG, tp_rank, dcp_rank)
-                msg, target_tp_rank, target_dcp_rank = msgspec.msgpack.decode(msg)
-                logger.debug(
-                    "Received message for worker key (%s, %s)",
-                    target_tp_rank,
-                    target_dcp_rank,
-                )
+                # Decode the message which contains:
+                # (GET_META_MSG, unified_worker_rank).
+                msg, target_worker_rank = msgspec.msgpack.decode(msg)
+                logger.debug("Received message for worker rank %s", target_worker_rank)
                 if msg != GET_META_MSG:
                     logger.warning("Connection listener got unexpected message %s", msg)
-                target_worker_key = (target_tp_rank, target_dcp_rank)
-                sock.send_multipart((identity, b"", encoded_data[target_worker_key]))
+                sock.send_multipart((identity, b"", encoded_data[target_worker_rank]))
 
     def _mamba_prefill_token_count(self, num_prompt_tokens: int) -> int:
         """D-side only. Returns N-1 for Mamba models since the decoder
@@ -823,6 +838,7 @@ class NixlConnectorScheduler:
         """
 
         params = request.kv_transfer_params
+        self._num_computed_tokens_by_req[request.request_id] = num_computed_tokens
         logger.debug(
             "NIXLConnector get_num_new_matched_tokens: "
             "num_computed_tokens=%s, kv_transfer_params=%s",
@@ -849,15 +865,17 @@ class NixlConnectorScheduler:
         request: "Request",
         blocks: "KVCacheBlocks",
         num_external_tokens: int,
-        num_computed_tokens: int | None = None,
     ):
         params = request.kv_transfer_params
+        local_num_computed_tokens = self._num_computed_tokens_by_req.get(
+            request.request_id, 0
+        )
         logger.debug(
             "NIXLConnector update_state_after_alloc: "
-            "num_external_tokens=%s num_computed_tokens=%s, "
+            "num_external_tokens=%s local_num_computed_tokens=%s, "
             "kv_transfer_params=%s",
             num_external_tokens,
-            num_computed_tokens,
+            local_num_computed_tokens,
             params,
         )
 
@@ -899,7 +917,7 @@ class NixlConnectorScheduler:
                     self._reqs_need_recv[request.request_id] = (
                         request,
                         local_block_ids,
-                        num_computed_tokens or 0,
+                        local_num_computed_tokens,
                     )
 
                 else:
@@ -912,6 +930,7 @@ class NixlConnectorScheduler:
                 assert num_external_tokens == 0
             # Only trigger 1 KV transfer per request.
             params["do_remote_prefill"] = False
+            self._num_computed_tokens_by_req.pop(request.request_id, None)
 
     def _build_save_meta(
         self,
@@ -1003,6 +1022,7 @@ class NixlConnectorScheduler:
             params,
         )
         if not params:
+            self._num_computed_tokens_by_req.pop(request.request_id, None)
             return False, None
 
         if params.get("do_remote_prefill"):
@@ -1014,9 +1034,11 @@ class NixlConnectorScheduler:
             # worker side will notify and free blocks in the prefill instance.
             self._reqs_need_recv[request.request_id] = (request, [], 0)
             params["do_remote_prefill"] = False
+            self._num_computed_tokens_by_req.pop(request.request_id, None)
             return False, None
 
         if not params.get("do_remote_decode"):
+            self._num_computed_tokens_by_req.pop(request.request_id, None)
             return False, None
         if request.status != RequestStatus.FINISHED_LENGTH_CAPPED:
             # Also include the case of a P/D Prefill request with immediate
@@ -1024,6 +1046,7 @@ class NixlConnectorScheduler:
             self._reqs_not_processed.add(request.request_id)
             # Clear _reqs_need_save if a request is aborted as partial prefill.
             self._reqs_need_save.pop(request.request_id, None)
+            self._num_computed_tokens_by_req.pop(request.request_id, None)
             return False, None
 
         # TODO: check whether block_ids actually ever be 0. If not we could
@@ -1428,7 +1451,13 @@ class NixlConnectorWorker:
 
                 start_time = time.perf_counter()
                 # Send query for the request.
-                msg = msgspec.msgpack.encode((GET_META_MSG, *remote_worker_key))
+                remote_tp_rank, remote_dcp_rank = remote_worker_key
+                remote_worker_rank = _encode_unified_worker_rank(
+                    tp_rank=remote_tp_rank,
+                    dcp_rank=remote_dcp_rank,
+                    dcp_size=remote_dcp_size,
+                )
+                msg = msgspec.msgpack.encode((GET_META_MSG, remote_worker_rank))
                 # Set receive timeout to 5 seconds to avoid hanging on dead server
                 sock.setsockopt(zmq.RCVTIMEO, 5000)  # milliseconds
                 sock.send(msg)
