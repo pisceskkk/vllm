@@ -344,6 +344,13 @@ class ParallelConfig:
     the process world size. Without PCP, DCP reuses TP ranks. With PCP, DCP
     either spans the PCP axis or the full TP x PCP block."""
 
+    kvpp_size: int = Field(default=1, ge=1)
+    """Number of ranks that partition KV cache ownership by layer.
+
+    KVPP does not expand the process world size. It reuses the same PCP/TP
+    rank layout as DCP, but does not shard the token sequence.
+    """
+
     dcp_kv_cache_interleave_size: int = 1
     """
     Interleave size of kv_cache storage while using DCP.
@@ -524,17 +531,33 @@ class ParallelConfig:
         tp = self.tensor_parallel_size
         pcp = self.prefill_context_parallel_size
         dcp = self.decode_context_parallel_size
+        kvpp = self.kvpp_size
+        if dcp > 1 and kvpp > 1:
+            raise ValueError(
+                "decode_context_parallel_size and kvpp_size cannot both be "
+                "greater than 1."
+            )
         if pcp > 1 and self.data_parallel_size > 1:
             raise ValueError("PCP does not support data parallelism yet.")
         if pcp == 1:
             # DCP reuses the TP ranks when PCP is disabled.
             if tp % dcp != 0:
                 raise ValueError(f"tp_size={tp} must be divisible by dcp_size={dcp}.")
+            if tp % kvpp != 0:
+                raise ValueError(f"tp_size={tp} must be divisible by kvpp_size={kvpp}.")
         elif dcp not in (1, pcp, tp * pcp):
             raise ValueError(
                 "When PCP is enabled, DCP must be disabled, span the PCP "
                 "axis, or span the full TP x PCP axis. "
                 f"Got TP={tp}, PCP={pcp}, DCP={dcp}; valid DCP sizes are "
+                f"{sorted({1, pcp, tp * pcp})}."
+            )
+
+        if pcp > 1 and kvpp not in (1, pcp, tp * pcp):
+            raise ValueError(
+                "When PCP is enabled, KVPP must be disabled, span the PCP "
+                "axis, or span the full TP x PCP axis. "
+                f"Got TP={tp}, PCP={pcp}, KVPP={kvpp}; valid KVPP sizes are "
                 f"{sorted({1, pcp, tp * pcp})}."
             )
 

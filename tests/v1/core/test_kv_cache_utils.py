@@ -11,7 +11,7 @@ import pytest
 import torch
 
 import vllm.v1.core.kv_cache_utils as kv_cache_utils
-from vllm.config import ModelConfig, SchedulerConfig, VllmConfig
+from vllm.config import ModelConfig, ParallelConfig, SchedulerConfig, VllmConfig
 from vllm.config.kv_events import KVEventsConfig
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import (
@@ -1255,6 +1255,62 @@ def test_project_kv_cache_groups_to_worker():
     proj_spec = projected[0].kv_cache_spec
     assert isinstance(proj_spec, UniformTypeKVCacheSpecs)
     assert set(proj_spec.kv_cache_specs.keys()) == {"layer1", "layer3"}
+
+
+def test_kvpp_uses_contiguous_layer_bundles_and_one_scratch():
+    layer_names = [f"model.layers.{index}.self_attn" for index in range(4)]
+    indexer_names = [f"model.layers.{index}.indexer_attn" for index in range(4)]
+    spec = new_kv_cache_spec()
+    owners = kv_cache_utils._get_kvpp_layer_owners(
+        dict.fromkeys(layer_names + indexer_names, spec), kvpp_size=2
+    )
+
+    assert [owners[name] for name in layer_names] == [0, 0, 1, 1]
+    assert [owners[name] for name in indexer_names] == [0, 0, 1, 1]
+
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(max_model_len=16),
+        parallel_config=ParallelConfig(tensor_parallel_size=2, kvpp_size=2),
+    )
+    worker_specs = [dict.fromkeys(layer_names, spec) for _ in range(2)]
+    available_memory = [spec.page_size_bytes * 3 * 10] * 2
+
+    configs = get_kv_cache_configs(vllm_config, worker_specs, available_memory)
+
+    assert [config.num_blocks for config in configs] == [10, 10]
+    assert all(
+        config.kv_cache_groups[0].layer_names == layer_names for config in configs
+    )
+    expected_worker_owners = {name: owners[name] for name in layer_names}
+    assert configs[0].kvpp_layer_owners == expected_worker_owners
+    assert configs[1].kvpp_layer_owners == expected_worker_owners
+    assert [tensor.shared_by for tensor in configs[0].kv_cache_tensors] == [
+        [layer_names[0]],
+        [layer_names[1]],
+        layer_names[2:],
+    ]
+    assert [tensor.shared_by for tensor in configs[1].kv_cache_tensors] == [
+        layer_names[:2],
+        [layer_names[2]],
+        [layer_names[3]],
+    ]
+
+
+def test_kvpp_rejects_incompatible_scratch_aliases():
+    layer_names = [f"model.layers.{index}.self_attn" for index in range(3)]
+    specs = {
+        layer_names[0]: new_kv_cache_spec(),
+        layer_names[1]: new_kv_cache_spec(),
+        layer_names[2]: new_kv_cache_spec(num_kv_heads=4),
+    }
+    group = KVCacheGroupSpec(
+        layer_names,
+        UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs=specs),
+    )
+    owners = {name: 1 for name in layer_names}
+
+    with pytest.raises(ValueError, match="identical KV cache specs"):
+        kv_cache_utils._get_kvpp_allocation_groups([group], specs, owners, kvpp_rank=0)
 
 
 def test_merge_kv_cache_spec():

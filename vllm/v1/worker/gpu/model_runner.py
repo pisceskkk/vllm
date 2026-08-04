@@ -538,6 +538,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.vllm_config,
         )
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
+        self._on_kv_caches_initialized(kv_caches_dict)
+
+    def _on_kv_caches_initialized(self, kv_caches_dict: dict[str, Any]) -> None:
+        """Optional device hook invoked after layer caches have been bound."""
 
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""

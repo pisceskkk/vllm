@@ -145,6 +145,26 @@ class TestDCPCommBackendConfig:
         assert config.dcp_comm_backend == "ag_rs"
 
 
+class TestKVPPConfig:
+    def test_kvpp_reuses_tp_ranks(self):
+        config = ParallelConfig(tensor_parallel_size=8, kvpp_size=4)
+
+        assert config.world_size == 8
+        assert config.kvpp_size == 4
+
+    def test_kvpp_must_divide_tp(self):
+        with pytest.raises(ValueError, match="must be divisible by kvpp_size"):
+            ParallelConfig(tensor_parallel_size=8, kvpp_size=3)
+
+    def test_kvpp_and_dcp_are_mutually_exclusive(self):
+        with pytest.raises(ValueError, match="cannot both be greater than 1"):
+            ParallelConfig(
+                tensor_parallel_size=8,
+                decode_context_parallel_size=2,
+                kvpp_size=2,
+            )
+
+
 class TestLSEWeightedCombine:
     """Test LSE-weighted combination logic (CPU only, no GPU).
 

@@ -1403,6 +1403,14 @@ def get_dcp_group() -> GroupCoordinator:
     return _DCP
 
 
+_KVPP: GroupCoordinator | None = None
+
+
+def get_kvpp_group() -> GroupCoordinator:
+    assert _KVPP is not None, "KV layer parallel group is not initialized"
+    return _KVPP
+
+
 _PP: GroupCoordinator | None = None
 
 
@@ -1749,6 +1757,7 @@ def initialize_model_parallel(
     prefill_context_model_parallel_size: int = 1,
     decode_context_model_parallel_size: int | None = 1,
     backend: str | None = None,
+    kvpp_model_parallel_size: int | None = 1,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -1826,6 +1835,14 @@ def initialize_model_parallel(
         tensor_model_parallel_size,
     )  # noqa
 
+    def build_cp_overlay_groups(
+        ranks: torch.Tensor, group_size: int
+    ) -> list[list[int]]:
+        if group_size > 1:
+            # Overlay groups span PCP first, then TP for full TP x PCP groups.
+            ranks = ranks.transpose(-1, -2)
+        return [x.tolist() for x in ranks.reshape(-1, group_size).unbind(0)]
+
     # Build the tensor model-parallel groups.
     global _TP
     assert _TP is None, "tensor model parallel group is already initialized"
@@ -1848,17 +1865,29 @@ def initialize_model_parallel(
     assert _DCP is None, "decode context model parallel group is already initialized"
     dcp_size = decode_context_model_parallel_size or 1
     dcp_ranks = local_all_ranks if enable_elastic_ep else all_ranks
-    if dcp_size > 1:
-        # DCP spans PCP first, then TP for full TP x PCP groups.
-        dcp_ranks = dcp_ranks.transpose(-1, -2)
-    group_ranks = dcp_ranks.reshape(-1, dcp_size).unbind(0)
-    group_ranks = [x.tolist() for x in group_ranks]
+    group_ranks = build_cp_overlay_groups(dcp_ranks, dcp_size)
     _DCP = init_model_parallel_group(
         group_ranks,
         get_world_group().local_rank,
         backend,
         use_message_queue_broadcaster=True,
         group_name="dcp",
+    )
+
+    # Build KV layer-parallel groups independently from DCP. The two overlays
+    # share rank construction but deliberately have different semantics.
+    global _KVPP
+    assert _KVPP is None, "KV layer parallel group is already initialized"
+    kvpp_size = kvpp_model_parallel_size or 1
+    if dcp_size > 1 and kvpp_size > 1:
+        raise ValueError("DCP and KVPP cannot be enabled at the same time.")
+    kvpp_ranks = local_all_ranks if enable_elastic_ep else all_ranks
+    group_ranks = build_cp_overlay_groups(kvpp_ranks, kvpp_size)
+    _KVPP = init_model_parallel_group(
+        group_ranks,
+        get_world_group().local_rank,
+        backend,
+        group_name="kvpp",
     )
 
     global _PCP
@@ -1995,6 +2024,7 @@ def ensure_model_parallel_initialized(
     prefill_context_model_parallel_size: int = 1,
     decode_context_model_parallel_size: int | None = 1,
     backend: str | None = None,
+    kvpp_model_parallel_size: int | None = 1,
 ) -> None:
     """Helper to initialize model parallel groups if they are not initialized,
     or ensure tensor-parallel and pipeline-parallel sizes are equal to expected
@@ -2012,6 +2042,7 @@ def ensure_model_parallel_initialized(
             prefill_context_model_parallel_size,
             decode_context_model_parallel_size,
             backend,
+            kvpp_model_parallel_size,
         )
         return
 
@@ -2038,6 +2069,12 @@ def ensure_model_parallel_initialized(
         "decode context parallel group already initialized, but of unexpected size: "
         f"{dcp_world_size=} vs. "
         f"{dcp_model_parallel_size=}"
+    )
+    kvpp_world_size = get_kvpp_group().world_size
+    kvpp_parallel_size = kvpp_model_parallel_size or 1
+    assert kvpp_world_size == kvpp_parallel_size, (
+        "KV layer parallel group already initialized, but of unexpected size: "
+        f"{kvpp_world_size=} vs. {kvpp_parallel_size=}"
     )
 
 
@@ -2112,6 +2149,11 @@ def destroy_model_parallel():
     if _DCP:
         _DCP.destroy()
     _DCP = None
+
+    global _KVPP
+    if _KVPP:
+        _KVPP.destroy()
+    _KVPP = None
 
     global _PCP
     if _PCP:

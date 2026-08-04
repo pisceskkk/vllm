@@ -15,6 +15,7 @@ from typing import Any, NamedTuple, NewType, TypeAlias, cast, overload
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.utils.hashing import sha256_cbor, xxhash_cbor
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import format_gib
@@ -2091,6 +2092,80 @@ def _project_kv_cache_groups_to_worker(
     return projected_groups
 
 
+def _get_kvpp_layer_owners(
+    kv_cache_specs: dict[str, KVCacheSpec], kvpp_size: int
+) -> dict[str, int]:
+    layers_by_index: dict[int, list[str]] = defaultdict(list)
+    for layer_name in kv_cache_specs:
+        layers_by_index[extract_layer_index(layer_name)].append(layer_name)
+
+    layer_indices = sorted(layers_by_index)
+    if len(layer_indices) < kvpp_size:
+        raise ValueError(
+            f"KVPP size ({kvpp_size}) exceeds the number of KV cache layer "
+            f"bundles ({len(layer_indices)})."
+        )
+
+    base, remainder = divmod(len(layer_indices), kvpp_size)
+    owners: dict[str, int] = {}
+    offset = 0
+    for owner_rank in range(kvpp_size):
+        partition_size = base + int(owner_rank < remainder)
+        for layer_index in layer_indices[offset : offset + partition_size]:
+            for layer_name in layers_by_index[layer_index]:
+                owners[layer_name] = owner_rank
+        offset += partition_size
+    return owners
+
+
+def _get_kvpp_allocation_groups(
+    logical_groups: list[KVCacheGroupSpec],
+    worker_spec: dict[str, KVCacheSpec],
+    owners: dict[str, int],
+    kvpp_rank: int,
+) -> tuple[list[KVCacheGroupSpec], dict[str, list[str]]]:
+    allocation_spec: dict[str, KVCacheSpec] = {}
+    scratch_aliases: dict[str, list[str]] = {}
+
+    for group in logical_groups:
+        local_names = [name for name in group.layer_names if name in worker_spec]
+        owned_names = [name for name in local_names if owners[name] == kvpp_rank]
+        non_owned_names = [name for name in local_names if owners[name] != kvpp_rank]
+        allocation_names = list(owned_names)
+        if non_owned_names:
+            scratch_name = non_owned_names[0]
+            incompatible_names = [
+                name
+                for name in non_owned_names[1:]
+                if worker_spec[name] != worker_spec[scratch_name]
+            ]
+            if incompatible_names:
+                raise ValueError(
+                    "KVPP scratch sharing requires identical KV cache specs "
+                    "within each cache group. "
+                    f"{scratch_name} is incompatible with {incompatible_names}."
+                )
+            allocation_names.append(scratch_name)
+            scratch_aliases[scratch_name] = non_owned_names
+        for layer_name in allocation_names:
+            allocation_spec[layer_name] = worker_spec[layer_name]
+
+    return (
+        _project_kv_cache_groups_to_worker(logical_groups, allocation_spec),
+        scratch_aliases,
+    )
+
+
+def _expand_kvpp_scratch_aliases(
+    kv_cache_config: KVCacheConfig, scratch_aliases: dict[str, list[str]]
+) -> None:
+    for tensor in kv_cache_config.kv_cache_tensors:
+        expanded_names: list[str] = []
+        for layer_name in tensor.shared_by:
+            expanded_names.extend(scratch_aliases.get(layer_name, [layer_name]))
+        tensor.shared_by = list(dict.fromkeys(expanded_names))
+
+
 def get_kv_cache_configs(
     vllm_config: VllmConfig,
     kv_cache_specs: list[dict[str, KVCacheSpec]],
@@ -2108,8 +2183,9 @@ def get_kv_cache_configs(
        the whole model.
     2. Generate the KV cache groups based on the layer ratio of the whole model.
        This also handles spec unification for hybrid models.
-    3. Handle auto-fit max_model_len and memory checks using per-worker
-       projected groups to account for PP sharding.
+    3. Project each worker to its PP layers and, when KVPP is enabled, its
+       contiguous owned layer partition plus one scratch layer per cache group.
+       Use that physical view for auto-fit and memory checks.
     4. Generate the KV cache configs for each worker based on the KV cache
        grouping strategy. (This is reasonable because the layer ratio of
        different PP stages are similar.)
@@ -2148,13 +2224,33 @@ def get_kv_cache_configs(
     # After this call, merged_kv_cache_specs may be modified in-place.
     global_kv_cache_groups = get_kv_cache_groups(vllm_config, merged_kv_cache_specs)
 
+    kvpp_size = vllm_config.parallel_config.kvpp_size
+    kvpp_owners = (
+        _get_kvpp_layer_owners(merged_kv_cache_specs, kvpp_size)
+        if kvpp_size > 1
+        else None
+    )
+
     # If original_max_model_len was -1, automatically
     # determine the maximum model length that fits in available GPU memory.
     # We use per-worker projected groups to account for PP sharding.
-    projected_groups_per_worker = [
-        _project_kv_cache_groups_to_worker(global_kv_cache_groups, worker_spec)
-        for worker_spec in kv_cache_specs
-    ]
+    scratch_aliases_per_worker: list[dict[str, list[str]]] = []
+    projected_groups_per_worker: list[list[KVCacheGroupSpec]] = []
+    for worker_index, worker_spec in enumerate(kv_cache_specs):
+        if kvpp_owners is None:
+            projected_groups_per_worker.append(
+                _project_kv_cache_groups_to_worker(global_kv_cache_groups, worker_spec)
+            )
+            scratch_aliases_per_worker.append({})
+            continue
+        allocation_groups, scratch_aliases = _get_kvpp_allocation_groups(
+            global_kv_cache_groups,
+            worker_spec,
+            kvpp_owners,
+            worker_index % kvpp_size,
+        )
+        projected_groups_per_worker.append(allocation_groups)
+        scratch_aliases_per_worker.append(scratch_aliases)
 
     # If `num_gpu_blocks_override` is set, the cache size that will actually
     # be allocated is decoupled from the profiled `available_memory`:
@@ -2195,17 +2291,36 @@ def get_kv_cache_configs(
         )
 
     kv_cache_configs: list[KVCacheConfig] = []
-    for projected_groups, kv_cache_spec_one_worker, available_memory_one_worker in zip(
-        projected_groups_per_worker, kv_cache_specs, available_memory
-    ):
-        assert sum(len(group.layer_names) for group in projected_groups) == len(
-            kv_cache_spec_one_worker
-        ), "Some layers are not assigned to any group."
-        kv_cache_configs.append(
-            get_kv_cache_config_from_groups(
-                vllm_config, projected_groups, available_memory_one_worker
-            )
+    for worker_index, (
+        projected_groups,
+        kv_cache_spec_one_worker,
+        available_memory_one_worker,
+        scratch_aliases,
+    ) in enumerate(
+        zip(
+            projected_groups_per_worker,
+            kv_cache_specs,
+            available_memory,
+            scratch_aliases_per_worker,
         )
+    ):
+        kv_cache_config = get_kv_cache_config_from_groups(
+            vllm_config, projected_groups, available_memory_one_worker
+        )
+        if kvpp_owners is not None:
+            _expand_kvpp_scratch_aliases(kv_cache_config, scratch_aliases)
+            kv_cache_config.kv_cache_groups = _project_kv_cache_groups_to_worker(
+                global_kv_cache_groups, kv_cache_spec_one_worker
+            )
+            kv_cache_config.kvpp_rank = worker_index % kvpp_size
+            kv_cache_config.kvpp_layer_owners = {
+                name: kvpp_owners[name] for name in kv_cache_spec_one_worker
+            }
+        else:
+            assert sum(len(group.layer_names) for group in projected_groups) == len(
+                kv_cache_spec_one_worker
+            ), "Some layers are not assigned to any group."
+        kv_cache_configs.append(kv_cache_config)
 
     # Change the num_blocks of each rank to the smallest among all ranks.
     # We also need to shrink the tensor size proportionally to avoid
