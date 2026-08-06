@@ -2133,7 +2133,11 @@ def _get_kvpp_allocation_groups(
         non_owned_names = [name for name in local_names if owners[name] != kvpp_rank]
         allocation_names = list(owned_names)
         if non_owned_names:
-            scratch_name = non_owned_names[0]
+            # Keep two independently addressable scratch caches so layer N+1
+            # can be filled while attention still reads layer N. Logical
+            # layers alternate between the two buffers in forward order.
+            scratch_names = non_owned_names[:2]
+            scratch_name = scratch_names[0]
             incompatible_names = [
                 name
                 for name in non_owned_names[1:]
@@ -2145,8 +2149,11 @@ def _get_kvpp_allocation_groups(
                     "within each cache group. "
                     f"{scratch_name} is incompatible with {incompatible_names}."
                 )
-            allocation_names.append(scratch_name)
-            scratch_aliases[scratch_name] = non_owned_names
+            allocation_names.extend(scratch_names)
+            for scratch_index, scratch_name in enumerate(scratch_names):
+                scratch_aliases[scratch_name] = non_owned_names[
+                    scratch_index :: len(scratch_names)
+                ]
         for layer_name in allocation_names:
             allocation_spec[layer_name] = worker_spec[layer_name]
 

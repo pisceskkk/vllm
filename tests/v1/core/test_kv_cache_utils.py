@@ -1257,23 +1257,23 @@ def test_project_kv_cache_groups_to_worker():
     assert set(proj_spec.kv_cache_specs.keys()) == {"layer1", "layer3"}
 
 
-def test_kvpp_uses_contiguous_layer_bundles_and_one_scratch():
-    layer_names = [f"model.layers.{index}.self_attn" for index in range(4)]
-    indexer_names = [f"model.layers.{index}.indexer_attn" for index in range(4)]
+def test_kvpp_uses_contiguous_layer_bundles_and_dual_scratch():
+    layer_names = [f"model.layers.{index}.self_attn" for index in range(6)]
+    indexer_names = [f"model.layers.{index}.indexer_attn" for index in range(6)]
     spec = new_kv_cache_spec()
     owners = kv_cache_utils._get_kvpp_layer_owners(
         dict.fromkeys(layer_names + indexer_names, spec), kvpp_size=2
     )
 
-    assert [owners[name] for name in layer_names] == [0, 0, 1, 1]
-    assert [owners[name] for name in indexer_names] == [0, 0, 1, 1]
+    assert [owners[name] for name in layer_names] == [0, 0, 0, 1, 1, 1]
+    assert [owners[name] for name in indexer_names] == [0, 0, 0, 1, 1, 1]
 
     vllm_config = VllmConfig(
         model_config=ModelConfig(max_model_len=16),
         parallel_config=ParallelConfig(tensor_parallel_size=2, kvpp_size=2),
     )
     worker_specs = [dict.fromkeys(layer_names, spec) for _ in range(2)]
-    available_memory = [spec.page_size_bytes * 3 * 10] * 2
+    available_memory = [spec.page_size_bytes * 5 * 10] * 2
 
     configs = get_kv_cache_configs(vllm_config, worker_specs, available_memory)
 
@@ -1287,12 +1287,16 @@ def test_kvpp_uses_contiguous_layer_bundles_and_one_scratch():
     assert [tensor.shared_by for tensor in configs[0].kv_cache_tensors] == [
         [layer_names[0]],
         [layer_names[1]],
-        layer_names[2:],
+        [layer_names[2]],
+        [layer_names[3], layer_names[5]],
+        [layer_names[4]],
     ]
     assert [tensor.shared_by for tensor in configs[1].kv_cache_tensors] == [
-        layer_names[:2],
-        [layer_names[2]],
+        [layer_names[0], layer_names[2]],
+        [layer_names[1]],
         [layer_names[3]],
+        [layer_names[4]],
+        [layer_names[5]],
     ]
 
 
