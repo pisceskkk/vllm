@@ -2132,26 +2132,25 @@ def _get_kvpp_allocation_groups(
         owned_names = [name for name in local_names if owners[name] == kvpp_rank]
         non_owned_names = [name for name in local_names if owners[name] != kvpp_rank]
         allocation_names = list(owned_names)
-        if non_owned_names:
+        scratch_layout_groups: list[list[str]] = []
+        for name in non_owned_names:
+            for layout_names in scratch_layout_groups:
+                if worker_spec[name] == worker_spec[layout_names[0]]:
+                    layout_names.append(name)
+                    break
+            else:
+                scratch_layout_groups.append([name])
+        for layout_names in scratch_layout_groups:
             # Keep two independently addressable scratch caches so layer N+1
             # can be filled while attention still reads layer N. Logical
-            # layers alternate between the two buffers in forward order.
-            scratch_names = non_owned_names[:2]
-            scratch_name = scratch_names[0]
-            incompatible_names = [
-                name
-                for name in non_owned_names[1:]
-                if worker_spec[name] != worker_spec[scratch_name]
-            ]
-            if incompatible_names:
-                raise ValueError(
-                    "KVPP scratch sharing requires identical KV cache specs "
-                    "within each cache group. "
-                    f"{scratch_name} is incompatible with {incompatible_names}."
-                )
+            # layers alternate between the two buffers in forward order. SFA
+            # main and indexer caches can share one logical cache group while
+            # using different physical layouts, so allocate a dual scratch
+            # pair independently for every distinct spec.
+            scratch_names = layout_names[:2]
             allocation_names.extend(scratch_names)
             for scratch_index, scratch_name in enumerate(scratch_names):
-                scratch_aliases[scratch_name] = non_owned_names[
+                scratch_aliases[scratch_name] = layout_names[
                     scratch_index :: len(scratch_names)
                 ]
         for layer_name in allocation_names:
@@ -2191,8 +2190,9 @@ def get_kv_cache_configs(
     2. Generate the KV cache groups based on the layer ratio of the whole model.
        This also handles spec unification for hybrid models.
     3. Project each worker to its PP layers and, when KVPP is enabled, its
-       contiguous owned layer partition plus one scratch layer per cache group.
-       Use that physical view for auto-fit and memory checks.
+       contiguous owned layer partition plus a dual scratch pair per distinct
+       physical cache layout. Use that physical view for auto-fit and memory
+       checks.
     4. Generate the KV cache configs for each worker based on the KV cache
        grouping strategy. (This is reasonable because the layer ratio of
        different PP stages are similar.)

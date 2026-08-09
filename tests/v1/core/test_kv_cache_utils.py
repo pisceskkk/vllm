@@ -1300,21 +1300,41 @@ def test_kvpp_uses_contiguous_layer_bundles_and_dual_scratch():
     ]
 
 
-def test_kvpp_rejects_incompatible_scratch_aliases():
+def test_kvpp_allocates_dual_scratch_per_cache_layout():
     layer_names = [f"model.layers.{index}.self_attn" for index in range(3)]
+    indexer_names = [
+        f"model.layers.{index}.self_attn.indexer.k_cache" for index in range(3)
+    ]
+    main_spec = new_kv_cache_spec()
+    indexer_spec = new_kv_cache_spec(num_kv_heads=4)
     specs = {
-        layer_names[0]: new_kv_cache_spec(),
-        layer_names[1]: new_kv_cache_spec(),
-        layer_names[2]: new_kv_cache_spec(num_kv_heads=4),
+        **dict.fromkeys(layer_names, main_spec),
+        **dict.fromkeys(indexer_names, indexer_spec),
     }
     group = KVCacheGroupSpec(
-        layer_names,
+        layer_names + indexer_names,
         UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs=specs),
     )
-    owners = {name: 1 for name in layer_names}
+    owners = dict.fromkeys(specs, 1)
 
-    with pytest.raises(ValueError, match="identical KV cache specs"):
-        kv_cache_utils._get_kvpp_allocation_groups([group], specs, owners, kvpp_rank=0)
+    allocation_groups, scratch_aliases = (
+        kv_cache_utils._get_kvpp_allocation_groups(
+            [group], specs, owners, kvpp_rank=0
+        )
+    )
+
+    assert allocation_groups[0].layer_names == [
+        layer_names[0],
+        layer_names[1],
+        indexer_names[0],
+        indexer_names[1],
+    ]
+    assert scratch_aliases == {
+        layer_names[0]: [layer_names[0], layer_names[2]],
+        layer_names[1]: [layer_names[1]],
+        indexer_names[0]: [indexer_names[0], indexer_names[2]],
+        indexer_names[1]: [indexer_names[1]],
+    }
 
 
 def test_merge_kv_cache_spec():
