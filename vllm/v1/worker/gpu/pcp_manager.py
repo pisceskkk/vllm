@@ -343,14 +343,6 @@ class PCPManager:
             return None
         if input_batch.has_prefill:
             raise RuntimeError("PCP FULL graphs require a decode-only batch.")
-        if input_batch.num_tokens != input_batch.num_reqs:
-            raise RuntimeError("PCP FULL decode batches require one token per request.")
-        if input_batch.num_tokens_after_padding != input_batch.num_reqs_after_padding:
-            raise RuntimeError(
-                "PCP FULL graphs must pad requests and tokens to the same size: "
-                f"{input_batch.num_reqs_after_padding} requests vs "
-                f"{input_batch.num_tokens_after_padding} tokens."
-            )
         return input_batch.num_reqs_after_padding
 
     @property
@@ -494,19 +486,7 @@ class PCPManager:
         local_query_start_loc_np[0] = 0
         local_query_start_loc_out = local_query_start_loc_np[1 : num_local_reqs + 1]
         np.cumsum(local_num_scheduled_tokens, out=local_query_start_loc_out)
-        if num_reqs_after_padding > num_local_reqs:
-            local_query_start_loc_np[
-                num_local_reqs + 1 : num_reqs_after_padding + 1
-            ] = np.arange(
-                num_local_tokens + 1,
-                num_local_tokens_padded + 1,
-                dtype=np.int32,
-            )
-            local_query_start_loc_np[num_reqs_after_padding + 1 :] = (
-                num_local_tokens_padded
-            )
-        else:
-            local_query_start_loc_np[num_local_reqs + 1 :] = num_local_tokens
+        local_query_start_loc_np[num_local_reqs + 1 :] = num_local_tokens
         async_copy_to_gpu(local_query_start_loc_np, out=input_buffers.query_start_loc)
         local_query_start_loc = input_buffers.query_start_loc[
             : num_reqs_after_padding + 1
@@ -525,8 +505,6 @@ class PCPManager:
             input_buffers.positions,
             input_buffers.seq_lens,
         )
-        if num_reqs_after_padding > num_local_reqs:
-            input_buffers.seq_lens[num_local_reqs:num_reqs_after_padding].fill_(1)
         seq_lens = input_buffers.seq_lens[:num_reqs_after_padding]
         is_padding = input_buffers.is_padding[:num_local_tokens_padded]
         is_padding[:num_local_tokens].fill_(False)
@@ -578,7 +556,6 @@ class PCPManager:
         seq_lens_cpu_upper_bound_np[:num_local_reqs] = (
             local_start_pos_np + local_num_scheduled_tokens
         )
-        seq_lens_cpu_upper_bound_np[num_local_reqs:] = 1
 
         dcp_local_seq_lens = None
         if self.dcp_world_size > 1:

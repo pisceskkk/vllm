@@ -78,7 +78,7 @@ def test_full_graph_rejects_prefill_batch():
         PCPManager._get_full_padded_num_reqs(input_batch, CUDAGraphMode.FULL)
 
 
-def test_full_graph_requires_matching_request_and_token_padding():
+def test_full_graph_allows_independent_request_and_token_padding():
     input_batch = SimpleNamespace(
         num_reqs=3,
         num_reqs_after_padding=4,
@@ -87,8 +87,7 @@ def test_full_graph_requires_matching_request_and_token_padding():
         has_prefill=False,
     )
 
-    with pytest.raises(RuntimeError, match="same size"):
-        PCPManager._get_full_padded_num_reqs(input_batch, CUDAGraphMode.FULL)
+    assert PCPManager._get_full_padded_num_reqs(input_batch, CUDAGraphMode.FULL) == 4
 
 
 def test_full_capture_uses_pcp_persistent_buffers(monkeypatch):
