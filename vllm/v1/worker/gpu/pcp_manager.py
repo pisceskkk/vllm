@@ -157,8 +157,15 @@ class PCPManager:
                 "MRV2 sparse MLA PCP does not support CUDA graphs yet. "
                 "Set -cc.cudagraph_mode=NONE."
             )
-        if vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs():
-            raise NotImplementedError("MRV2 PCP supports PIECEWISE CUDA graphs only.")
+        cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
+        if (
+            cudagraph_mode.has_full_cudagraphs()
+            and not cudagraph_mode.separate_routine()
+        ):
+            raise NotImplementedError(
+                "MRV2 PCP supports full CUDA graphs for decode-only routines. "
+                "Use FULL_DECODE_ONLY, FULL_AND_PIECEWISE, PIECEWISE, or NONE."
+            )
 
     @staticmethod
     def _reorder_segments(
@@ -327,6 +334,25 @@ class PCPManager:
             return None
         return input_batch.num_tokens_after_padding
 
+    @staticmethod
+    def _get_full_padded_num_reqs(
+        input_batch: InputBatch,
+        cudagraph_mode: CUDAGraphMode,
+    ) -> int | None:
+        if cudagraph_mode != CUDAGraphMode.FULL:
+            return None
+        if input_batch.has_prefill:
+            raise RuntimeError("PCP FULL graphs require a decode-only batch.")
+        if input_batch.num_tokens != input_batch.num_reqs:
+            raise RuntimeError("PCP FULL decode batches require one token per request.")
+        if input_batch.num_tokens_after_padding != input_batch.num_reqs_after_padding:
+            raise RuntimeError(
+                "PCP FULL graphs must pad requests and tokens to the same size: "
+                f"{input_batch.num_reqs_after_padding} requests vs "
+                f"{input_batch.num_tokens_after_padding} tokens."
+            )
+        return input_batch.num_reqs_after_padding
+
     @property
     def input_buffers(self) -> InputBuffers:
         assert self._input_buffers is not None
@@ -348,6 +374,10 @@ class PCPManager:
         self._global_batch = global_batch
 
         num_tokens_after_padding = self._get_cudagraph_padded_num_tokens(
+            global_batch,
+            cudagraph_mode,
+        )
+        num_reqs_after_padding = self._get_full_padded_num_reqs(
             global_batch,
             cudagraph_mode,
         )
@@ -375,6 +405,13 @@ class PCPManager:
             ]
 
         num_local_reqs = len(local_segments)
+        if num_reqs_after_padding is None:
+            num_reqs_after_padding = num_local_reqs
+        elif num_reqs_after_padding < num_local_reqs:
+            raise RuntimeError(
+                "PCP graph request capacity is smaller than the rank-local batch: "
+                f"{num_reqs_after_padding} < {num_local_reqs}."
+            )
         if num_local_reqs > input_buffers.max_num_reqs:
             raise RuntimeError(
                 "PCP local request count exceeds the MRV2 input buffer size: "
@@ -457,9 +494,23 @@ class PCPManager:
         local_query_start_loc_np[0] = 0
         local_query_start_loc_out = local_query_start_loc_np[1 : num_local_reqs + 1]
         np.cumsum(local_num_scheduled_tokens, out=local_query_start_loc_out)
-        local_query_start_loc_np[num_local_reqs + 1 :] = num_local_tokens
+        if num_reqs_after_padding > num_local_reqs:
+            local_query_start_loc_np[
+                num_local_reqs + 1 : num_reqs_after_padding + 1
+            ] = np.arange(
+                num_local_tokens + 1,
+                num_local_tokens_padded + 1,
+                dtype=np.int32,
+            )
+            local_query_start_loc_np[num_reqs_after_padding + 1 :] = (
+                num_local_tokens_padded
+            )
+        else:
+            local_query_start_loc_np[num_local_reqs + 1 :] = num_local_tokens
         async_copy_to_gpu(local_query_start_loc_np, out=input_buffers.query_start_loc)
-        local_query_start_loc = input_buffers.query_start_loc[: num_local_reqs + 1]
+        local_query_start_loc = input_buffers.query_start_loc[
+            : num_reqs_after_padding + 1
+        ]
 
         local_to_global_req_idx = async_copy_to_gpu(
             local_to_global_req_idx_np, device=self.device
@@ -472,9 +523,11 @@ class PCPManager:
             local_query_start_loc,
             local_start_pos,
             input_buffers.positions,
-            input_buffers.seq_lens[:num_local_reqs],
+            input_buffers.seq_lens,
         )
-        seq_lens = input_buffers.seq_lens[:num_local_reqs]
+        if num_reqs_after_padding > num_local_reqs:
+            input_buffers.seq_lens[num_local_reqs:num_reqs_after_padding].fill_(1)
+        seq_lens = input_buffers.seq_lens[:num_reqs_after_padding]
         is_padding = input_buffers.is_padding[:num_local_tokens_padded]
         is_padding[:num_local_tokens].fill_(False)
         is_padding[num_local_tokens:].fill_(True)
@@ -516,29 +569,36 @@ class PCPManager:
         local_num_computed_prefill_tokens_np = np.minimum(
             local_start_pos_np, local_prefill_len_np
         )
-        local_is_prefilling_np = (
+        real_local_is_prefilling_np = (
             local_num_computed_prefill_tokens_np < local_prefill_len_np
         )
-        seq_lens_cpu_upper_bound_np = np.zeros(num_local_reqs, dtype=np.int32)
-        seq_lens_cpu_upper_bound_np[:] = local_start_pos_np + local_num_scheduled_tokens
+        local_is_prefilling_np = np.zeros(num_reqs_after_padding, dtype=np.bool_)
+        local_is_prefilling_np[:num_local_reqs] = real_local_is_prefilling_np
+        seq_lens_cpu_upper_bound_np = np.zeros(num_reqs_after_padding, dtype=np.int32)
+        seq_lens_cpu_upper_bound_np[:num_local_reqs] = (
+            local_start_pos_np + local_num_scheduled_tokens
+        )
+        seq_lens_cpu_upper_bound_np[num_local_reqs:] = 1
 
         dcp_local_seq_lens = None
         if self.dcp_world_size > 1:
             prepare_dcp_local_seq_lens(
                 input_buffers.dcp_local_seq_lens,
                 seq_lens,
-                num_local_reqs,
+                num_reqs_after_padding,
                 self.dcp_world_size,
                 self.dcp_rank,
                 self.cp_interleave,
             )
-            dcp_local_seq_lens = input_buffers.dcp_local_seq_lens[:num_local_reqs]
+            dcp_local_seq_lens = input_buffers.dcp_local_seq_lens[
+                :num_reqs_after_padding
+            ]
 
         return replace(
             input_batch,
             req_ids=local_req_ids,
             num_reqs=num_local_reqs,
-            num_reqs_after_padding=num_local_reqs,
+            num_reqs_after_padding=num_reqs_after_padding,
             idx_mapping=local_to_global_req_idx,
             idx_mapping_np=local_to_global_req_idx_np,
             expanded_idx_mapping=local_to_global_req_idx,
@@ -551,7 +611,7 @@ class PCPManager:
             num_draft_tokens=0,
             num_draft_tokens_per_req=None,
             query_start_loc=local_query_start_loc,
-            query_start_loc_np=local_query_start_loc_np[: num_local_reqs + 1],
+            query_start_loc_np=local_query_start_loc_np[: num_reqs_after_padding + 1],
             seq_lens=seq_lens,
             seq_lens_cpu_upper_bound=torch.from_numpy(seq_lens_cpu_upper_bound_np),
             dcp_local_seq_lens=dcp_local_seq_lens,
@@ -571,6 +631,39 @@ class PCPManager:
             cu_num_logits_np=cu_num_logits_np,
             prompt_lens=None,
         )
+
+    def prepare_inputs_to_capture(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        max_query_len: int | None = None,
+    ) -> tuple[InputBatch, tuple[torch.Tensor, ...], torch.Tensor]:
+        """Prepare persistent PCP buffers for FULL decode graph capture."""
+        assert self._input_buffers is not None
+        assert self._local_block_tables is not None
+        input_batch = InputBatch.make_dummy(
+            num_reqs,
+            num_tokens,
+            self._input_buffers,
+            max_query_len=max_query_len,
+        )
+        input_block_tables = tuple(
+            block_table[:num_reqs].zero_() for block_table in self._local_block_tables
+        )
+        slot_mappings = self.get_dummy_slot_mappings(num_tokens)
+        if self.dcp_world_size > 1:
+            prepare_dcp_local_seq_lens(
+                self._input_buffers.dcp_local_seq_lens,
+                input_batch.seq_lens,
+                num_reqs,
+                self.dcp_world_size,
+                self.dcp_rank,
+                self.cp_interleave,
+            )
+            input_batch.dcp_local_seq_lens = self._input_buffers.dcp_local_seq_lens[
+                :num_reqs
+            ]
+        return input_batch, input_block_tables, slot_mappings
 
     def prepare_attn(
         self, input_batch: InputBatch

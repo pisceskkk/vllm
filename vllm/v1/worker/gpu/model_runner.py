@@ -890,6 +890,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.block_tables,
                     self.attn_groups,
                     self.kv_cache_config,
+                    pcp_manager=self.pcp_manager,
                     has_lora=self.lora_config is not None,
                     use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
                     lora_capture_hook=create_lora_capture_hook(self.lora_config, self),
@@ -1511,13 +1512,34 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         else:
             # No actual tokens to run. A dummy run for DP or memory profiling.
             dummy_num_reqs = batch_desc.num_reqs or num_reqs
-            input_batch = InputBatch.make_dummy(
-                dummy_num_reqs,
-                batch_desc.num_tokens,
-                self.input_buffers,
-                max_query_len=batch_desc.max_query_len,
-            )
-            if not skip_attn_for_dummy_run:
+            if (
+                self.pcp_manager is not None
+                and batch_desc.cg_mode == CUDAGraphMode.FULL
+            ):
+                input_batch, block_tables, slot_mappings = (
+                    self.pcp_manager.prepare_inputs_to_capture(
+                        dummy_num_reqs,
+                        batch_desc.num_tokens,
+                        max_query_len=batch_desc.max_query_len,
+                    )
+                )
+            else:
+                input_batch = InputBatch.make_dummy(
+                    dummy_num_reqs,
+                    batch_desc.num_tokens,
+                    self.input_buffers,
+                    max_query_len=batch_desc.max_query_len,
+                )
+                block_tables = None
+                slot_mappings = None
+            if skip_attn_for_dummy_run:
+                assert batch_desc.cg_mode != CUDAGraphMode.FULL, (
+                    "Attention metadata must be prepared for dummy runs when using "
+                    "FULL cudagraph mode."
+                )
+                block_tables = None
+                slot_mappings = None
+            elif block_tables is None:
                 block_tables, slot_mappings = self.prepare_dummy_attn(input_batch)
                 if context_len:
                     set_dummy_context(
@@ -1527,13 +1549,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         self.kv_cache_config.num_blocks,
                         self.max_model_len,
                     )
-            else:
-                assert batch_desc.cg_mode != CUDAGraphMode.FULL, (
-                    "Attention metadata must be prepared for dummy runs when using "
-                    "FULL cudagraph mode."
-                )
-                block_tables = None
-                slot_mappings = None
 
         attn_metadata = None
         slot_mappings_by_layer = None

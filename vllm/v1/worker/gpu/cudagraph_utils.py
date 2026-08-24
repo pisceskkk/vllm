@@ -72,6 +72,18 @@ class CreateForwardFn(Protocol):
     ) -> Callable[[CUDAGraphMode], None]: ...
 
 
+class PCPGraphCaptureManager(Protocol):
+    @property
+    def input_buffers(self) -> InputBuffers: ...
+
+    def prepare_inputs_to_capture(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        max_query_len: int | None = None,
+    ) -> tuple[InputBatch, tuple[torch.Tensor, ...], torch.Tensor]: ...
+
+
 def _is_compatible(
     desc: BatchExecutionDescriptor,
     num_reqs: int,
@@ -472,6 +484,7 @@ class ModelCudaGraphManager(CudaGraphManager):
         block_tables: BlockTables,
         attn_groups: list[list[AttentionGroup]],
         kv_cache_config: KVCacheConfig,
+        pcp_manager: PCPGraphCaptureManager | None = None,
         has_lora: bool = False,
         use_aux_hidden_state_outputs: bool = False,
         lora_capture_hook: Callable[[int, int, int], None] | None = None,
@@ -521,6 +534,9 @@ class ModelCudaGraphManager(CudaGraphManager):
                 kv_cache_config,
                 full_cudagraph=desc.cg_mode == CUDAGraphMode.FULL,
                 max_query_len=desc.max_query_len,
+                pcp_manager=(
+                    pcp_manager if desc.cg_mode == CUDAGraphMode.FULL else None
+                ),
             )
 
             # Capture with dummy rows marked as padding.
@@ -613,18 +629,29 @@ def prepare_inputs_to_capture(
     kv_cache_config: KVCacheConfig,
     full_cudagraph: bool,
     max_query_len: int | None = None,
+    pcp_manager: PCPGraphCaptureManager | None = None,
 ) -> AttentionState:
-    input_batch = InputBatch.make_dummy(
-        num_reqs, num_tokens, input_buffers, max_query_len=max_query_len
-    )
-    input_block_tables = block_tables.get_dummy_block_tables(num_reqs)
-    slot_mappings = block_tables.get_dummy_slot_mappings(num_tokens)
+    if pcp_manager is None:
+        input_batch = InputBatch.make_dummy(
+            num_reqs, num_tokens, input_buffers, max_query_len=max_query_len
+        )
+        input_block_tables = block_tables.get_dummy_block_tables(num_reqs)
+        slot_mappings = block_tables.get_dummy_slot_mappings(num_tokens)
+    else:
+        input_batch, input_block_tables, slot_mappings = (
+            pcp_manager.prepare_inputs_to_capture(
+                num_reqs,
+                num_tokens,
+                max_query_len=max_query_len,
+            )
+        )
+        input_buffers = pcp_manager.input_buffers
     slot_mappings_by_layer = build_slot_mappings_by_layer(
         slot_mappings, kv_cache_config
     )
 
     # HACK(woosuk): Special handling for DCP.
-    if block_tables.cp_size > 1:
+    if pcp_manager is None and block_tables.cp_size > 1:
         prepare_dcp_local_seq_lens(
             input_buffers.dcp_local_seq_lens,
             input_batch.seq_lens,
