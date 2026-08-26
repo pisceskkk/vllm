@@ -140,13 +140,15 @@ class PCPManager:
         is_sparse_mla = hasattr(model_config.hf_text_config, "index_topk")
         speculative_config = vllm_config.speculative_config
         if speculative_config is not None:
-            if speculative_config.method != "mtp":
+            if speculative_config.method not in ("mtp", "dspark"):
                 raise NotImplementedError(
-                    "MRV2 PCP speculative decoding currently supports MTP only."
+                    "MRV2 PCP speculative decoding currently supports MTP "
+                    "and DSpark only."
                 )
-            if is_sparse_mla:
+            if is_sparse_mla and speculative_config.method == "mtp":
                 raise NotImplementedError(
-                    "MRV2 PCP speculative decoding currently supports dense MLA only."
+                    "MRV2 PCP MTP speculative decoding currently supports "
+                    "dense MLA only."
                 )
             if parallel_config.decode_context_parallel_size != 1:
                 raise NotImplementedError(
