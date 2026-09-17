@@ -16,6 +16,7 @@ backends (e.g. ``ROCM_AITER_FA`` with eagle/eagle3 spec decode):
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from vllm.v1.worker.gpu.spec_decode import speculator as base_speculator
@@ -49,6 +50,7 @@ def _make_fake_speculator(
     return SimpleNamespace(
         arange=torch.arange(max_num_reqs + 1, dtype=torch.int32, device="cpu"),
         block_tables=fake_block_tables,
+        dcp_size=1,
         input_buffers=fake_input_buffers,
         attn_groups=[],
         kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
@@ -132,14 +134,17 @@ def test_build_draft_attn_metadata_clamps_to_max_model_len():
     assert torch.equal(bound, torch.tensor([1024, 503], dtype=torch.int32))
 
 
-def test_build_draft_attn_metadata_recomputes_dcp_local_seq_lens():
+@pytest.mark.parametrize("draft_dcp_size", [1, 2])
+def test_build_draft_attn_metadata_recomputes_dcp_local_seq_lens(draft_dcp_size):
     fake = _make_fake_speculator()
+    fake.dcp_size = draft_dcp_size
     fake.block_tables.cp_size = 2
     fake.block_tables.cp_rank = 1
     fake.block_tables.cp_interleave = 4
     fake.input_buffers.seq_lens[:3] = torch.tensor([5, 9, 16])
 
     def fake_prepare(out, seq_lens, num_reqs, dcp_size, dcp_rank, cp_interleave):
+        assert draft_dcp_size > 1
         assert seq_lens is fake.input_buffers.seq_lens
         assert (num_reqs, dcp_size, dcp_rank, cp_interleave) == (3, 2, 1, 4)
         out[:num_reqs].copy_(torch.tensor([1, 4, 8], dtype=torch.int32))
@@ -159,6 +164,9 @@ def test_build_draft_attn_metadata_recomputes_dcp_local_seq_lens():
         )
 
     local = captured["dcp_local_seq_lens"]
+    if draft_dcp_size == 1:
+        assert local is None
+        return
     assert isinstance(local, torch.Tensor)
     assert local.data_ptr() == fake.input_buffers.dcp_local_seq_lens.data_ptr()
     assert local.tolist() == [1, 4, 8, 0]

@@ -32,6 +32,7 @@ from vllm.v1.core.kv_cache_utils import (
     make_block_hash_with_group_id,
     maybe_convert_block_hash,
     resolve_block_hashes,
+    resolve_dcp_kv_block_size,
 )
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
@@ -267,7 +268,7 @@ class SimpleCPUOffloadScheduler:
         target = 0
         for g in kv_cache_config.kv_cache_groups:
             spec = g.kv_cache_spec
-            block_size = spec.block_size * cp_world_size
+            block_size = resolve_dcp_kv_block_size(spec, cp_world_size)
             if isinstance(spec, MambaSpec):
                 target += 2
             elif isinstance(spec, SlidingWindowSpec):
