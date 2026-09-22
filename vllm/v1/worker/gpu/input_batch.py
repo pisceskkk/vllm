@@ -118,6 +118,12 @@ class InputBatch:
     # [num_reqs] set only under PCP+DCP (see CommonAttentionMetadata).
     dcp_local_seq_lens_cpu_upper_bound: torch.Tensor | None = None
 
+    # Rank-local token counts before PCP padding.  These are populated only by
+    # PCPManager and let cache replication use variable-size collectives when
+    # decode requests are sharded unevenly across PCP ranks.
+    pcp_tokens_per_rank: tuple[int, ...] | None = None
+    pcp_decode_tokens_per_rank: tuple[int, ...] | None = None
+
     @classmethod
     def make_dummy(
         cls,

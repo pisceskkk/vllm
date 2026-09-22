@@ -45,7 +45,7 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadata,
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
-from vllm.v1.attention.ops.pcp import maybe_gather_indexer_k
+from vllm.v1.attention.ops.pcp import PCPAsyncCacheUpdate, maybe_gather_indexer_k
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
@@ -891,6 +891,7 @@ class SparseAttnIndexer(CustomOp):
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
         self.pcp_shard_decode_requests = parallel_config.pcp_shard_decode_requests
+        self._pcp_async_cache_update = PCPAsyncCacheUpdate()
         self._cp_kv_cache_interleave_size: int | None = None
         if current_platform.is_cuda() and not has_deep_gemm():
             raise RuntimeError(
@@ -933,6 +934,54 @@ class SparseAttnIndexer(CustomOp):
                 self._cp_kv_cache_interleave_size = value
             return value
         return self._cp_kv_cache_interleave_size
+
+    def start_pcp_async_cache_update(self, k: torch.Tensor | None) -> bool:
+        """Write local/prefill indexer K now and replicate peer decodes later."""
+        if (
+            k is None
+            or self.skip_k_cache_insert
+            or not self.use_pcp
+            or not self.pcp_shard_decode_requests
+            or self.use_fp4_cache
+        ):
+            return False
+        attn_metadata = get_forward_context().attn_metadata
+        if not isinstance(attn_metadata, dict):
+            return False
+        metadata = attn_metadata.get(self.k_cache.prefix)
+        if not isinstance(metadata, DeepseekV32IndexerMetadata):
+            return False
+
+        slot_mapping = metadata.slot_mapping
+        num_tokens = slot_mapping.shape[0]
+        if num_tokens > k.shape[0]:
+            num_tokens //= get_pcp_group().world_size
+        k = k[:num_tokens]
+
+        def update_cache(
+            tensors: tuple[torch.Tensor, ...],
+            cache_slot_mapping: torch.Tensor,
+        ) -> None:
+            (cache_k,) = tensors
+            ops.indexer_k_quant_and_cache(
+                cache_k,
+                self.k_cache.kv_cache,
+                cache_slot_mapping,
+                self.quant_block_size,
+                self.scale_fmt,
+            )
+
+        return self._pcp_async_cache_update.start(
+            (k,),
+            slot_mapping,
+            metadata.num_decode_tokens,
+            metadata.pcp_tokens_per_rank,
+            metadata.pcp_decode_tokens_per_rank,
+            update_cache,
+        )
+
+    def finish_pcp_async_cache_update(self, wait: bool = True) -> None:
+        self._pcp_async_cache_update.finish(wait=wait)
 
     def forward_native(
         self,

@@ -443,6 +443,10 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
             prefill_max_seq_len=prefill_max_seq_len,
             prefill=prefill,
             cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
+            pcp_tokens_per_rank=common_attn_metadata.pcp_tokens_per_rank,
+            pcp_decode_tokens_per_rank=(
+                common_attn_metadata.pcp_decode_tokens_per_rank
+            ),
         )
 
     @staticmethod

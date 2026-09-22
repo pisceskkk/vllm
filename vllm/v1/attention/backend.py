@@ -451,6 +451,12 @@ class CommonAttentionMetadata:
     table. Rows of one request are adjacent, so equal neighbours are PCP
     chunks sharing one KV context."""
 
+    pcp_tokens_per_rank: tuple[int, ...] | None = None
+    """Actual rank-local token counts before PCP batch padding."""
+
+    pcp_decode_tokens_per_rank: tuple[int, ...] | None = None
+    """Actual rank-local decode-token counts before PCP batch padding."""
+
     mm_req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None
     """PrefixLM bidirectional ranges for multimodal tokens. Maps
     request index to list of (start, end) token position ranges

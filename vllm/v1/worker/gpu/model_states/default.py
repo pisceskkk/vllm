@@ -227,6 +227,8 @@ class DefaultModelState(ModelState):
             for_cudagraph_capture=for_capture,
             rswa_prefix_lens=input_batch.prompt_lens,
             req_idx=input_batch.idx_mapping_np,
+            pcp_tokens_per_rank=input_batch.pcp_tokens_per_rank,
+            pcp_decode_tokens_per_rank=input_batch.pcp_decode_tokens_per_rank,
             ubatch_idx=ubatch_idx,
             fast_prefill=input_batch.fast_prefill,
         )

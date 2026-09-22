@@ -297,6 +297,7 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.attention.ops.dcp import MLADCPManager
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.ops.pcp import (
+    PCPAsyncCacheUpdate,
     finalize_mla_pcp_decode,
     maybe_gather_mla_latent_cache_inputs,
 )
@@ -592,6 +593,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         parallel_config = vllm_config.parallel_config
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
         self.pcp_shard_decode_requests = parallel_config.pcp_shard_decode_requests
+        self._pcp_async_cache_update = PCPAsyncCacheUpdate()
         compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -760,6 +762,36 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         cache = self.hisparse_cache
         if slot_mapping is None or (cache is not None and cache.dummy_batch):
             return
+        if (
+            cache is None
+            and self.use_pcp
+            and self.pcp_shard_decode_requests
+            and attn_metadata is not None
+        ):
+
+            def update_cache(
+                tensors: tuple[torch.Tensor, ...],
+                cache_slot_mapping: torch.Tensor,
+            ) -> None:
+                cache_kv_c, cache_k_pe = tensors
+                self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
+                    cache_kv_c,
+                    cache_k_pe,
+                    kv_cache,
+                    cache_slot_mapping,
+                    kv_cache_dtype,
+                    k_scale,
+                )
+
+            if self._pcp_async_cache_update.start(
+                (kv_c_normed, k_pe),
+                slot_mapping,
+                attn_metadata.num_decode_tokens,
+                attn_metadata.pcp_tokens_per_rank,
+                attn_metadata.pcp_decode_tokens_per_rank,
+                update_cache,
+            ):
+                return
         kv_c_normed, k_pe, slot_mapping = maybe_gather_mla_latent_cache_inputs(
             kv_c_normed,
             k_pe,
@@ -795,6 +827,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     kv_cache_dtype,
                     k_scale,
                 )
+
+    def finish_pcp_async_cache_update(self, wait: bool = True) -> None:
+        self._pcp_async_cache_update.finish(wait=wait)
 
     def prepare_kv_cache_update(
         self, attn_metadata: "MLACommonMetadata | None"
@@ -852,6 +887,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 output=output,
                 q_dcp_replicated=q_dcp_replicated,
             )
+            self.finish_pcp_async_cache_update()
             return output
         else:
             encoded = _encode_layer_name(self.layer_name)
@@ -1497,6 +1533,7 @@ def unified_mla_attention_with_output(
         quant_tma_aligned=quant_tma_aligned,
         q_dcp_replicated=q_dcp_replicated,
     )
+    layer.finish_pcp_async_cache_update()
 
 
 direct_register_custom_op(
@@ -1705,6 +1742,8 @@ class MLACommonMetadata(AttentionMetadata, Generic[D]):
 
     prefill: MLACommonPrefillMetadata | None = None
     decode: D | None = None
+    pcp_tokens_per_rank: tuple[int, ...] | None = None
+    pcp_decode_tokens_per_rank: tuple[int, ...] | None = None
 
     def __post_init__(self):
         if self.head_dim is not None and not MLACommonBackend.supports_head_size(
@@ -2659,6 +2698,10 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             causal=not non_causal_decode,
             prefill=prefill_metadata,
             decode=decode_metadata,
+            pcp_tokens_per_rank=common_attn_metadata.pcp_tokens_per_rank,
+            pcp_decode_tokens_per_rank=(
+                common_attn_metadata.pcp_decode_tokens_per_rank
+            ),
         )
 
         return attn_metadata  # type: ignore[return-value]
