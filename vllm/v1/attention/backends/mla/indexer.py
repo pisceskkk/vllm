@@ -607,6 +607,8 @@ class DeepseekV32IndexerMetadata:
 
     decode: DeepSeekV32IndexerDecodeMetadata | None = None
     prefill: DeepseekV32IndexerPrefillMetadata | None = None
+    pcp_tokens_per_rank: tuple[int, ...] | None = None
+    pcp_decode_tokens_per_rank: tuple[int, ...] | None = None
 
 
 def compute_kpool_tail_slot_mapping(
@@ -690,6 +692,10 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
             num_decode_tokens=num_decode_tokens,
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
+            pcp_tokens_per_rank=common_attn_metadata.pcp_tokens_per_rank,
+            pcp_decode_tokens_per_rank=(
+                common_attn_metadata.pcp_decode_tokens_per_rank
+            ),
         )
 
 
@@ -1202,6 +1208,10 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 num_prefill_tokens=0,
                 prefill=None,
                 decode=None,
+                pcp_tokens_per_rank=common_attn_metadata.pcp_tokens_per_rank,
+                pcp_decode_tokens_per_rank=(
+                    common_attn_metadata.pcp_decode_tokens_per_rank
+                ),
             )
 
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
@@ -1513,6 +1523,10 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             num_prefill_tokens=num_prefill_tokens,
             prefill=prefill_metadata,
             decode=decode_metadata,
+            pcp_tokens_per_rank=common_attn_metadata.pcp_tokens_per_rank,
+            pcp_decode_tokens_per_rank=(
+                common_attn_metadata.pcp_decode_tokens_per_rank
+            ),
         )
 
         return attn_metadata

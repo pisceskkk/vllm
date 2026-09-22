@@ -37,7 +37,6 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.ops.pcp import (
     finalize_mla_pcp_decode,
-    maybe_gather_mla_latent_cache_inputs,
 )
 
 if TYPE_CHECKING:
@@ -457,11 +456,15 @@ class DeepseekV32Attention(MLAAttention):
         mqa_q: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
+        async_indexer_cache_update = False
         if self.indexer is not None and not self.skip_topk:
             assert index_q_fp8 is not None
             assert index_weights_out is not None
             if self.use_pcp:
                 assert index_k is not None
+                async_indexer_cache_update = (
+                    self.indexer.indexer_op.start_pcp_async_cache_update(index_k)
+                )
             sparse_attn_indexer(
                 q_c,
                 self.indexer.k_cache.prefix,
@@ -477,7 +480,9 @@ class DeepseekV32Attention(MLAAttention):
                 self.indexer.max_model_len,
                 self.indexer.max_total_seq_len,
                 self.topk_indices_buffer,
-                skip_k_cache_insert=not self.use_pcp,
+                skip_k_cache_insert=(
+                    not self.use_pcp or async_indexer_cache_update
+                ),
                 use_pcp=self.use_pcp,
                 pcp_shard_decode_requests=self.pcp_shard_decode_requests,
                 dense_mha_metadata_layer_name=self._dense_mha_metadata_layer_name,
@@ -501,27 +506,19 @@ class DeepseekV32Attention(MLAAttention):
         )
         if attn_metadata is None:
             output.zero_()
+            self._finish_pcp_async_cache_updates()
             return
         attn_metadata = cast("MLACommonMetadata", attn_metadata)
         self.impl.prepare_for_batch(attn_metadata)
 
         if self.use_pcp:
             assert kv_c is not None and k_pe is not None
-            kv_for_cache, kpe_for_cache, cache_slot_mapping = (
-                maybe_gather_mla_latent_cache_inputs(
-                    kv_c,
-                    k_pe.unsqueeze(1),
-                    layer_slot_mapping,
-                    attn_metadata.num_decode_tokens,
-                    True,
-                    pcp_shard_decode_requests=self.pcp_shard_decode_requests,
-                )
-            )
-            self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
-                kv_for_cache,
-                kpe_for_cache,
+            self.update_kv_cache(
+                kv_c,
+                k_pe.unsqueeze(1),
                 kv_cache,
-                cache_slot_mapping,
+                layer_slot_mapping,
+                attn_metadata,
                 self.kv_cache_dtype,
                 self._k_scale,
             )
@@ -529,6 +526,7 @@ class DeepseekV32Attention(MLAAttention):
         num_actual = attn_metadata.num_actual_tokens  # type: ignore[attr-defined]
         if num_actual == 0:
             output.zero_()
+            self._finish_pcp_async_cache_updates()
             return
 
         if self._use_sparse_mha(attn_metadata):
@@ -543,6 +541,7 @@ class DeepseekV32Attention(MLAAttention):
                 attn_metadata,
                 output,
             )
+            self._finish_pcp_async_cache_updates()
             return
 
         if self._fp8_kv_needs_view:
@@ -625,3 +624,12 @@ class DeepseekV32Attention(MLAAttention):
         torch.bmm(x, self.W_UV, out=out)
         if self.use_pcp and num_actual < output.shape[0]:
             output[num_actual:].zero_()
+        self._finish_pcp_async_cache_updates()
+
+    def _finish_pcp_async_cache_updates(self) -> None:
+        mla_update_pending = self._pcp_async_cache_update.pending
+        self.finish_pcp_async_cache_update()
+        if self.indexer is not None:
+            self.indexer.indexer_op.finish_pcp_async_cache_update(
+                wait=not mla_update_pending
+            )

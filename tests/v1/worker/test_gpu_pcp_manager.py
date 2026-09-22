@@ -9,8 +9,8 @@ import pytest
 import torch
 
 from vllm.config import CUDAGraphMode, ParallelConfig
-from vllm.model_executor.layers.attention import pcp as attention_pcp
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID, get_dcp_local_seq_lens
+from vllm.v1.attention.ops import pcp as attention_pcp
 from vllm.v1.worker.gpu import cp_utils as gpu_cp_utils
 from vllm.v1.worker.gpu import pcp_manager as pcp_manager_module
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
@@ -405,6 +405,8 @@ def test_sharded_decode_layout_selects_owner_kv_for_replication(monkeypatch):
         torch.tensor([[123, 789, 456, PAD_SLOT_ID]], dtype=torch.int64),
     )
     assert torch.equal(manager._hidden_restore_idx, torch.tensor([0, 2, 1]))
+    assert manager._tokens_per_rank == (2, 1)
+    assert manager._decode_tokens_per_rank == (2, 1)
 
     class FakePCPGroup:
         world_size = 2
@@ -424,6 +426,140 @@ def test_sharded_decode_layout_selects_owner_kv_for_replication(monkeypatch):
 
     assert torch.equal(gathered_kv, torch.tensor([[11.0], [33.0], [22.0], [0.0]]))
     assert torch.equal(cache_slot_mapping, torch.tensor([123, 789, 456, PAD_SLOT_ID]))
+
+
+def test_mixed_layout_tracks_variable_cache_collective_sizes(monkeypatch):
+    manager = PCPManager(
+        pcp_world_size=2,
+        pcp_rank=0,
+        device=torch.device("cpu"),
+        shard_decode_requests=True,
+        dcp_world_size=1,
+    )
+    monkeypatch.setattr(pcp_manager_module, "async_copy_to_gpu", _copy_to_cpu)
+    manager._build_batch_layout(
+        num_scheduled_tokens=np.array([1, 1, 1, 8], dtype=np.int32),
+        num_computed_tokens=np.array([16, 16, 16, 0], dtype=np.int32),
+        is_prefilling=np.array([False, False, False, True]),
+        query_start_loc_np=np.array([0, 1, 2, 3, 11], dtype=np.int32),
+    )
+
+    assert manager._tokens_per_rank == (6, 5)
+    assert manager._decode_tokens_per_rank == (2, 1)
+
+
+def test_async_cache_update_orders_mixed_prefill_before_decode(monkeypatch):
+    timeline = []
+    active_stream = {"name": "main"}
+
+    class FakeEvent:
+        def __init__(self):
+            self.name = f"event-{len(events)}"
+            events.append(self)
+
+        def record(self, stream):
+            timeline.append((self.name, "record", stream.name))
+
+    class FakeStream:
+        def __init__(self, name):
+            self.name = name
+
+        def wait_event(self, event):
+            timeline.append((self.name, "wait", event.name))
+
+    class FakeStreamContext:
+        def __enter__(self):
+            active_stream["name"] = "aux"
+
+        def __exit__(self, *args):
+            active_stream["name"] = "main"
+
+    class FakePCPGroup:
+        world_size = 2
+        rank_in_group = 0
+
+        def all_gatherv(self, tensors, dim=0, sizes=None):
+            assert dim == 0
+            assert sizes is not None
+            timeline.append((active_stream["name"], "gather", tuple(sizes)))
+            if sizes == [3, 2]:
+                return [
+                    torch.cat((tensor, torch.tensor([[40.0], [41.0]])))
+                    for tensor in tensors
+                ]
+            assert sizes == [2, 1]
+            return [torch.cat((tensor, torch.tensor([[20.0]]))) for tensor in tensors]
+
+    events = []
+    main_stream = FakeStream("main")
+    aux_stream = FakeStream("aux")
+    monkeypatch.setattr(attention_pcp.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        attention_pcp.BreakableCUDAGraphCapture, "is_active", lambda: False
+    )
+    monkeypatch.setattr(
+        attention_pcp.torch.cuda, "is_current_stream_capturing", lambda: False
+    )
+    monkeypatch.setattr(
+        attention_pcp.torch.cuda,
+        "current_stream",
+        lambda device=None: main_stream,
+    )
+    monkeypatch.setattr(attention_pcp.torch.cuda, "Event", FakeEvent)
+    monkeypatch.setattr(
+        attention_pcp.torch.cuda, "stream", lambda stream: FakeStreamContext()
+    )
+    monkeypatch.setattr(attention_pcp, "_get_pcp_kv_stream", lambda device: aux_stream)
+    monkeypatch.setattr(attention_pcp, "get_pcp_group", FakePCPGroup)
+    monkeypatch.setattr(torch.Tensor, "record_stream", lambda self, stream: None)
+
+    updates = []
+
+    def update_cache(tensors, slots):
+        updates.append(
+            (
+                active_stream["name"],
+                tensors[0].flatten().tolist(),
+                slots.tolist(),
+            )
+        )
+
+    update = attention_pcp.PCPAsyncCacheUpdate()
+    assert update.start(
+        (torch.tensor([[10.0], [11.0], [30.0], [31.0], [32.0]]),),
+        torch.tensor(
+            [100, 101, 110, 111, 112, 200, 210, 211, PAD_SLOT_ID, PAD_SLOT_ID]
+        ),
+        num_decode_tokens=2,
+        tokens_per_rank=(5, 3),
+        decode_tokens_per_rank=(2, 1),
+        update_cache=update_cache,
+    )
+    update.finish()
+
+    assert updates == [
+        ("main", [30.0, 31.0, 32.0, 40.0, 41.0], [110, 111, 112, 210, 211]),
+        ("main", [10.0, 11.0], [100, 101]),
+        ("aux", [20.0], [200]),
+    ]
+    assert timeline == [
+        ("main", "gather", (3, 2)),
+        ("event-0", "record", "main"),
+        ("aux", "wait", "event-0"),
+        ("aux", "gather", (2, 1)),
+        ("event-1", "record", "aux"),
+        ("main", "wait", "event-1"),
+    ]
+
+    pure_decode_update = attention_pcp.PCPAsyncCacheUpdate()
+    assert not pure_decode_update.start(
+        (torch.tensor([[10.0], [11.0]]),),
+        torch.tensor([100, 101, 200, 201]),
+        num_decode_tokens=2,
+        tokens_per_rank=(2, 2),
+        decode_tokens_per_rank=(2, 2),
+        update_cache=update_cache,
+    )
 
 
 def _rank_rows(

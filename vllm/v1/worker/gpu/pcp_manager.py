@@ -73,6 +73,8 @@ class PCPManager:
         self._hidden_restore_idx: torch.Tensor | None = None
         self._padded_gather_idx: torch.Tensor | None = None
         self._gathered_kv_write_mask: torch.Tensor | None = None
+        self._tokens_per_rank: tuple[int, ...] | None = None
+        self._decode_tokens_per_rank: tuple[int, ...] | None = None
         self._pad_slot_id = torch.tensor(PAD_SLOT_ID, dtype=torch.int64, device=device)
 
         max_num_local_reqs = 2 * max_num_reqs if max_num_reqs is not None else None
@@ -318,6 +320,7 @@ class PCPManager:
         replicated = self.replicated_requests(num_scheduled_tokens, is_prefilling)
         segments_by_rank = []
         per_rank_num_tokens = []
+        per_rank_num_decode_tokens = []
         for rank in range(self.pcp_world_size):
             segments = self._get_rank_segments(
                 rank,
@@ -326,8 +329,17 @@ class PCPManager:
                 query_start_loc_np,
             )
             num_rank_tokens = sum(segment.num_tokens for segment in segments)
+            num_rank_decode_tokens = sum(
+                segment.num_tokens
+                for segment in segments
+                if not is_prefilling[segment.global_batch_req_idx]
+            )
             segments_by_rank.append(segments)
             per_rank_num_tokens.append(num_rank_tokens)
+            per_rank_num_decode_tokens.append(num_rank_decode_tokens)
+
+        self._tokens_per_rank = tuple(per_rank_num_tokens)
+        self._decode_tokens_per_rank = tuple(per_rank_num_decode_tokens)
 
         # PCP=2 example:
         #   global batch:       [A B C D E F G]
@@ -673,6 +685,8 @@ class PCPManager:
             cu_num_logits=cu_num_logits,
             cu_num_logits_np=cu_num_logits_np,
             prompt_lens=None,
+            pcp_tokens_per_rank=self._tokens_per_rank,
+            pcp_decode_tokens_per_rank=self._decode_tokens_per_rank,
         )
         return self._local_batch
 
