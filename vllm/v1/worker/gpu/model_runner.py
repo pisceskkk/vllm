@@ -27,6 +27,7 @@ from typing import Any, NamedTuple
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils._pytree import tree_leaves
 
 import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
@@ -756,7 +757,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 block_tables=self.block_tables,
             )
         self.kv_caches = [
-            cache for cache in kv_caches_dict.values() if cache.device == self.device
+            cache
+            for cache in tree_leaves(kv_caches_dict)
+            if isinstance(cache, torch.Tensor) and cache.device == self.device
         ]
         if is_profiling:
             self.kv_connector = NO_OP_KV_CONNECTOR
