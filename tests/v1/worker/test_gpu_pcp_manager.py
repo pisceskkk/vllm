@@ -9,8 +9,8 @@ import pytest
 import torch
 
 from vllm.config import CUDAGraphMode, ParallelConfig
-from vllm.model_executor.layers.attention import pcp as attention_pcp
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID, get_dcp_local_seq_lens
+from vllm.v1.attention.ops import pcp as attention_pcp
 from vllm.v1.worker.gpu import cp_utils as gpu_cp_utils
 from vllm.v1.worker.gpu import pcp_manager as pcp_manager_module
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
@@ -686,12 +686,24 @@ def test_partition_defers_dcp_metadata_to_post_partition_batch():
     ("pcp_world_size", "dcp_world_size", "expected"),
     [(1, 1, False), (2, 1, True), (2, 2, False)],
 )
+@pytest.mark.parametrize("enabled", [True, False])
 def test_parallel_config_manages_decode_sharding(
-    pcp_world_size: int, dcp_world_size: int, expected: bool
+    pcp_world_size: int, dcp_world_size: int, expected: bool, enabled: bool
 ):
     parallel_config = ParallelConfig(
         prefill_context_parallel_size=pcp_world_size,
         decode_context_parallel_size=dcp_world_size,
+        enable_pcp_decode_sharding=enabled,
     )
 
-    assert parallel_config.pcp_shard_decode_requests is expected
+    assert parallel_config.pcp_shard_decode_requests is (expected and enabled)
+
+
+def test_decode_sharding_toggle_changes_parallel_config_hash():
+    enabled = ParallelConfig(prefill_context_parallel_size=2)
+    disabled = ParallelConfig(
+        prefill_context_parallel_size=2, enable_pcp_decode_sharding=False
+    )
+    assert enabled.pcp_shard_decode_requests
+    assert enabled.world_size == disabled.world_size == 2
+    assert enabled.compute_hash() != disabled.compute_hash()
