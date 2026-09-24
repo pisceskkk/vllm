@@ -337,7 +337,9 @@ class PCPManager:
         #   padded_gather_idx:  [0, 1, 6, 0, 2, 3, 4, 5]
         # Therefore global = gathered[hidden_restore_idx] and
         # padded_gathered = global[padded_gather_idx].
-        hidden_restore_idx = np.empty(int(query_start_loc_np[-1]), dtype=np.int64)
+        # Graph padding has no RankSegment. Give those rows a valid gather
+        # index; callers mask or discard the padding after restoration.
+        hidden_restore_idx = np.zeros(int(query_start_loc_np[-1]), dtype=np.int64)
         if padded_num_tokens is None:
             padded_num_tokens = max(per_rank_num_tokens)
         elif padded_num_tokens < max(per_rank_num_tokens):

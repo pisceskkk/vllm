@@ -115,6 +115,41 @@ def test_sharded_decode_piecewise_graph_padding(monkeypatch):
     )
 
 
+@pytest.mark.parametrize("shard_decode_requests", [False, True])
+def test_graph_padding_has_valid_hidden_restore_indices(
+    monkeypatch, shard_decode_requests
+):
+    manager = PCPManager(
+        pcp_world_size=2,
+        pcp_rank=0,
+        device=torch.device("cpu"),
+        shard_decode_requests=shard_decode_requests,
+        dcp_world_size=1,
+    )
+    monkeypatch.setattr(pcp_manager_module, "async_copy_to_gpu", _copy_to_cpu)
+    original_empty = np.empty
+
+    def poisoned_empty(*args, **kwargs):
+        result = original_empty(*args, **kwargs)
+        result.fill(99999)
+        return result
+
+    # Padding has no RankSegment: never depend on uninitialized allocator data.
+    monkeypatch.setattr(np, "empty", poisoned_empty)
+    manager._build_batch_layout(
+        num_scheduled_tokens=np.ones(3, dtype=np.int32),
+        num_computed_tokens=np.full(3, 16, dtype=np.int32),
+        is_prefilling=np.zeros(3, dtype=np.bool_),
+        query_start_loc_np=np.arange(5, dtype=np.int32),
+        padded_num_tokens=4,
+    )
+    gathered = torch.arange(8)
+    restored = gathered[manager._hidden_restore_idx]
+    expected = [0, 4, 1] if shard_decode_requests else [0, 1, 2]
+    assert restored[:3].tolist() == expected
+    assert manager._hidden_restore_idx[3].item() == 0
+
+
 def test_input_buffers_are_exposed_for_cudagraph_capture():
     manager = PCPManager(
         pcp_world_size=2,
