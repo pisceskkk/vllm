@@ -27,6 +27,7 @@ from typing import Any, NamedTuple
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils._pytree import tree_leaves
 
 import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
@@ -756,7 +757,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 block_tables=self.block_tables,
             )
         self.kv_caches = [
-            cache for cache in kv_caches_dict.values() if cache.device == self.device
+            cache
+            for cache in tree_leaves(kv_caches_dict)
+            if isinstance(cache, torch.Tensor) and cache.device == self.device
         ]
         if is_profiling:
             self.kv_connector = NO_OP_KV_CONNECTOR
@@ -1344,7 +1347,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Get query_start_loc.
         # num_reqs_padded is None for PIECEWISE graphs (no request padding needed)
-        num_reqs_padded = batch_desc.num_reqs or num_reqs
+        num_reqs_padded = max(num_reqs, batch_desc.num_reqs or 0)
         query_start_loc_np = np.empty(self.max_num_reqs + 1, dtype=np.int32)
         query_start_loc_np[0] = 0
         np.cumsum(num_scheduled_tokens_np, out=query_start_loc_np[1 : num_reqs + 1])
@@ -1658,6 +1661,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Get batch descriptor and sync across DP ranks.
         num_reqs = len(scheduler_output.num_scheduled_tokens)
+        num_reqs_for_dispatch = num_reqs
         num_toks = scheduler_output.total_num_scheduled_tokens
         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
         batch_req_state, uniform_tok_count = self.gather_batch_req_state(
@@ -1667,6 +1671,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_toks = batch_req_state.num_tokens
             if self.pcp_manager is not None:
                 num_toks = self.pcp_manager.get_num_tokens_for_dispatch(
+                    batch_req_state.num_scheduled_tokens,
+                    batch_req_state.is_prefilling_np,
+                )
+                num_reqs_for_dispatch = self.pcp_manager.get_num_reqs_for_dispatch(
                     batch_req_state.num_scheduled_tokens,
                     batch_req_state.is_prefilling_np,
                 )
@@ -1687,7 +1695,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         batch_desc, dp_sync = dispatch_cg_and_sync_dp(
             self.cudagraph_manager,
-            num_reqs,
+            num_reqs_for_dispatch,
             num_toks,
             uniform_tok_count,
             self.dp_size,

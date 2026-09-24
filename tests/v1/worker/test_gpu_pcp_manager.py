@@ -9,11 +9,14 @@ import pytest
 import torch
 
 from vllm.config import CUDAGraphMode, ParallelConfig
-from vllm.model_executor.layers.attention import pcp as attention_pcp
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID, get_dcp_local_seq_lens
+from vllm.v1.attention.ops import pcp as attention_pcp
 from vllm.v1.worker.gpu import cp_utils as gpu_cp_utils
 from vllm.v1.worker.gpu import pcp_manager as pcp_manager_module
-from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+from vllm.v1.worker.gpu.cudagraph_utils import (
+    BatchExecutionDescriptor,
+    CudaGraphManager,
+)
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers, set_dummy_context
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
 
@@ -112,6 +115,41 @@ def test_sharded_decode_piecewise_graph_padding(monkeypatch):
     )
 
 
+@pytest.mark.parametrize("shard_decode_requests", [False, True])
+def test_graph_padding_has_valid_hidden_restore_indices(
+    monkeypatch, shard_decode_requests
+):
+    manager = PCPManager(
+        pcp_world_size=2,
+        pcp_rank=0,
+        device=torch.device("cpu"),
+        shard_decode_requests=shard_decode_requests,
+        dcp_world_size=1,
+    )
+    monkeypatch.setattr(pcp_manager_module, "async_copy_to_gpu", _copy_to_cpu)
+    original_empty = np.empty
+
+    def poisoned_empty(*args, **kwargs):
+        result = original_empty(*args, **kwargs)
+        result.fill(99999)
+        return result
+
+    # Padding has no RankSegment: never depend on uninitialized allocator data.
+    monkeypatch.setattr(np, "empty", poisoned_empty)
+    manager._build_batch_layout(
+        num_scheduled_tokens=np.ones(3, dtype=np.int32),
+        num_computed_tokens=np.full(3, 16, dtype=np.int32),
+        is_prefilling=np.zeros(3, dtype=np.bool_),
+        query_start_loc_np=np.arange(5, dtype=np.int32),
+        padded_num_tokens=4,
+    )
+    gathered = torch.arange(8)
+    restored = gathered[manager._hidden_restore_idx]
+    expected = [0, 4, 1] if shard_decode_requests else [0, 1, 2]
+    assert restored[:3].tolist() == expected
+    assert manager._hidden_restore_idx[3].item() == 0
+
+
 def test_input_buffers_are_exposed_for_cudagraph_capture():
     manager = PCPManager(
         pcp_world_size=2,
@@ -154,6 +192,47 @@ def test_num_tokens_for_dispatch_uses_largest_pcp_rank(
     )
 
     assert actual == expected
+
+
+@pytest.mark.parametrize("num_reqs", [1, 2, 15, 16, 17, 31, 32])
+@pytest.mark.parametrize("shard_decode", [False, True])
+def test_decode_graph_dispatch_matches_rank_local_requests(num_reqs, shard_decode):
+    manager = PCPManager(
+        pcp_world_size=16,
+        pcp_rank=0,
+        device=torch.device("cpu"),
+        shard_decode_requests=shard_decode,
+    )
+    scheduled = np.ones(num_reqs, dtype=np.int32)
+    prefilling = np.zeros(num_reqs, dtype=np.bool_)
+    local_tokens = manager.get_num_tokens_for_dispatch(scheduled, prefilling)
+    local_reqs = manager.get_num_reqs_for_dispatch(scheduled, prefilling)
+    expected = (num_reqs + 15) // 16 if shard_decode else num_reqs
+    assert local_reqs == local_tokens == expected
+
+    # Simulate a captured graph without a device: the public dispatcher must
+    # select the local decode graph rather than fall back to eager execution.
+    graph = CudaGraphManager.__new__(CudaGraphManager)
+    desc = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.FULL,
+        num_tokens=local_tokens,
+        num_reqs=local_reqs,
+        uniform_token_count=1,
+    )
+    graph._graphs_captured = True
+    graph._candidates = {(local_tokens, 0): [desc]}
+    assert graph.dispatch(local_reqs, local_tokens, 1, 0) == desc
+
+
+def test_prefill_dispatch_counts_each_request_once_per_rank():
+    manager = PCPManager(2, 0, torch.device("cpu"), True)
+    assert (
+        manager.get_num_reqs_for_dispatch(
+            np.array([8, 1, 1], dtype=np.int32),
+            np.array([True, False, False]),
+        )
+        == 2
+    )
 
 
 def test_graph_padding_cannot_be_smaller_than_largest_pcp_rank(monkeypatch):
@@ -686,12 +765,24 @@ def test_partition_defers_dcp_metadata_to_post_partition_batch():
     ("pcp_world_size", "dcp_world_size", "expected"),
     [(1, 1, False), (2, 1, True), (2, 2, False)],
 )
+@pytest.mark.parametrize("enabled", [True, False])
 def test_parallel_config_manages_decode_sharding(
-    pcp_world_size: int, dcp_world_size: int, expected: bool
+    pcp_world_size: int, dcp_world_size: int, expected: bool, enabled: bool
 ):
     parallel_config = ParallelConfig(
         prefill_context_parallel_size=pcp_world_size,
         decode_context_parallel_size=dcp_world_size,
+        enable_pcp_decode_sharding=enabled,
     )
 
-    assert parallel_config.pcp_shard_decode_requests is expected
+    assert parallel_config.pcp_shard_decode_requests is (expected and enabled)
+
+
+def test_decode_sharding_toggle_changes_parallel_config_hash():
+    enabled = ParallelConfig(prefill_context_parallel_size=2)
+    disabled = ParallelConfig(
+        prefill_context_parallel_size=2, enable_pcp_decode_sharding=False
+    )
+    assert enabled.pcp_shard_decode_requests
+    assert enabled.world_size == disabled.world_size == 2
+    assert enabled.compute_hash() != disabled.compute_hash()

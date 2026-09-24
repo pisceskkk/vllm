@@ -570,6 +570,20 @@ def test_multi_node_world_size_includes_pcp(monkeypatch):
     assert vllm_config.parallel_config.world_size == 2
 
 
+@pytest.mark.parametrize(
+    ("flags", "expected"),
+    [
+        ([], True),
+        (["--enable-pcp-decode-sharding"], True),
+        (["--no-enable-pcp-decode-sharding"], False),
+    ],
+)
+def test_pcp_decode_sharding_cli(flags, expected):
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = EngineArgs.from_cli_args(parser.parse_args(flags))
+    assert args.enable_pcp_decode_sharding is expected
+
+
 def test_prefix_cache_default():
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
     args = parser.parse_args([])

@@ -126,6 +126,9 @@ class ParallelConfig:
     prefill_context_parallel_size: int = Field(default=1, ge=1)
     """Number of ranks that split prefill sequence computation. PCP expands
     the process world size but does not increase the KV-cache shard count."""
+    enable_pcp_decode_sharding: bool = True
+    """Assign decode requests to individual PCP ranks when PCP > 1 and DCP = 1.
+    Disable to retain replicated decode at the same parallel topology."""
     data_parallel_size: int = Field(default=1, ge=1)
     """Number of data parallel groups. MoE layers will be sharded according to
     the product of the tensor, prefill-context, and data parallel sizes."""
@@ -601,7 +604,8 @@ class ParallelConfig:
         every decode request to run on every participating DCP rank.
         """
         return (
-            self.prefill_context_parallel_size > 1
+            self.enable_pcp_decode_sharding
+            and self.prefill_context_parallel_size > 1
             and self.decode_context_parallel_size == 1
         )
 
