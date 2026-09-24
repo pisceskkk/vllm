@@ -13,7 +13,10 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID, get_dcp_local_seq_lens
 from vllm.v1.attention.ops import pcp as attention_pcp
 from vllm.v1.worker.gpu import cp_utils as gpu_cp_utils
 from vllm.v1.worker.gpu import pcp_manager as pcp_manager_module
-from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+from vllm.v1.worker.gpu.cudagraph_utils import (
+    BatchExecutionDescriptor,
+    CudaGraphManager,
+)
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers, set_dummy_context
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
 
@@ -154,6 +157,47 @@ def test_num_tokens_for_dispatch_uses_largest_pcp_rank(
     )
 
     assert actual == expected
+
+
+@pytest.mark.parametrize("num_reqs", [1, 2, 15, 16, 17, 31, 32])
+@pytest.mark.parametrize("shard_decode", [False, True])
+def test_decode_graph_dispatch_matches_rank_local_requests(num_reqs, shard_decode):
+    manager = PCPManager(
+        pcp_world_size=16,
+        pcp_rank=0,
+        device=torch.device("cpu"),
+        shard_decode_requests=shard_decode,
+    )
+    scheduled = np.ones(num_reqs, dtype=np.int32)
+    prefilling = np.zeros(num_reqs, dtype=np.bool_)
+    local_tokens = manager.get_num_tokens_for_dispatch(scheduled, prefilling)
+    local_reqs = manager.get_num_reqs_for_dispatch(scheduled, prefilling)
+    expected = (num_reqs + 15) // 16 if shard_decode else num_reqs
+    assert local_reqs == local_tokens == expected
+
+    # Simulate a captured graph without a device: the public dispatcher must
+    # select the local decode graph rather than fall back to eager execution.
+    graph = CudaGraphManager.__new__(CudaGraphManager)
+    desc = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.FULL,
+        num_tokens=local_tokens,
+        num_reqs=local_reqs,
+        uniform_token_count=1,
+    )
+    graph._graphs_captured = True
+    graph._candidates = {(local_tokens, 0): [desc]}
+    assert graph.dispatch(local_reqs, local_tokens, 1, 0) == desc
+
+
+def test_prefill_dispatch_counts_each_request_once_per_rank():
+    manager = PCPManager(2, 0, torch.device("cpu"), True)
+    assert (
+        manager.get_num_reqs_for_dispatch(
+            np.array([8, 1, 1], dtype=np.int32),
+            np.array([True, False, False]),
+        )
+        == 2
+    )
 
 
 def test_graph_padding_cannot_be_smaller_than_largest_pcp_rank(monkeypatch):

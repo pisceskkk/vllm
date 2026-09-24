@@ -407,6 +407,24 @@ class PCPManager:
             for rank in range(self.pcp_world_size)
         )
 
+    def get_num_reqs_for_dispatch(
+        self,
+        num_scheduled_tokens: np.ndarray,
+        is_prefilling: np.ndarray,
+    ) -> int:
+        """Return the largest rank-local request count for graph dispatch."""
+        return max(
+            len(
+                {
+                    req_idx
+                    for req_idx, _, _ in self._iter_rank_chunks(
+                        rank, num_scheduled_tokens, is_prefilling
+                    )
+                }
+            )
+            for rank in range(self.pcp_world_size)
+        )
+
     @staticmethod
     def _resolve_num_reqs_after_padding(
         input_batch: InputBatch,
