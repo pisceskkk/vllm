@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import time
 from contextlib import nullcontext
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -36,6 +37,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheLayout,
     KVCacheSpec,
@@ -50,7 +52,10 @@ from vllm.v1.simple_kv_offload.cuda_mem_ops import (
     build_params,
 )
 from vllm.v1.simple_kv_offload.disk_backend import DiskBackend
-from vllm.v1.simple_kv_offload.metadata import SimpleCPUOffloadMetadata
+from vllm.v1.simple_kv_offload.metadata import (
+    SimpleCPUOffloadMetadata,
+    SimpleCPUOffloadWorkerMetadata,
+)
 from vllm.v1.simple_kv_offload.worker import SimpleCPUOffloadWorker
 from vllm.v1.worker.gpu.kv_connector import ActiveKVConnector
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
@@ -62,6 +67,12 @@ ITERS = 30
 # Keep the compute stream busy so the KV write lands late; this makes the
 # store-vs-compute race deterministic instead of timing-dependent.
 SLEEP_CYCLES = 50_000_000
+
+
+def _make_worker(
+    kv_cache_config: KVCacheConfig | None, cpu_capacity_bytes: int
+) -> SimpleCPUOffloadWorker:
+    return SimpleCPUOffloadWorker(None, kv_cache_config, cpu_capacity_bytes)
 
 
 def _make_backend() -> tuple[DmaCopyBackend, torch.Tensor, torch.Tensor]:
@@ -87,7 +98,7 @@ def _make_backend() -> tuple[DmaCopyBackend, torch.Tensor, torch.Tensor]:
 def test_no_forward_step_completes_cpu_store(monkeypatch, use_v2):
     """A finished request's final store must drain without another model step."""
     backend, gpu, cpu = _make_backend()
-    worker = SimpleCPUOffloadWorker(None, None, cpu_capacity_bytes=0)
+    worker = _make_worker(None, 0)
     worker._backend = backend
     connector = SimpleCPUOffloadConnector.__new__(SimpleCPUOffloadConnector)
     connector.worker_handler = worker
@@ -105,7 +116,7 @@ def test_no_forward_step_completes_cpu_store(monkeypatch, use_v2):
             active = ActiveKVConnector.__new__(ActiveKVConnector)
             active.kv_connector = connector
             active._disabled = False
-            active._pending_load_start = False
+            active._pending_load_kwargs = None
             module = "vllm.v1.worker.gpu.kv_connector"
             monkeypatch.setattr(f"{module}.is_forward_context_available", lambda: True)
             monkeypatch.setattr(f"{module}.get_forward_context", lambda: None)
@@ -123,6 +134,7 @@ def test_no_forward_step_completes_cpu_store(monkeypatch, use_v2):
             completion = connector.build_connector_worker_meta()
             time.sleep(0.001)
         assert completion is not None, "CPU store never completed on the empty step"
+        assert isinstance(completion, SimpleCPUOffloadWorkerMetadata)
         assert completion.completed_store_events == {0: 1}
         assert torch.equal(cpu[0], gpu[0].cpu())
     finally:
@@ -132,7 +144,7 @@ def test_no_forward_step_completes_cpu_store(monkeypatch, use_v2):
 def test_deferred_store_waits_for_draft_forward(monkeypatch):
     """Target completion must not submit the store before draft finalization."""
     backend, gpu, cpu = _make_backend()
-    worker = SimpleCPUOffloadWorker(None, None, cpu_capacity_bytes=0)
+    worker = _make_worker(None, 0)
     worker._backend = backend
     connector = SimpleCPUOffloadConnector.__new__(SimpleCPUOffloadConnector)
     connector.worker_handler = worker
@@ -267,8 +279,9 @@ class _RecordingBackend:
 
 def test_transfer_hooks_pass_wait_event_for_store_only():
     """wait_for_save gates stores on a compute-done event; start_load_kv does not."""
-    worker = SimpleCPUOffloadWorker(
-        vllm_config=None, kv_cache_config=None, cpu_capacity_bytes=0
+    worker = _make_worker(
+        kv_cache_config=None,
+        cpu_capacity_bytes=0,
     )
     recording = _RecordingBackend()
     worker._backend = recording
@@ -324,16 +337,16 @@ def test_register_shared_kv_cache_storage(monkeypatch, layout: KVCacheLayout):
     )
     caches = dense_kv_cache_views(raw, spec, num_blocks, num_layers, layout)
     layer_names = [f"layer.{i}" for i in range(num_layers)]
-    cache_config = MagicMock(
+    cache_config = KVCacheConfig(
         num_blocks=num_blocks,
+        kv_cache_groups=[],
         kv_cache_tensors=[
             dense_kv_cache_tensor(
                 raw, spec, num_blocks, num_layers, layout, layer_names
             )
         ],
     )
-    worker = SimpleCPUOffloadWorker(
-        vllm_config=None,
+    worker = _make_worker(
         kv_cache_config=cache_config,
         cpu_capacity_bytes=raw.nbytes,
     )
@@ -366,10 +379,10 @@ def test_register_kv_cache_storage_with_trailing_padding(monkeypatch):
     cache_bytes = num_blocks * block_bytes
     raw = torch.zeros(4096, dtype=torch.int8, device="cuda")
     cache = raw[:cache_bytes].view(num_blocks, block_bytes)
-    worker = SimpleCPUOffloadWorker(
-        vllm_config=None,
-        kv_cache_config=MagicMock(
+    worker = _make_worker(
+        kv_cache_config=KVCacheConfig(
             num_blocks=num_blocks,
+            kv_cache_groups=[],
             kv_cache_tensors=[
                 KVCacheTensor(
                     size=cache_bytes,
@@ -389,6 +402,7 @@ def test_register_kv_cache_storage_with_trailing_padding(monkeypatch):
     assert worker.gpu_kv_caches is not None
     assert list(worker.gpu_kv_caches) == ["layer.0"]
     assert worker.gpu_kv_caches["layer.0"].shape == (num_blocks, block_bytes)
+    assert worker.gpu_kv_caches["layer.0"].data_ptr() == cache.data_ptr()
 
 
 def test_register_separate_kv_head_groups(monkeypatch):
@@ -412,10 +426,10 @@ def test_register_separate_kv_head_groups(monkeypatch):
     )
     caches = dense_kv_cache_views(raw, spec, num_blocks, num_layers, layout)
     layer_names = [f"layer.{i}" for i in range(num_layers)]
-    worker = SimpleCPUOffloadWorker(
-        vllm_config=None,
-        kv_cache_config=MagicMock(
+    worker = _make_worker(
+        kv_cache_config=KVCacheConfig(
             num_blocks=num_blocks,
+            kv_cache_groups=[],
             kv_cache_tensors=[
                 dense_kv_cache_tensor(
                     raw, spec, num_blocks, num_layers, layout, layer_names
@@ -509,8 +523,7 @@ def test_register_mixed_page_sizes_in_one_cache_group(monkeypatch):
     assert len(set(pages)) > 1, "the mixed page sizes are what this test covers"
 
     kv_caches = allocate_kv_cache(kv_cache_config, torch.device("cuda"), layout)
-    worker = SimpleCPUOffloadWorker(
-        vllm_config=None,
+    worker = _make_worker(
         kv_cache_config=kv_cache_config,
         cpu_capacity_bytes=sum(pages) * num_blocks,
     )
@@ -533,6 +546,71 @@ def test_register_mixed_page_sizes_in_one_cache_group(monkeypatch):
         region = worker.gpu_kv_caches[name]
         assert region.data_ptr() == cache.data_ptr()
         assert region.stride(0) == specs[name].page_size_bytes
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_layer_sharded_offload_roundtrip_excludes_scratch(rank):
+    from vllm.v1.kv_cache_interface import KVCacheConfig
+    from vllm.v1.kv_cache_placement import (
+        KVCacheBundle,
+        KVCachePlacement,
+        build_kv_cache_storage,
+    )
+
+    specs = _dsa_specs(5, 64)
+    names = list(specs)
+    group = KVCacheGroupSpec(
+        names, UniformTypeKVCacheSpecs(block_size=64, kv_cache_specs=specs)
+    )
+    placement = KVCachePlacement(
+        rank,
+        2,
+        tuple(KVCacheBundle(tuple(names[2 * i : 2 * i + 2]), i % 2) for i in range(5)),
+    )
+    config = build_kv_cache_storage(
+        KVCacheConfig(4, [], [group]), placement, KVCacheLayout.LBNHC
+    )
+    # Rank 0 owns 3 bundles, rank 1 owns 2; both use the same block IDs.
+    block_bytes = 3 * sum(specs[n].page_size_bytes for n in names[:2])
+    config.offload_block_size_bytes = block_bytes
+    caches = allocate_kv_cache(config, torch.device("cuda"), KVCacheLayout.LBNHC)
+    worker = SimpleCPUOffloadWorker(None, config, cpu_capacity_bytes=7 * block_bytes)
+    worker.register_kv_caches(caches)
+    backend = worker._backend
+    assert backend is not None and config.storage_plan is not None
+    assert worker.gpu_kv_caches is not None and worker.cpu_kv_caches is not None
+    try:
+        assert worker.num_cpu_blocks == 7
+        assert set(worker.gpu_kv_caches) == set(config.storage_plan.persistent_layers)
+        for i, (name, region) in enumerate(worker.gpu_kv_caches.items()):
+            assert region.data_ptr() == caches[name].data_ptr()
+            region.fill_(i + 11)
+        ready = torch.cuda.Event()
+        ready.record()
+        events: list[Any] = []
+        backend.launch_copy([1], [3], True, 0, events, ready)
+        deadline = time.monotonic() + 10
+        while not events and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert events, "offload store did not launch"
+        events[0][1].synchronize()
+        for region in worker.gpu_kv_caches.values():
+            region.zero_()
+        ready.record()
+        events = []
+        backend.launch_copy([3], [2], False, 1, events, ready)
+        deadline = time.monotonic() + 10
+        while not events and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert events, "offload load did not launch"
+        events[0][1].synchronize()
+        for i, region in enumerate(worker.gpu_kv_caches.values()):
+            assert torch.all(region[2] == i + 11)
+            assert torch.all(region[1] == 0)
+    finally:
+        backend.shutdown()
+        for tensor in worker.cpu_kv_caches.values():
+            torch.cuda.cudart().cudaHostUnregister(tensor.data_ptr())
 
 
 @pytest.mark.parametrize("rank_blocks", [1, 5])
@@ -567,8 +645,7 @@ def test_register_mixed_page_sizes_odd_block_counts(monkeypatch, rank_blocks):
     assert kv_cache_config.num_blocks == rank_blocks
 
     kv_caches = allocate_kv_cache(kv_cache_config, torch.device("cuda"), layout)
-    worker = SimpleCPUOffloadWorker(
-        vllm_config=None,
+    worker = _make_worker(
         kv_cache_config=kv_cache_config,
         cpu_capacity_bytes=sum(pages) * rank_blocks,
     )

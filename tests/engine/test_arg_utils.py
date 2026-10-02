@@ -103,6 +103,18 @@ def test_memory_utilization_cli_aliases(option):
     assert args.gpu_memory_utilization == 0.8
 
 
+@pytest.mark.parametrize(
+    "options,expected",
+    [([], False), (["--enable-kvpp"], True), (["--no-enable-kvpp"], False)],
+)
+def test_enable_kvpp_cli(options, expected):
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = EngineArgs.from_cli_args(parser.parse_args(options))
+
+    assert args.enable_kvpp is expected
+    assert CacheConfig().enable_kvpp is False
+
+
 def test_device_memory_utilization_property():
     config = CacheConfig(gpu_memory_utilization=0.8)
 
@@ -478,6 +490,18 @@ def test_compilation_config():
         and args.compilation_config.cudagraph_capture_sizes == [1, 2, 4, 8]
         and args.compilation_config.backend == "inductor"
     )
+
+
+def test_trust_request_mm_kwargs_cli():
+    from vllm.entrypoints.launchers.cli_args import FrontendArgs
+
+    parser = FrontendArgs.add_cli_args(FlexibleArgumentParser())
+
+    args = parser.parse_args([])
+    assert not args.trust_request_mm_kwargs
+
+    args = parser.parse_args(["--trust-request-mm-kwargs"])
+    assert args.trust_request_mm_kwargs
 
 
 def test_attention_config():

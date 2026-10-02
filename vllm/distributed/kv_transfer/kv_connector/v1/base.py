@@ -42,6 +42,7 @@ The class provides the following primitives:
 import enum
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -227,6 +228,13 @@ class KVConnectorBase_V1(ABC):
     # Worker-side methods
     # ==============================
 
+    def get_mem_pool_context(self) -> AbstractContextManager | None:
+        """Return a custom KV cache allocation context, if configured.
+
+        Returning None uses the engine's default memory pool.
+        """
+        return None
+
     def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
         """Set the connector metadata from the scheduler.
 
@@ -269,6 +277,15 @@ class KVConnectorBase_V1(ABC):
 
         """
         return self._connector_metadata is not None
+
+    @classmethod
+    def supports_layer_sharded_kv_cache(cls) -> bool:
+        """Support persistent-owner transfers and common distributed capacity.
+
+        Compute-only scratch must be excluded; all owners must finish a
+        distributed load/store before the connector reports completion.
+        """
+        return False
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Initialize with the KV caches. Useful for pre-registering the

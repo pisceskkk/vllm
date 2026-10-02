@@ -1549,6 +1549,14 @@ def get_tp_group() -> GroupCoordinator:
     return _TP
 
 
+_KVPP: GroupCoordinator | None = None
+
+
+def get_kvpp_group() -> GroupCoordinator:
+    assert _KVPP is not None, "KVPP group is not initialized"
+    return _KVPP
+
+
 _ETP: GroupCoordinator | None = None
 
 
@@ -1581,6 +1589,14 @@ _DCP: GroupCoordinator | None = None
 def get_dcp_group() -> GroupCoordinator:
     assert _DCP is not None, "decode context model parallel group is not initialized"
     return _DCP
+
+
+def get_dcp_world_size_and_rank(enabled: bool = True) -> tuple[int, int]:
+    """Return ``(world_size, rank)`` in the DCP group, or ``(1, 0)`` when disabled
+    (e.g. a replicated draft cache) or the group is uninitialized (unit tests)."""
+    if not enabled or _DCP is None:
+        return 1, 0
+    return _DCP.world_size, _DCP.rank_in_group
 
 
 _PP: GroupCoordinator | None = None
@@ -2068,6 +2084,20 @@ def initialize_model_parallel(
         group_name="tp",
     )
 
+    global _KVPP
+    assert _KVPP is None, "KVPP group is already initialized"
+    if config.cache_config.enable_kvpp:
+        # Replicated KV spans PCP x TP within each DP replica and PP stage.
+        kvpp_size = prefill_context_model_parallel_size * tensor_model_parallel_size
+        kvpp_ranks = local_all_ranks if enable_elastic_ep else all_ranks
+        _KVPP = init_model_parallel_group(
+            [ranks.tolist() for ranks in kvpp_ranks.reshape(-1, kvpp_size)],
+            get_world_group().local_rank,
+            backend,
+            use_device_communicator=False,
+            group_name="kvpp",
+        )
+
     global _ETP
     assert _ETP is None, "Engram tensor-parallel group is already initialized"
     engram_tensor_parallel_size = (
@@ -2363,6 +2393,11 @@ def get_node_count() -> int:
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
+    global _KVPP
+    if _KVPP:
+        _KVPP.destroy()
+    _KVPP = None
+
     global _TP, _ETP
 
     if _ETP and _ETP is not _TP:

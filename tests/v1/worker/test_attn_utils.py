@@ -8,6 +8,7 @@ never addressed by the logical view.
 """
 
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pytest
@@ -44,6 +45,36 @@ from vllm.v1.worker.utils import (
 )
 
 
+def test_disabled_kvpp_does_not_access_batch_state():
+    unused = SimpleNamespace()
+    attn_utils.maybe_prepare_kvpp(None, unused, unused, unused)
+
+
+@pytest.mark.parametrize(
+    ("indices", "local_history", "expected"),
+    [([0], 4, False), ([1], 0, True), (None, 0, False), (None, 4, True)],
+)
+def test_kvpp_uses_scheduled_history_or_dummy_context(indices, local_history, expected):
+    prepared: list[np.ndarray | None] = []
+    runtime = SimpleNamespace(prepare_forward=prepared.append)
+    block_tables = SimpleNamespace(
+        get_history_block_ids=lambda indices, computed: np.array([3])
+    )
+    req_states = SimpleNamespace(num_computed_tokens_np=np.array([0, 7]))
+    if indices is not None:
+        batch_req_state = SimpleNamespace(idx_mapping_np=np.array(indices))
+    else:
+        batch_req_state = None
+    input_batch = SimpleNamespace(
+        num_reqs=1, num_computed_tokens_np=np.array([local_history, 9])
+    )
+    attn_utils.maybe_prepare_kvpp(
+        runtime, req_states, batch_req_state, input_batch, block_tables
+    )
+    [block_ids] = prepared
+    assert (block_ids is not None) == expected
+
+
 @pytest.mark.parametrize(
     ("enabled", "block_size", "main_sizes", "indexer_sizes", "expected"),
     [
@@ -76,6 +107,7 @@ def test_get_kv_cache_spec_resolves_hisparse_block_size(
     layers = {}
     for name, sizes in zip(specs, [main_sizes, indexer_sizes, [block_size]]):
         backend = SimpleNamespace(
+            get_name=lambda name=name: name,
             customize_spec=AttentionBackend.customize_spec,
             get_supported_kernel_block_sizes=lambda sizes=sizes: sizes,
         )
@@ -84,6 +116,9 @@ def test_get_kv_cache_spec_resolves_hisparse_block_size(
             get_attn_backend=lambda backend=backend: backend,
         )
     monkeypatch.setattr(attn_utils, "get_layers_from_vllm_config", lambda *_: layers)
+    monkeypatch.setattr(
+        attn_utils_module, "get_hisparse_kv_cache_groups", lambda *_: []
+    )
     config = SimpleNamespace(
         attention_config=SimpleNamespace(hisparse_config=object() if enabled else None)
     )
@@ -99,11 +134,15 @@ def test_get_kv_cache_spec_resolves_hisparse_block_size(
 
 
 class _FakeMetadataBuilder:
-    def __init__(self, support: AttentionCGSupport):
+    def __init__(self, support: AttentionCGSupport, varlen_bound: int | None = None):
         self.support = support
+        self.varlen_bound = varlen_bound
 
     def get_cudagraph_support(self, *_args):
         return self.support
+
+    def get_varlen_cudagraph_max_query_len(self, *_args):
+        return self.varlen_bound
 
 
 class _TargetBackend:
@@ -129,7 +168,7 @@ def test_attention_checks_preserve_global_and_target_scoped_support():
         _TargetBackend,
         ["target"],
         spec,
-        0,  # type: ignore[arg-type]
+        0,
     )
     target_group.metadata_builders = [
         _FakeMetadataBuilder(AttentionCGSupport.ALWAYS)  # type: ignore[list-item]
@@ -138,7 +177,7 @@ def test_attention_checks_preserve_global_and_target_scoped_support():
         _DraftBackend,
         ["draft"],
         spec,
-        0,  # type: ignore[arg-type]
+        0,
     )
     draft_group.metadata_builders = [
         _FakeMetadataBuilder(AttentionCGSupport.UNIFORM_BATCH)  # type: ignore[list-item]
@@ -146,14 +185,14 @@ def test_attention_checks_preserve_global_and_target_scoped_support():
     groups = [[target_group, draft_group]]
 
     # The runner-wide execution mode must still honor the drafter's limit.
-    unfiltered = get_attn_cg_support(groups, None)  # type: ignore[arg-type]
+    unfiltered = get_attn_cg_support(groups, None)
     assert unfiltered.min_cg_support == AttentionCGSupport.UNIFORM_BATCH
     assert unfiltered.min_cg_attn_backend == "_DraftBackend"
 
     # Adaptive verification validates only the target's varlen graphs.
     target_only = get_attn_cg_support(
         groups,
-        None,  # type: ignore[arg-type]
+        None,
         checked_layer_names={"target"},
     )
     assert target_only.min_cg_support == AttentionCGSupport.ALWAYS
@@ -170,7 +209,7 @@ def test_attention_checks_preserve_global_and_target_scoped_support():
     draft_group.layer_names.append("target")
     target_with_shared_group = get_attn_cg_support(
         groups,
-        None,  # type: ignore[arg-type]
+        None,
         checked_layer_names={"target"},
     )
     assert target_with_shared_group.min_cg_support == AttentionCGSupport.UNIFORM_BATCH
@@ -181,6 +220,42 @@ def test_attention_checks_preserve_global_and_target_scoped_support():
         )
         == "_DraftBackend"
     )
+
+
+def test_varlen_cudagraph_unsupported_backend_checks_scoped_bounds():
+    """ALWAYS passes without a bound, other builders need one at least as wide as
+    the requested length, and NEVER fails whatever bound a builder reports."""
+    config: Any = SimpleNamespace()
+    spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+    )
+
+    def group(
+        backend: Any,
+        layer_name: str,
+        support: AttentionCGSupport,
+        bound: int | None = None,
+    ):
+        builder: Any = _FakeMetadataBuilder(support, bound)
+        attn_group = AttentionGroup(backend, [layer_name], spec, 0)
+        attn_group.metadata_builders = [builder]
+        return attn_group
+
+    target = group(_TargetBackend, "target", AttentionCGSupport.ALWAYS)
+    draft = group(_DraftBackend, "draft", AttentionCGSupport.UNIFORM_BATCH, 8)
+    never = group(_DraftBackend, "never", AttentionCGSupport.NEVER, 8)
+
+    unsupported = attn_utils.get_varlen_cudagraph_unsupported_backend
+    assert unsupported([[target, draft]], config, 8) is None
+    assert unsupported([[target, draft]], config, 9) == ("_DraftBackend", 8)
+    assert (
+        unsupported([[target, draft]], config, 9, checked_layer_names={"target"})
+        is None
+    )
+    assert unsupported([[target, never]], config, 1) == ("_DraftBackend", None)
 
 
 def test_get_kv_sharing_fast_prefill_eligible_layers(monkeypatch: pytest.MonkeyPatch):

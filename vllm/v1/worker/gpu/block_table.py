@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import itertools
 from collections.abc import Iterable
 
+import numpy as np
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -15,6 +17,9 @@ from vllm.v1.worker.gpu.buffer_utils import (
 
 
 class BlockTables:
+    # Set by the elastic EP warmup so KV writes land in the null block.
+    redirect_writes_to_null_block = False
+
     def __init__(
         self,
         block_sizes: list[int],
@@ -27,9 +32,12 @@ class BlockTables:
         cp_rank: int = 0,
         cp_interleave: int = 1,
         slot_mapping_enabled: list[bool] | None = None,
+        dcp_sharded: list[bool] | None = None,
     ):
         self.block_sizes = block_sizes
         self.kernel_block_sizes = kernel_block_sizes
+        # Optional host mirror of logical block IDs (enabled by KVPP).
+        self.cpu_block_ids: list[list[list[int]]] | None = None
         self.max_num_reqs = max_num_reqs
         self.max_num_batched_tokens = max_num_batched_tokens
         self.device = device
@@ -44,6 +52,10 @@ class BlockTables:
             slot_mapping_enabled = [True] * self.num_kv_cache_groups
         assert len(slot_mapping_enabled) == self.num_kv_cache_groups
         self._slot_mapping_enabled = slot_mapping_enabled
+        if dcp_sharded is None:
+            dcp_sharded = [True] * self.num_kv_cache_groups
+        assert len(dcp_sharded) == self.num_kv_cache_groups
+        self.dcp_sharded = torch.tensor(dcp_sharded, dtype=torch.bool, device=device)
 
         self.blocks_per_kv_block = [
             bs // kbs for bs, kbs in zip(block_sizes, kernel_block_sizes)
@@ -118,9 +130,21 @@ class BlockTables:
         for i in range(self.num_kv_cache_groups):
             start = self.num_blocks.np[i, req_index] if not overwrite else 0
             block_ids = new_block_ids[i]
+            if self.cpu_block_ids is not None:
+                row = self.cpu_block_ids[i][req_index]
+                if overwrite:
+                    row.clear()
+                # Mirror what the device table holds, including null redirects.
+                row.extend(
+                    [0] * len(block_ids)
+                    if self.redirect_writes_to_null_block
+                    else block_ids
+                )
             bpk = self.blocks_per_kv_block[i]
             if bpk > 1:
                 block_ids = [b * bpk + k for b in block_ids for k in range(bpk)]
+            if self.redirect_writes_to_null_block:
+                block_ids = [0] * len(block_ids)
             end = start + len(block_ids)
             row_capacity = self.block_tables[i].gpu.shape[1]
             if end > row_capacity:
@@ -130,6 +154,28 @@ class BlockTables:
                 )
             self.block_tables[i].stage_write(req_index, start, block_ids)
             self.num_blocks.np[i, req_index] = end
+
+    def enable_cpu_block_ids(self) -> None:
+        self.cpu_block_ids = [
+            [[] for _ in range(self.max_num_reqs)]
+            for _ in range(self.num_kv_cache_groups)
+        ]
+
+    def get_history_block_ids(
+        self, req_indices: np.ndarray, num_computed_tokens: np.ndarray
+    ) -> np.ndarray:
+        """Unique logical block IDs holding already-computed tokens."""
+        assert self.cpu_block_ids is not None
+        chunks: list[list[int]] = []
+        for i, block_size in enumerate(self.block_sizes):
+            rows = self.cpu_block_ids[i]
+            num_blocks = -(-num_computed_tokens // block_size)
+            chunks.extend(
+                rows[r][:n] for r, n in zip(req_indices.tolist(), num_blocks.tolist())
+            )
+        if not chunks:
+            return np.empty(0, dtype=np.int64)
+        return np.unique(np.fromiter(itertools.chain.from_iterable(chunks), np.int64))
 
     def apply_staged_writes(self) -> None:
         if self.num_kv_cache_groups == 0:
@@ -210,6 +256,7 @@ class BlockTables:
             self.block_sizes_tensor,
             self.kernel_block_sizes_tensor,
             self.slot_mapping_enabled,
+            self.dcp_sharded,
             slot_mappings,
             slot_mappings.stride(0),
             self.cp_rank,
@@ -283,6 +330,7 @@ def _compute_slot_mappings_kernel(
     block_sizes,  # [num_kv_cache_groups]
     kernel_block_sizes,  # [num_kv_cache_groups]
     slot_mapping_enabled,  # [num_kv_cache_groups]
+    dcp_sharded,  # [num_kv_cache_groups]
     slot_mappings_ptr,  # [num_kv_cache_groups, max_num_tokens]
     slot_mappings_stride,
     cp_rank,
@@ -312,6 +360,8 @@ def _compute_slot_mappings_kernel(
     kv_block_size = tl.load(block_sizes + group_id)
     kernel_block_size = tl.load(kernel_block_sizes + group_id)
     mapping_enabled = tl.load(slot_mapping_enabled + group_id)
+    if CP_SIZE != 1:
+        sharded = tl.load(dcp_sharded + group_id)
 
     req_state_idx = tl.load(idx_mapping + batch_idx)
     # idx_mapping == -1 marks a dummy (or CUDA-graph padding) request that owns
@@ -337,6 +387,8 @@ def _compute_slot_mappings_kernel(
             remainder = virtual_block_offsets % CP_INTERLEAVE
             local_offsets = rounds * CP_INTERLEAVE + remainder
             local_positions = virtual_block_indices * kv_block_size + local_offsets
+            local_positions = tl.where(sharded, local_positions, positions)
+            is_local = ~sharded | is_local
 
         block_indices = tl.where(
             mapping_enabled, local_positions // kernel_block_size, 0

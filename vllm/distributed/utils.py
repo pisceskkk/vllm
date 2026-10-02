@@ -16,7 +16,7 @@ import uuid
 from collections import deque
 from collections.abc import Sequence
 from datetime import timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 from torch.distributed import ProcessGroup, Store, TCPStore
@@ -33,6 +33,9 @@ from vllm.logger import init_logger
 from vllm.utils.network_utils import get_tcp_uri
 from vllm.utils.system_utils import suppress_stdout
 
+if TYPE_CHECKING:
+    from vllm.distributed.parallel_state import GroupCoordinator
+
 logger = init_logger(__name__)
 
 # We prefer to use os.sched_yield as it results in tighter polling loops,
@@ -41,6 +44,29 @@ logger = init_logger(__name__)
 USE_SCHED_YIELD = (sys.version_info[:3] >= (3, 11, 1)) or (
     sys.version_info[:2] == (3, 10) and sys.version_info[2] >= 8
 )
+
+
+def warmup_process_group(
+    group: "GroupCoordinator",
+    operations: Sequence[Literal["broadcast", "all_reduce"]],
+) -> None:
+    """Warm up device-group collectives before measuring available memory.
+
+    All ranks in the group must call with the same operations in the same order.
+    """
+    if group.world_size == 1 or not operations:
+        return
+    probe = torch.zeros(1, device=group.device)
+    for operation in operations:
+        if operation == "broadcast":
+            torch.distributed.broadcast(
+                probe, src=group.ranks[0], group=group.device_group
+            )
+        elif operation == "all_reduce":
+            torch.distributed.all_reduce(probe, group=group.device_group)
+        else:
+            raise ValueError(f"Unsupported warmup operation: {operation}")
+    torch.accelerator.synchronize(group.device)
 
 
 def sched_yield():
@@ -530,8 +556,7 @@ def get_cpu_distributed_timeout_or_none() -> timedelta | None:
     vllm_config = get_current_vllm_config_or_none()
     if vllm_config is None:
         return None
-    timeout_seconds = vllm_config.parallel_config.cpu_distributed_timeout_seconds
-    return timedelta(seconds=timeout_seconds) if timeout_seconds is not None else None
+    return vllm_config.parallel_config.cpu_distributed_timeout
 
 
 def get_distributed_timeout_or_none() -> timedelta | None:
@@ -582,6 +607,7 @@ def stateless_init_torch_distributed_process_group(
     group_name: str | None = None,
     return_store: bool = False,
     listen_socket: socket.socket | None = None,
+    timeout: timedelta | None = None,
 ) -> ProcessGroup | tuple[ProcessGroup, Store]:
     """A replacement for `torch.distributed.init_process_group` that does not
     pollute the global state. The created ProcessGroup object can be used for
@@ -617,18 +643,13 @@ def stateless_init_torch_distributed_process_group(
     is skipped and a ``TCPStore`` server is created directly using the
     pre-bound socket.  This is useful for eliminating TOCTOU races
     between port allocation and binding.
+
+    If *timeout* is None, use PyTorch's default for the backend.
     """
     init_method = get_tcp_uri(host, port)
     backend = Backend(backend)  # it is basically string
-    timeout = _get_default_timeout(backend)
-    if backend == "gloo":
-        gloo_timeout = get_cpu_distributed_timeout_or_none()
-        if gloo_timeout is not None:
-            timeout = gloo_timeout
-    else:
-        device_timeout = get_distributed_timeout_or_none()
-        if device_timeout is not None:
-            timeout = device_timeout
+    if timeout is None:
+        timeout = _get_default_timeout(backend)
 
     if listen_socket is not None:
         store = create_tcp_store(
