@@ -17,11 +17,10 @@ from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
-    PCPOProjRowParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
-    get_pcp_o_proj_batch_has_prefill,
 )
+from vllm.model_executor.layers.pcp_o_proj import PCPOProjRowParallelLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sparse_attn_indexer import (
@@ -427,9 +426,7 @@ class DeepseekV32Attention(MLAAttention):
         # Keep the weight gather off fused_norm_rope while retaining the Q
         # projection, indexer, and main attention as overlap candidates.
         if isinstance(self.o_proj, PCPOProjRowParallelLinear):
-            self.o_proj.prefetch_full_weight_if_needed(
-                get_pcp_o_proj_batch_has_prefill(layer_attn_metadata)
-            )
+            self.o_proj.prefetch_weights()
 
         q = self.q_b_proj(q_c)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)

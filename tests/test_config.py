@@ -1819,11 +1819,8 @@ def test_pcp_o_proj_tp_requires_pcp_and_dcp_one():
         enable_pcp_o_proj_tp=True,
     )
     assert config.enable_pcp_o_proj_tp
-    assert not config.pcp_shard_decode_requests
-    assert ParallelConfig(
-        prefill_context_parallel_size=2,
-        decode_context_parallel_size=1,
-    ).pcp_shard_decode_requests
+    # O-Proj follows the native decode request ownership policy.
+    assert config.pcp_shard_decode_requests
 
 
 def test_pcp_o_proj_tp_accepts_glm5_family_architecture():

@@ -67,13 +67,13 @@ from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     DCPGroupColumnParallelLinear,
     MergedColumnParallelLinear,
-    PCPOProjRowParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mla import MLAModules, MultiHeadLatentAttentionWrapper
+from vllm.model_executor.layers.pcp_o_proj import PCPOProjRowParallelLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,

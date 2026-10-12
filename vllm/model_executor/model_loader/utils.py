@@ -185,6 +185,9 @@ def process_weights_after_loading(
             # narrows replicated (disable_tp) weights at the correct offset.
             if hasattr(module, "update_param_tp_status"):
                 module.update_param_tp_status()
+            # Layers that derive runtime state from their processed weights.
+            if hasattr(module, "on_weights_processed"):
+                module.on_weights_processed()
             # Repacking transients above can leave large amounts of memory in
             # the caching allocator, which starves the OS on UMA devices.
             release_device_memory_under_pressure(target_device)
