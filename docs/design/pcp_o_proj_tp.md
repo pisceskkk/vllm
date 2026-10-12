@@ -200,6 +200,44 @@ Subsections marked "previous implementation" were measured with the earlier
 design, which reassembled a TP-sized weight from representation-specific
 layouts and replicated decode requests over PCP.
 
+### GLM-5.2 cropped execution
+
+On October 12, 2026, commit `81334e6294` was validated with the same four-layer
+GLM-5.2 crop, topology, and workload as the previous-implementation run below
+(TP1/PCP2/DCP1/EP2 on two H20 GPUs, BF16 O-Proj, eager execution, 128-token
+scheduler budget, six requests). Decode requests were sharded over PCP in both
+arms. Both arms used synchronous scheduling so that they executed the same 32
+batches; with the default asynchronous scheduling, batch composition depends
+on timing and differed by one or two steps between arms.
+
+Every O-Proj call was compared with a full-weight BF16 GEMM on its actual
+input. Worst-case errors across both ranks of the enabled arm:
+
+| Phase | Calls across ranks | Relative L2 error | Max error / max reference magnitude |
+| --- | ---: | ---: | ---: |
+| prefill | 16 | 0.003074 | 0.007752 |
+| mixed | 96 | 0.003110 | 0.006711 |
+| decode | 144 | 0.003130 | 0.007634 |
+
+All outputs were finite and within the predeclared 0.01 relative L2 and 0.02
+scaled maximum error bounds. Each rank ran 56 `PREFILL` and 72
+`DECODE_SHARDED` O-Proj calls. Prefill is no longer bit-identical to the
+oracle because it sums two BF16 partial projections. Five of six generated
+continuations matched the disabled arm; the sixth diverged at its fifth
+generated token.
+
+Resident O-Proj parameters per rank halved from `[6144, 16384]` to
+`[6144, 8192]` per layer. Tensor allocation before installing the GEMM oracle
+was 11.0743 GiB/rank disabled and 10.8868 GiB/rank enabled (the previous
+implementation: 11.2618 GiB/rank enabled).
+
+Thread-simulated two-rank unit tests run real kernels on H20 for BF16, FP8
+block (CUTLASS), FP8 per-tensor (CUTLASS, transposed weight view), and
+GPTQ-Marlin int4 O-Proj layers in all three modes. Every output matches
+standard row parallelism over the TP x PCP shards bit for bit. The tests also
+cover an opaque per-shard-rescaled, permuted, strided layout and the
+DeepSeek-V4 grouped `wo_a`/`wo_b` composition.
+
 ### GLM-5.2 cropped execution (previous implementation)
 
 On October 12, 2026, code commit `eb04a10709` was validated on two H20 GPUs
