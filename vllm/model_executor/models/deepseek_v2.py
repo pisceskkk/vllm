@@ -1104,11 +1104,14 @@ class DeepseekV2MLAAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.kv_b_proj",
         )
-        o_proj_cls = (
-            PCPOProjRowParallelLinear
-            if vllm_config.parallel_config.enable_pcp_o_proj_tp
-            else RowParallelLinear
-        )
+        parallel_config = vllm_config.parallel_config
+        o_proj_cls: type[RowParallelLinear] = RowParallelLinear
+        o_proj_kwargs = {}
+        if parallel_config.enable_pcp_o_proj_tp:
+            # The prefill weight gather and its buffers exist only with PCP.
+            o_proj_cls = PCPOProjRowParallelLinear
+            pcp_size = parallel_config.prefill_context_parallel_size
+            o_proj_kwargs["prefill_weight_gather"] = pcp_size > 1
         self.o_proj = o_proj_cls(
             self.num_heads * self.v_head_dim,
             self.hidden_size,
@@ -1116,6 +1119,7 @@ class DeepseekV2MLAAttention(nn.Module):
             reduce_results=reduce_results,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
+            **o_proj_kwargs,
         )
 
         if config.rope_parameters["rope_type"] != "default":

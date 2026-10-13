@@ -8,6 +8,7 @@ method. Only the collectives are simulated, by exchanging tensors between the
 rank threads, so each mode is checked end to end against a TP-only O-Proj.
 """
 
+import contextlib
 import threading
 from collections.abc import Callable
 from types import SimpleNamespace
@@ -18,14 +19,22 @@ import torch
 import torch.nn.functional as F
 
 import vllm.model_executor.parameter as parameter_module
-from vllm.model_executor.layers import pcp_o_proj, peer_weight_gather
+from vllm.model_executor.layers import pcp_o_proj, pcp_tp_weight
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     LinearMethodBase,
     RowParallelLinear,
 )
-from vllm.model_executor.layers.pcp_o_proj import PCPOProjRowParallelLinear
-from vllm.model_executor.layers.peer_weight_gather import PeerWeightGather
+from vllm.model_executor.layers.pcp_o_proj import (
+    OProjMode,
+    PCPOProjRowParallelLinear,
+)
+from vllm.model_executor.layers.pcp_tp_weight import (
+    AssembledTPWeight,
+    PeerShardTPWeight,
+    build_tp_weight,
+    gather_raw_tp_shard,
+)
 from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.utils.torch_utils import set_default_torch_dtype
 
@@ -130,14 +139,24 @@ def _run_ranks(collectives: _Collectives, fn: Callable[[int], Any]) -> list[Any]
 @pytest.fixture
 def simulated_pcp(monkeypatch, default_vllm_config):
     """Route PCP O-Proj collectives through thread-simulated PCP ranks."""
+    # Actual ranks have independent default dtypes. Serialize the temporary
+    # dtype switch used to construct the TP layer in these simulated ranks.
+    dtype_lock = threading.Lock()
+
+    @contextlib.contextmanager
+    def rank_default_dtype(dtype):
+        with dtype_lock, set_default_torch_dtype(dtype):
+            yield
+
+    monkeypatch.setattr(pcp_o_proj, "set_default_torch_dtype", rank_default_dtype)
     fake_dist = SimpleNamespace(
         all_gather_into_tensor=_all_gather_into_tensor,
         all_to_all_single=_all_to_all_single,
         Work=_DoneWork,
     )
     monkeypatch.setattr(pcp_o_proj, "dist", fake_dist)
-    monkeypatch.setattr(peer_weight_gather, "dist", fake_dist)
-    monkeypatch.setattr(peer_weight_gather, "_RECV_BUFFERS", _PerThreadBuffers())
+    monkeypatch.setattr(pcp_tp_weight, "dist", fake_dist)
+    monkeypatch.setattr(pcp_tp_weight, "_SHARED_BUFFERS", _PerThreadBuffers())
     for module in (pcp_o_proj, parameter_module):
         monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 0)
         monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 1)
@@ -149,11 +168,22 @@ def _set_global_has_prefill(monkeypatch, has_prefill: bool | None) -> None:
     monkeypatch.setattr(pcp_o_proj, "get_forward_context", lambda: context)
 
 
-def _load(layer: torch.nn.Module, checkpoint: dict[str, torch.Tensor]) -> None:
+def _load_raw(layer: torch.nn.Module, checkpoint: dict[str, torch.Tensor]) -> None:
     for name, tensor in checkpoint.items():
         param = getattr(layer, name)
         param.weight_loader(param, tensor.to(param.device))
+
+
+def _load(layer: torch.nn.Module, checkpoint: dict[str, torch.Tensor]) -> None:
+    _load_raw(layer, checkpoint)
     layer.quant_method.process_weights_after_loading(layer)
+
+
+def _finish_loading(layer: PCPOProjRowParallelLinear) -> None:
+    """The model loader's post-load sequence for one PCP O-Proj layer."""
+    layer.on_weights_loaded()
+    layer.quant_method.process_weights_after_loading(layer)
+    layer.on_weights_processed()
 
 
 def _build_pcp_layers(
@@ -174,6 +204,10 @@ def _build_pcp_layers(
         "get_current_vllm_config",
         lambda: SimpleNamespace(parallel_config=parallel_config),
     )
+    # The stub config is not a VllmConfig; keep the fixture's real one current.
+    monkeypatch.setattr(
+        pcp_o_proj, "set_current_vllm_config", lambda config: contextlib.nullcontext()
+    )
     layers = []
     for rank in range(collectives.world_size):
         group = _FakeGroup(collectives, rank)
@@ -186,10 +220,11 @@ def _build_pcp_layers(
                 quant_config=quant_config,
                 reduce_results=False,
                 prefix="o_proj",
+                prefill_weight_gather=collectives.world_size > 1,
             )
-        _load(layer, checkpoint)
+        _load_raw(layer, checkpoint)
         layers.append(layer)
-    _run_ranks(collectives, lambda rank: layers[rank].on_weights_processed())
+    _run_ranks(collectives, lambda rank: _finish_loading(layers[rank]))
     return layers
 
 
@@ -224,11 +259,13 @@ def _relative_error(output: torch.Tensor, expected: torch.Tensor) -> float:
     return ((output.float() - expected).norm() / expected.norm()).item()
 
 
+# (has_prefill, shard_decode_requests, expected mode)
 MODES = [
-    pytest.param(True, True, id="prefill"),
-    pytest.param(False, True, id="decode_sharded"),
-    pytest.param(False, False, id="decode_replicated"),
+    pytest.param(True, True, OProjMode.GATHER_WEIGHT, id="prefill"),
+    pytest.param(False, True, OProjMode.EXCHANGE_HEADS, id="decode_sharded"),
+    pytest.param(False, False, OProjMode.LOCAL_HEADS, id="decode_replicated"),
 ]
+MODE_ARGS = "has_prefill,shard_decode_requests,mode"
 
 
 def _check_modes_match_tp_o_proj(
@@ -237,11 +274,13 @@ def _check_modes_match_tp_o_proj(
     *,
     has_prefill: bool,
     shard_decode_requests: bool,
+    mode: OProjMode,
     input_size: int,
     output_size: int,
     params_dtype: torch.dtype,
     device: str,
     quant_config=None,
+    expect_assembled: bool = True,
     rtol: float = 1e-5,
     tp_rtol: float = 1e-5,
 ) -> None:
@@ -260,9 +299,13 @@ def _check_modes_match_tp_o_proj(
         shard_decode_requests=shard_decode_requests,
         **layer_args,
     )
-    # Standard row-parallel TP over all TP x PCP shards. With dynamic
-    # activation quantization every input slice gets its own scale, so this
-    # differs slightly from a single TP-sized O-Proj.
+    strategy = AssembledTPWeight if expect_assembled else PeerShardTPWeight
+    assert all(isinstance(layer.tp_weight, strategy) for layer in layers)
+
+    # Decode, and prefill without an assembled TP layer, compute standard
+    # row-parallel TP over all TP x PCP shards. With dynamic activation
+    # quantization every input slice gets its own scale, so this differs
+    # slightly from the single TP-sized O-Proj that assembled prefill runs.
     shards = [
         _build_row_parallel_layer(
             checkpoint, tp_rank=rank, tp_size=PCP_SIZE, **layer_args
@@ -277,7 +320,7 @@ def _check_modes_match_tp_o_proj(
         return torch.stack(partials).sum(0)
 
     # Replicated decode gives every rank the same tokens.
-    replicated = not has_prefill and not shard_decode_requests
+    replicated = mode is OProjMode.LOCAL_HEADS
     inputs = [
         torch.randn(NUM_TOKENS, input_size, dtype=params_dtype, device=device)
         for _ in range(PCP_SIZE)
@@ -290,18 +333,24 @@ def _check_modes_match_tp_o_proj(
     def forward(rank: int) -> torch.Tensor:
         layer = layers[rank]
         layer.prefetch_weights()
+        assert layer._mode is mode
         output, output_bias = layer(inputs[rank])
         assert output_bias is None
         return output
 
+    def tp_reference(x: torch.Tensor) -> torch.Tensor:
+        return tp_layer(x)[0]
+
+    gathers_assembled = mode is OProjMode.GATHER_WEIGHT and expect_assembled
+    exact_reference = tp_reference if gathers_assembled else row_parallel_reference
     for x, output in zip(inputs, _run_ranks(collectives, forward)):
-        assert _relative_error(output, row_parallel_reference(x)) <= rtol
-        assert _relative_error(output, tp_layer(x)[0]) <= tp_rtol
+        assert _relative_error(output, exact_reference(x)) <= rtol
+        assert _relative_error(output, tp_reference(x)) <= tp_rtol
 
 
-@pytest.mark.parametrize("has_prefill,shard_decode_requests", MODES)
+@pytest.mark.parametrize(MODE_ARGS, MODES)
 def test_unquantized_modes_match_tp_o_proj(
-    simulated_pcp, has_prefill, shard_decode_requests
+    simulated_pcp, has_prefill, shard_decode_requests, mode
 ):
     input_size, output_size = 8, 6
     checkpoint = {"weight": torch.randn(output_size, input_size)}
@@ -310,6 +359,7 @@ def test_unquantized_modes_match_tp_o_proj(
         checkpoint,
         has_prefill=has_prefill,
         shard_decode_requests=shard_decode_requests,
+        mode=mode,
         input_size=input_size,
         output_size=output_size,
         params_dtype=torch.float32,
@@ -367,9 +417,13 @@ class _ScrambledQuantConfig(SimpleNamespace):
         return _ScrambledLinearMethod()
 
 
-@pytest.mark.parametrize("has_prefill,shard_decode_requests", MODES)
+@pytest.mark.parametrize(MODE_ARGS, MODES)
 def test_peer_gather_is_layout_agnostic(
-    simulated_pcp, monkeypatch, has_prefill, shard_decode_requests
+    simulated_pcp,
+    monkeypatch,
+    has_prefill,
+    shard_decode_requests,
+    mode,
 ):
     from vllm.model_executor.layers import linear as linear_module
 
@@ -385,11 +439,13 @@ def test_peer_gather_is_layout_agnostic(
         checkpoint,
         has_prefill=has_prefill,
         shard_decode_requests=shard_decode_requests,
+        mode=mode,
         input_size=input_size,
         output_size=output_size,
         params_dtype=torch.float32,
         device="cpu",
         quant_config=_ScrambledQuantConfig(),
+        expect_assembled=False,
     )
 
 
@@ -447,7 +503,7 @@ def _gptq_int4_config():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA kernels")
-@pytest.mark.parametrize("has_prefill,shard_decode_requests", MODES)
+@pytest.mark.parametrize(MODE_ARGS, MODES)
 @pytest.mark.parametrize(
     "make_config,make_checkpoint,params_dtype",
     [
@@ -469,6 +525,7 @@ def test_quantized_modes_match_tp_o_proj(
     params_dtype,
     has_prefill,
     shard_decode_requests,
+    mode,
 ):
     default_vllm_config.model_config = SimpleNamespace(
         dtype=params_dtype, hf_text_config=SimpleNamespace(model_type=None)
@@ -485,6 +542,7 @@ def test_quantized_modes_match_tp_o_proj(
         checkpoint,
         has_prefill=has_prefill,
         shard_decode_requests=shard_decode_requests,
+        mode=mode,
         input_size=input_size,
         output_size=output_size,
         params_dtype=params_dtype,
@@ -500,47 +558,53 @@ def test_grouped_o_proj_gathers_column_and_row_shards(simulated_pcp):
 
     ``wo_a`` is column-parallel over head groups and ``wo_b`` is row-parallel
     over the grouped low-rank features. Sharding both over PCP and gathering
-    them per peer reproduces the unsharded projection.
+    them reproduces the unsharded projection with TP-sized weights.
     """
     num_groups, group_dim, rank_dim, hidden = 4, 6, 3, 5
     wo_a_weight = torch.randn(num_groups * rank_dim, group_dim)
     wo_b_weight = torch.randn(hidden, num_groups * rank_dim)
     collectives = _Collectives(PCP_SIZE)
-    local_groups = num_groups // PCP_SIZE
 
-    def build(rank: int) -> tuple[ColumnParallelLinear, RowParallelLinear]:
-        common = dict(bias=False, params_dtype=torch.float32, tp_rank=rank,
-                      tp_size=PCP_SIZE)  # fmt: skip
-        wo_a = ColumnParallelLinear(group_dim, num_groups * rank_dim, **common)
-        wo_b = RowParallelLinear(num_groups * rank_dim, hidden, **common)
-        _load(wo_a, {"weight": wo_a_weight})
-        _load(wo_b, {"weight": wo_b_weight})
-        return wo_a, wo_b
+    def build(cls, input_size, output_size, rank, tp_size):
+        return cls(input_size, output_size, bias=False, params_dtype=torch.float32,
+                   tp_rank=rank, tp_size=tp_size)  # fmt: skip
 
-    layers = [build(rank) for rank in range(PCP_SIZE)]
+    shapes = {
+        "wo_a": (ColumnParallelLinear, group_dim, num_groups * rank_dim, wo_a_weight),
+        "wo_b": (RowParallelLinear, num_groups * rank_dim, hidden, wo_b_weight),
+    }
+    local_layers = []
+    for rank in range(PCP_SIZE):
+        layers = {}
+        for name, (cls, input_size, output_size, weight) in shapes.items():
+            layers[name] = build(cls, input_size, output_size, rank, PCP_SIZE)
+            _load_raw(layers[name], {"weight": weight})
+        local_layers.append(layers)
+
+    def load(rank: int) -> dict:
+        group = _FakeGroup(collectives, rank)
+        tp_weights = {}
+        for name, (cls, input_size, output_size, _) in shapes.items():
+            local = local_layers[rank][name]
+            tp_layer = build(cls, input_size, output_size, 0, 1)
+            gather_raw_tp_shard(local, tp_layer, group)
+            local.quant_method.process_weights_after_loading(local)
+            tp_layer.quant_method.process_weights_after_loading(tp_layer)
+            tp_weights[name] = build_tp_weight(local, tp_layer, group, name)
+            assert isinstance(tp_weights[name], AssembledTPWeight)
+        return tp_weights
+
+    tp_weights = _run_ranks(collectives, load)
     inputs = [torch.randn(NUM_TOKENS, num_groups, group_dim) for _ in range(PCP_SIZE)]
 
     def prefill(rank: int) -> torch.Tensor:
-        group = _FakeGroup(collectives, rank)
-        wo_a, wo_b = layers[rank]
-        wo_a_peers = PeerWeightGather(wo_a, group, "wo_a")
-        wo_b_peers = PeerWeightGather(wo_b, group, "wo_b")
-        wo_a_peers.start()
-        wo_b_peers.start()
-        wo_a_peers.wait()
-        wo_b_peers.wait()
-
-        z = []
-        for peer, o in enumerate(inputs[rank].split(local_groups, dim=1)):
-            with wo_a_peers.use_peer(peer):
-                grouped = wo_a.weight.view(local_groups, rank_dim, group_dim)
-                z.append(torch.einsum("tgd,grd->tgr", o, grouped))
-        z = torch.cat(z, dim=1).flatten(1)
-        output = torch.zeros(NUM_TOKENS, hidden)
-        for peer, z_peer in enumerate(z.split(local_groups * rank_dim, dim=-1)):
-            with wo_b_peers.use_peer(peer):
-                output += wo_b.quant_method.apply(wo_b, z_peer.contiguous())
-        return output
+        wo_a, wo_b = tp_weights[rank]["wo_a"], tp_weights[rank]["wo_b"]
+        wo_a.start()
+        wo_b.start()
+        wo_a.wait()
+        grouped = wo_a.tp_layer.weight.view(num_groups, rank_dim, group_dim)
+        z = torch.einsum("tgd,grd->tgr", inputs[rank], grouped).flatten(1)
+        return wo_b.apply(z)
 
     grouped_weight = wo_a_weight.view(num_groups, rank_dim, group_dim)
     for x, output in zip(inputs, _run_ranks(collectives, prefill)):
@@ -596,7 +660,9 @@ def test_wrong_input_width_drains_pending_gather(simulated_pcp):
         layers[rank].prefetch_weights()
         with pytest.raises(ValueError, match="expects input shape"):
             layers[rank](torch.randn(2, 2))
-        assert not layers[rank].peer_weights.pending
+        # Nothing is pending, so a new gather can start.
+        layers[rank].tp_weight.start()
+        layers[rank].tp_weight.wait()
 
     _run_ranks(collectives, forward)
 
@@ -611,4 +677,40 @@ def test_method_holding_tensors_is_rejected(simulated_pcp):
     layer.quant_method = _TableMethod()
     layer.quant_method.process_weights_after_loading(layer)
     with pytest.raises(ValueError, match="keeps tensors"):
-        PeerWeightGather(layer, _FakeGroup(_Collectives(1), 0), "test")
+        PeerShardTPWeight(layer, _FakeGroup(_Collectives(1), 0), "test")
+
+
+@pytest.mark.parametrize("has_prefill", [True, False])
+def test_without_pcp_builds_no_tp_weight(simulated_pcp, has_prefill):
+    """With PCP disabled the model turns the prefill weight gather off: no
+    TP-sized layer or shared buffers exist and O-Proj is a plain TP O-Proj."""
+    collectives = _Collectives(1)
+    weight = torch.randn(3, 4)
+    (layer,) = _build_pcp_layers(
+        simulated_pcp,
+        collectives,
+        {"weight": weight},
+        input_size=4,
+        output_size=3,
+        params_dtype=torch.float32,
+        device="cpu",
+    )
+    assert layer._tp_layer is None and layer._tp_weight is None
+    _set_global_has_prefill(simulated_pcp, has_prefill)
+    x = torch.randn(NUM_TOKENS, 4)
+
+    def forward(rank: int) -> torch.Tensor:
+        layer.prefetch_weights()
+        assert layer._mode is OProjMode.LOCAL_HEADS
+        return layer(x)[0]
+
+    (output,) = _run_ranks(collectives, forward)
+    torch.testing.assert_close(output, F.linear(x, weight))
+
+
+def test_prefill_weight_gather_must_follow_pcp(simulated_pcp):
+    simulated_pcp.setattr(
+        pcp_o_proj, "get_pcp_group", lambda: _FakeGroup(_Collectives(PCP_SIZE), 0)
+    )
+    with pytest.raises(ValueError, match="exactly when PCP is enabled"):
+        PCPOProjRowParallelLinear(4, 3, prefill_weight_gather=False)

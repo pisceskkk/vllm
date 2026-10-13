@@ -139,6 +139,10 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             index_group_builder=mla_modules.index_group_builder,
             non_causal_multi_token_decode=non_causal_multi_token_decode,
         )
+        if isinstance(self.o_proj, PCPOProjRowParallelLinear):
+            # Queue the O-Proj weight gather behind attention's PCP KV gather
+            # so they do not compete, while still overlapping attention.
+            self.mla_attn.after_kv_gather = self.o_proj.prefetch_weights
         indexer_op = getattr(self.indexer, "indexer_op", None)
         if indexer_op is not None and hasattr(
             indexer_op, "dense_mha_metadata_layer_name"
@@ -216,11 +220,6 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             q_c = q_proj_input
         else:
             kv_c_normed = self.kv_a_layernorm(kv_c)
-
-        # Keep the weight gather off the Q/KV RMSNorm kernels while retaining
-        # Q projection, RoPE, indexer, and attention as overlap candidates.
-        if isinstance(self.o_proj, PCPOProjRowParallelLinear):
-            self.o_proj.prefetch_weights()
 
         # Add head dim of 1 to k_pe
         k_pe = k_pe.unsqueeze(1)

@@ -177,6 +177,9 @@ def process_weights_after_loading(
                 else nullcontext()
             )
             with loading_context, timing_context:
+                # Layers that derive state from their raw loaded weights.
+                if hasattr(module, "on_weights_loaded"):
+                    module.on_weights_loaded()
                 quant_method.process_weights_after_loading(module)
             # process_weights_after_loading may swap in freshly-created
             # Parameters (e.g. FP8 requantization), which are stamped with the

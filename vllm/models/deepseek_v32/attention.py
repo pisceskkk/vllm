@@ -261,11 +261,14 @@ class DeepseekV32Attention(MLAAttention):
         )
         self.kv_a_layernorm = RMSNorm(kv_lora_rank, eps=config.rms_norm_eps)
 
-        o_proj_cls = (
-            PCPOProjRowParallelLinear
-            if vllm_config.parallel_config.enable_pcp_o_proj_tp
-            else RowParallelLinear
-        )
+        parallel_config = vllm_config.parallel_config
+        o_proj_cls: type[RowParallelLinear] = RowParallelLinear
+        o_proj_kwargs = {}
+        if parallel_config.enable_pcp_o_proj_tp:
+            # The prefill weight gather and its buffers exist only with PCP.
+            o_proj_cls = PCPOProjRowParallelLinear
+            pcp_size = parallel_config.prefill_context_parallel_size
+            o_proj_kwargs["prefill_weight_gather"] = pcp_size > 1
         self.o_proj = o_proj_cls(
             num_heads * v_head_dim,
             hidden_size,
@@ -273,6 +276,7 @@ class DeepseekV32Attention(MLAAttention):
             reduce_results=False,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
+            **o_proj_kwargs,
         )
 
         self.rotary_emb = get_rope(
@@ -423,11 +427,6 @@ class DeepseekV32Attention(MLAAttention):
                 self._k_scale,
             )
 
-        # Keep the weight gather off fused_norm_rope while retaining the Q
-        # projection, indexer, and main attention as overlap candidates.
-        if isinstance(self.o_proj, PCPOProjRowParallelLinear):
-            self.o_proj.prefetch_weights()
-
         q = self.q_b_proj(q_c)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         if prepare_mqa_query:
@@ -472,6 +471,12 @@ class DeepseekV32Attention(MLAAttention):
             output,
         )
         return self.o_proj(output)[0]
+
+    def _prefetch_o_proj_weights(self) -> None:
+        """Start the O-Proj weight gather once the PCP index-K and KV gathers
+        are issued, so that it queues behind them and overlaps attention."""
+        if isinstance(self.o_proj, PCPOProjRowParallelLinear):
+            self.o_proj.prefetch_weights()
 
     @eager_break_during_capture
     def _sparse_indexer_and_attn(
@@ -533,6 +538,7 @@ class DeepseekV32Attention(MLAAttention):
             self.layer_name
         )
         if attn_metadata is None:
+            self._prefetch_o_proj_weights()
             output.zero_()
             return
         attn_metadata = cast("MLACommonMetadata", attn_metadata)
@@ -558,6 +564,7 @@ class DeepseekV32Attention(MLAAttention):
                 self.kv_cache_dtype,
                 self._k_scale,
             )
+        self._prefetch_o_proj_weights()
 
         num_actual = attn_metadata.num_actual_tokens  # type: ignore[attr-defined]
         if num_actual == 0:

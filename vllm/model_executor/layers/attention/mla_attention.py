@@ -610,6 +610,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         parallel_config = vllm_config.parallel_config
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
         self.pcp_shard_decode_requests = parallel_config.pcp_shard_decode_requests
+        # Called once per forward after the KV-cache update has issued its PCP
+        # gather, e.g. to start collectives that must queue behind it.
+        self.after_kv_gather: Callable[[], None] | None = None
         compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -849,6 +852,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
             if self.hisparse_cache is not None:
                 self.hisparse_cache.finish_kv_update()
+            if self.after_kv_gather is not None:
+                self.after_kv_gather()
             output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
             self.forward_impl(
                 q,
@@ -1438,6 +1443,8 @@ def unified_mla_kv_cache_update(
             kv_cache_dtype,
             k_scale,
         )
+    if attn_layer.after_kv_gather is not None:
+        attn_layer.after_kv_gather()
 
     return torch.empty(0, device=kv_c_normed.device, dtype=kv_c_normed.dtype)
 

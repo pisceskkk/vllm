@@ -58,79 +58,67 @@ checkpoint format change is required. The resident O-Proj weight on each rank
 is `1/P` of the standard TP layout, and the PCP peers of a TP rank hold
 adjacent head slices of that TP rank's heads.
 
-## Peer weight gather
+## TP-sized weight for prefill
 
-`PeerWeightGather` (`vllm/model_executor/layers/peer_weight_gather.py`) never
-reassembles a TP-sized weight. Instead, a rank borrows the shards of its PCP
-peers and runs the layer once per shard:
+`vllm/model_executor/layers/pcp_tp_weight.py` rebuilds the TP-sized O-Proj
+for prefill so that it runs one ordinary TP GEMM:
 
-```text
-Y_t = sum_q apply(W_local[t,q], X_t[..., q-th input slice])
-```
-
-This is the same identity that makes TP row parallelism correct, so it holds
-for every linear quantization method. Each peer shard is used exactly as its
-owner processed it: swizzled or packed scales, Marlin/Machete repacking,
-TRT-LLM shuffles, K padding, per-shard requantized scales, and kernels
-configured for the local K all stay valid. The kernel always sees the local
-shape it was built and warmed up for, so no layer metadata is switched either.
-
-Mechanics:
-
-1. After the quantization method's `process_weights_after_loading`, the model
-   loader calls `layer.on_weights_processed()`. The layer collects every
-   non-empty tensor it owns (parameters, buffers, and plain tensor
-   attributes), plans one 256-byte-aligned byte blob that preserves each
-   tensor's strides, and checks with one small all-gather that all PCP ranks
-   produced the same layout. Quantization methods or kernels that keep tensors
-   outside the layer are rejected, because such weight data would not be
-   gathered.
-2. `start()` copies the local tensors into this rank's row of a shared
-   `[P, blob_bytes]` receive buffer and launches one asynchronous in-place
-   `all_gather_into_tensor` per layer. The collective sees raw bytes, so FP8,
-   FP4, and packed integer formats need no special datatype.
-3. `use_peer(q)` temporarily points the layer's tensor attributes at strided
-   views of row `q` and restores the local tensors afterwards. The views are
-   built once, so swapping allocates nothing.
+1. Before the quantization method processes the weights, the model loader
+   calls `on_weights_loaded()`. The layer builds a hidden `RowParallelLinear`
+   with the same quantization config for the TP-sized input, outside the module
+   tree, and fills it with the raw TP shard gathered once over PCP. Its quant
+   method and kernels are therefore configured for the real TP `K` (Marlin
+   kernel configs, NVFP4 padding, and DeepGEMM shapes included), so no layer
+   metadata is ever switched.
+2. After processing, `on_weights_processed()` processes the TP-sized layer as
+   well and compares every post-load tensor with the local one, bit for bit
+   and on every rank: it is either identical (replicated scales, workspaces)
+   or the concatenation of the ranks' local tensors along one dimension. The
+   layouts are discovered and verified rather than declared per quantization
+   method.
+3. The TP-sized layer's concatenated tensors are rebound to buffers shared by
+   all O-Proj layers. If the concatenation dimension is outermost in storage
+   (Marlin, Blackwell DeepGEMM packed scales), the all-gather writes the final
+   layout directly. Otherwise it writes a staging buffer and one batched
+   concatenation on a side stream assembles the final layout while attention
+   runs. No second copy of the local shard is kept.
+4. A layout that fails verification, such as block scales swizzled per shard,
+   falls back with a warning to summing the projections of every peer's opaque
+   shard, which is correct for any row-parallel method but runs `P` GEMMs.
 
 ## Runtime modes
 
-The model runner records whether the logical, pre-partition batch contains
-any prefill before PCP splits its tokens, and passes it through
-`ForwardContext.global_has_prefill`. `prefetch_weights()` uses this flag to
-select one of three modes, identically on every PCP rank.
+The model runner passes the logical, pre-partition batch type through
+`ForwardContext.global_has_prefill`, and attention calls `prefetch_weights()`
+before its own compute, so every PCP rank selects the same mode.
 
-### Prefill or mixed batches: `PREFILL`
+### Batches with prefill: `GATHER_WEIGHT`
 
-The attention module starts the asynchronous peer weight gather after its
-Q/KV normalization, so the gather overlaps the remaining query projection,
-RoPE, indexer, and main attention. O-Proj waits for it, then projects the
-local tokens with all `P` shards and accumulates the partial results. No PCP
-output reduction is needed because different PCP ranks process different
-tokens. The existing TP reduction is unchanged.
+The asynchronous TP weight gather starts right after attention has issued
+its own PCP gathers (index K and latent KV), so it queues behind them on the
+PCP communicator instead of delaying them, and overlaps the main attention
+computation. PCP targets long prefills and large batches, whose attention
+normally hides the gather. O-Proj waits for it and projects the local tokens with the
+TP-sized weight.
 
-### Decode-only batches with sharded requests: `DECODE_SHARDED`
+### Decode-only batches with sharded requests: `EXCHANGE_HEADS`
 
 With `DCP = 1`, PCP assigns each decode request to one PCP rank
-(`ParallelConfig.pcp_shard_decode_requests`). PCP pads every rank's batch to
-the same token count `T_pad`, so the head slices can be exchanged with
-equal-size collectives:
+(`ParallelConfig.pcp_shard_decode_requests`) and pads every rank's batch to
+the same token count `T`, so the head slices are exchanged with equal-size
+collectives:
 
 ```text
-X_t[T_pad, K/T] --view--> [T_pad, P, K/(T*P)] --transpose--> [P, T_pad, K/(T*P)]
---PCP all-to-all--> [P*T_pad, K/(T*P)]   # this rank's head slice of all tokens
---local GEMM-->     [P*T_pad, N]
---PCP reduce-scatter--> [T_pad, N]       # summed over head slices, own tokens
+X_t[T, K/T] --view--> [T, P, K/(T*P)] --transpose--> [P, T, K/(T*P)]
+--PCP all-to-all--> [P*T, K/(T*P)]   # this rank's head slice of all tokens
+--local GEMM-->     [P*T, N]
+--PCP reduce-scatter--> [T, N]       # summed over head slices, own tokens
 ```
 
-### Decode-only batches with replicated requests: `DECODE_REPLICATED`
+### Decode-only batches with replicated requests: `LOCAL_HEADS`
 
-If every PCP rank holds every decode request, each rank projects its head
-slice of the shared tokens and the partial results are all-reduced over PCP:
-
-```text
-Y_t = PCP-AllReduce(X_t[..., p-th input slice] @ W_local[t,p]^T)
-```
+Each rank projects its head slice of the shared tokens and the partial results
+are all-reduced over PCP.
 
 In all modes, `Y = TP-AllReduce(Y_t)` follows when `reduce_results=True`.
 DeepSeek-V3.2 O-Proj uses `reduce_results=False`; its fused TP
@@ -138,41 +126,43 @@ all-reduce/RMSNorm remains responsible for the TP reduction.
 
 ## Buffer lifecycle
 
-The receive buffer is allocated during weight post-processing, before
-profiling and KV-cache sizing, and is shared by all O-Proj layers with the
-same blob size. Its size equals one TP-sized O-Proj shard plus alignment.
-Layers execute sequentially and every layer waits for its gather before the
-next layer's attention starts the next one, so a single buffer suffices. DBO is
-disabled to prevent two concurrent microbatches from sharing it. The decode
-modes allocate only activation-sized temporaries.
+`PCPOProjRowParallelLinear(prefill_weight_gather=...)` decides whether the
+TP-sized layer and the shared full/staging buffers are built at load time.
+Models enable it exactly when PCP is enabled; without PCP the local shard is
+the TP shard, nothing extra is allocated, and the layer behaves like
+`RowParallelLinear`. When enabled, the buffers are allocated during weight
+post-processing, before profiling and KV-cache sizing. Layers execute
+sequentially, the side stream waits for the compute stream before assembling,
+and O-Proj waits for the assembly event, so one set of buffers serves all
+layers. DBO is disabled to prevent two concurrent microbatches from sharing
+them.
 
 ## Explicit triggering and correctness constraints
 
-Both the generic MLA wrapper and the modular DeepSeek-V3.2 attention path call
-`prefetch_weights()` after their Q/KV normalization and before the remaining
-query projection and main attention computation.
+`prefetch_weights()` runs once per forward, after attention has issued its
+PCP gathers:
+
+- DeepSeek-V3.2 attention calls it in `_sparse_indexer_and_attn` right after
+  the latent KV gather (the indexer gathers index K before that), and on the
+  early return without attention metadata.
+- The generic MLA wrapper registers it as `MLAAttention.after_kv_gather`,
+  which runs after the KV-cache update in both the direct-call and the
+  custom-op paths, including when the update is skipped.
+
 `PCPOProjRowParallelLinear.forward()` requires that call before every
 invocation, and `prefetch_weights()` requires the global batch type instead of
-inferring it from rank-local metadata. This guarantees that:
-
-- every PCP rank issues the same collectives in the same order;
-- decode-only batches do not issue a weight gather;
-- O-Proj does not read peer tensors before the asynchronous gather has
-  completed; and
-- dummy, profile, and warmup runs, which are unpartitioned decode-only batches
-  on every rank, take a decode mode.
+inferring it from rank-local metadata, so every PCP rank issues the same
+collectives in the same order.
 
 ## DeepSeek-V4 grouped O-Proj
 
 DeepSeek-V4 projects attention output through a grouped `wo_a`
 (column-parallel over head groups, applied as a batched GEMM) followed by a
 row-parallel `wo_b`. Sharding the head groups over PCP shards `wo_a` on its
-output axis and `wo_b` on its input axis. `PeerWeightGather` is layer-agnostic,
-so both layers are gathered the same way: in `PREFILL` mode each peer's `wo_a`
-groups produce that peer's slice of the low-rank features, and each peer's
-`wo_b` shard is accumulated as above. The unit tests cover this composition.
-DeepSeek-V4 attention does not yet support PCP on CUDA, so the model is not
-wired to the feature.
+output axis and `wo_b` on its input axis. `pcp_tp_weight` is axis-agnostic, so
+both are rebuilt as TP-sized layers the same way; the unit tests cover this
+composition. DeepSeek-V4 attention does not yet support PCP on CUDA, so the
+model is not wired to the feature.
 
 ## Configuration
 
@@ -196,11 +186,13 @@ vllm serve <model> \
 
 ## Validation results
 
-Subsections marked "previous implementation" were measured with the earlier
-design, which reassembled a TP-sized weight from representation-specific
-layouts and replicated decode requests over PCP.
+The subsections below predate the current design. "Peer-shard
+implementation" summed one GEMM per PCP shard in prefill; "previous
+implementation" reassembled a TP-sized weight from representation-specific
+layouts and replicated decode requests over PCP. Results for the current
+design are pending.
 
-### GLM-5.2 cropped execution
+### GLM-5.2 cropped execution (peer-shard implementation)
 
 On October 12, 2026, commit `81334e6294` was validated with the same four-layer
 GLM-5.2 crop, topology, and workload as the previous-implementation run below
@@ -417,13 +409,12 @@ saving in this table are divided by `T`.
 
 ## Future work
 
-1. Add multi-run stability tests and traces of weight-gather/attention overlap.
-2. Measure prefill O-Proj cost: the peer-shard accumulation runs `P` GEMMs of
-   `K/(T*P)` plus `P-1` output additions instead of one GEMM of `K/T`.
-3. Integrate the shared receive buffer with a concurrency-safe model-level
-   workspace manager and remove the DBO restriction.
-4. Add CUDA Graph and `torch.compile`-capturable paths; the decode modes
-   already use static shapes.
+1. Evaluate a dedicated PCP communicator so that the weight gather can also
+   overlap attention's own PCP collectives.
+2. Add multi-run full-model TTFT/throughput regressions and traces of
+   weight-gather/attention overlap.
+3. Integrate the shared buffers with a concurrency-safe model-level workspace
+   manager and remove the DBO restriction.
+4. Add CUDA Graph and `torch.compile`-capturable paths; `EXCHANGE_HEADS` and
+   `LOCAL_HEADS` already use static shapes.
 5. Wire DeepSeek-V4 once its attention supports PCP.
-6. Evaluate a dedicated PCP communicator or stream to avoid serialization with
-   attention PCP collectives.
