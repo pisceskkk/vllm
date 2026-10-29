@@ -457,6 +457,46 @@ def test_run_model_uses_complete_pcp_padding(monkeypatch, partitioned):
 
 
 @pytest.mark.parametrize(
+    ("cg_mode", "use_pcp", "expected_prefill_mode"),
+    [
+        (
+            CUDAGraphMode.FULL_AND_PIECEWISE,
+            False,
+            CUDAGraphMode.FULL_AND_PIECEWISE,
+        ),
+        (CUDAGraphMode.FULL_AND_PIECEWISE, True, CUDAGraphMode.PIECEWISE),
+        (CUDAGraphMode.FULL_DECODE_ONLY, True, CUDAGraphMode.NONE),
+        (CUDAGraphMode.PIECEWISE, True, CUDAGraphMode.PIECEWISE),
+    ],
+)
+def test_pcp_draft_prefill_skips_full_cudagraphs(
+    monkeypatch, cg_mode, use_pcp, expected_prefill_mode
+):
+    # A FULL draft-prefill replay would skip the PCP hidden-state all-gather.
+    modes = []
+    monkeypatch.setattr(
+        spec_module,
+        "SpeculatorCudaGraphManager",
+        lambda vllm_config, device, mode, *args, **kwargs: modes.append(mode),
+    )
+    speculator = object.__new__(_TestSpeculator)
+    speculator.vllm_config = None
+    speculator.device = torch.device("cpu")
+    speculator.num_speculative_steps = 3
+    speculator.enable_adaptive_verification = False
+    speculator.pcp_manager = object() if use_pcp else None
+
+    speculator.init_cudagraph_manager(cg_mode)
+
+    expected_decode_mode = (
+        CUDAGraphMode.FULL_DECODE_ONLY
+        if cg_mode.decode_mode() == CUDAGraphMode.FULL
+        else CUDAGraphMode.NONE
+    )
+    assert modes == [expected_prefill_mode, expected_decode_mode]
+
+
+@pytest.mark.parametrize(
     (
         "method_name",
         "cg_mode",

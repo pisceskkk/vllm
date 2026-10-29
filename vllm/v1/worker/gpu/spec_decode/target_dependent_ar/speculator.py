@@ -87,11 +87,18 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
         super()._configure_decode_metadata_update()
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
+        prefill_cudagraph_mode = cudagraph_mode
+        if self.pcp_manager is not None:
+            # PCP draft prefill runs on each rank's local slice of the target
+            # batch and all-gathers its hidden states afterwards. FULL graphs
+            # capture neither, and only the rank owning a lone decode request
+            # would match one, leaving the other ranks' all-gather unpaired.
+            prefill_cudagraph_mode = cudagraph_mode.mixed_mode()
         # Initialize cudagraph manager for draft prefill (draft position 0).
         self.prefill_cudagraph_manager = SpeculatorCudaGraphManager(
             self.vllm_config,
             self.device,
-            cudagraph_mode,
+            prefill_cudagraph_mode,
             self.num_speculative_steps + 1,
             # Draft prefill shares the target's padded attention metadata.
             varlen_decode=self.enable_adaptive_verification,
