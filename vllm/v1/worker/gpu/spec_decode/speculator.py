@@ -517,6 +517,8 @@ class DraftModelSpeculator(BaseSpeculator):
             seq_lens_cpu_upper_bound=draft_seq_lens_cpu_upper_bound,
             positions=self.input_buffers.positions[:num_tokens],
             is_prefilling=self.draft_is_prefilling[:num_reqs_padded],
+            draft_window_size=self.speculative_config.draft_window_size,
+            draft_window_block_sizes=self.block_tables.block_sizes,
         )
         return attn_metadata
 

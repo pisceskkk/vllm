@@ -473,6 +473,33 @@ def build_slot_mappings_by_layer(
     return slot_mappings_by_layer
 
 
+def apply_draft_window(
+    metadata: CommonAttentionMetadata, window_size: int, block_size: int
+) -> None:
+    """Restrict draft KV reads, preserving absolute positions and write slots."""
+    full_table = metadata.block_table_tensor
+    starts = (metadata.seq_lens - window_size).clamp(min=0) // block_size
+    lengths = metadata.seq_lens - starts * block_size
+    num_cols = min(
+        (window_size + block_size - 1) // block_size + 1, full_table.shape[1]
+    )
+    cols = torch.arange(num_cols, device=full_table.device)
+    source_cols = starts[:, None] + cols
+    valid = (source_cols < full_table.shape[1]) & (cols * block_size < lengths[:, None])
+    metadata.block_table_tensor = torch.gather(
+        full_table, 1, source_cols.clamp(max=full_table.shape[1] - 1).long()
+    ).masked_fill(~valid, 0)
+    metadata.seq_lens = lengths
+    # Rounding can retain up to block_size - 1 extra tokens. Applying the
+    # modulo-like transform to a CPU upper bound could underestimate lengths.
+    upper_bound = window_size + block_size - 1
+    metadata.max_seq_len = min(metadata.max_seq_len, upper_bound)
+    if metadata.seq_lens_cpu_upper_bound is not None:
+        metadata.seq_lens_cpu_upper_bound = metadata.seq_lens_cpu_upper_bound.clamp(
+            max=upper_bound
+        )
+
+
 def build_attn_metadata(
     attn_groups: list[list[AttentionGroup]],
     num_reqs: int,
@@ -498,6 +525,8 @@ def build_attn_metadata(
     ubatch_idx: int = 0,
     fast_prefill: FastPrefillBatchMetadata | None = None,
     req_idx: np.ndarray | None = None,
+    draft_window_size: int | None = None,
+    draft_window_block_sizes: Sequence[int] | None = None,
 ) -> dict[str, Any]:
     seq_lens = seq_lens[:num_reqs]
     if dcp_local_seq_lens is not None:
@@ -564,6 +593,12 @@ def build_attn_metadata(
             _token_to_req_indices_cache=token_to_req_indices,
             **common_attn_metadata_extra_kwargs,
         )
+
+        if draft_window_size is not None:
+            assert draft_window_block_sizes is not None
+            apply_draft_window(
+                common_attn_metadata, draft_window_size, draft_window_block_sizes[i]
+            )
 
         for attn_group in attn_groups[i]:
             attn_metadata_builder = attn_group.get_metadata_builder(ubatch_idx)

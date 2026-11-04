@@ -87,6 +87,7 @@ def test_pcp_draft_metadata_keeps_graph_padding_in_decode(cg_mode):
         )
 
     speculator = object.__new__(_TestSpeculator)
+    speculator.speculative_config = SimpleNamespace(draft_window_size=None)
     speculator.arange_np = torch.arange(5, dtype=torch.int32).numpy()
     speculator.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(max_model_len=32)
@@ -101,6 +102,7 @@ def test_pcp_draft_metadata_keeps_graph_padding_in_decode(cg_mode):
     speculator.dcp_size = 1
     speculator.block_tables = SimpleNamespace(
         cp_size=1,
+        block_sizes=[16],
         input_block_tables=[torch.zeros(4, 1, dtype=torch.int32)],
         slot_mappings=torch.tensor([[10, 20, -1, -1]]),
     )

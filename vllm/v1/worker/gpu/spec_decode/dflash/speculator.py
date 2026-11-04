@@ -141,6 +141,13 @@ class DFlashSpeculator(DraftModelSpeculator):
         return config
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
+        if self.speculative_config.draft_window_size is not None:
+            # Captured metadata updates would restore the full block table.
+            cudagraph_mode = CUDAGraphMode.NONE
+            logger.info(
+                "Draft KV window enabled: %d tokens (block-aligned), eager draft",
+                self.speculative_config.draft_window_size,
+            )
         wants_full = cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
         supports_full = (
             self.attn_cg_support.min_cg_support.value
@@ -265,6 +272,15 @@ class DFlashSpeculator(DraftModelSpeculator):
         for groups in self.attn_groups:
             for group in groups:
                 builder = group.get_metadata_builder()
+                if self.speculative_config.draft_window_size is not None and (
+                    self.draft_model_config.use_mla
+                    or get_kv_cache_spec_sliding_window(builder.kv_cache_spec)
+                    or group.backend.get_name() != "FLASH_ATTN"
+                ):
+                    raise ValueError(
+                        "draft_window_size currently requires a full-attention "
+                        "FlashAttention draft without MLA or native SWA"
+                    )
                 if getattr(
                     builder, "aot_schedule", False
                 ) and get_kv_cache_spec_sliding_window(builder.kv_cache_spec):

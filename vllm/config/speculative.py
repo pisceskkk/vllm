@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Literal, Self, get_args
 
 from pydantic import Field, SkipValidation, field_validator, model_validator
 
+import vllm.envs as envs
 from vllm.config import LoadConfig
 from vllm.config.cache import CacheDType
 from vllm.config.kernel import MoEBackend
@@ -482,6 +483,11 @@ class SpeculativeConfig:
     warn users when they mistakenly provide the wrong argument."""
 
     # Draft model configuration
+    draft_window_size: int | None = Field(default=None, gt=0, strict=True)
+    """Optional block-aligned attention window for an independent DFlash/DSpark
+    draft on Model Runner V2. Includes the query block; the target keeps its full
+    context. Currently requires full-attention drafts and no context parallelism.
+    The draft runs eagerly when enabled. This does not reduce KV allocation."""
     quantization: me_quant.QuantizationMethods | str | None = None
     """Quantization method that was used to quantize the draft model weights.
     If `None`, we assume the model weights are not quantized. Note that it only
@@ -739,6 +745,7 @@ class SpeculativeConfig:
         # they return intermediate hidden states in addition to the final hidden state.
         uses_aux_hidden_states = self.uses_aux_hidden_states
         factors.append(uses_aux_hidden_states)
+        factors.append(self.draft_window_size)
 
         if self.draft_model_config is not None:
             factors.append(self.draft_model_config.compute_hash())
@@ -1619,6 +1626,24 @@ class SpeculativeConfig:
 
     @model_validator(mode="after")
     def _verify_args(self) -> Self:
+        if self.draft_window_size is not None:
+            if self.method not in ("dflash", "dspark"):
+                raise ValueError("draft_window_size requires DFlash or DSpark")
+            if envs.VLLM_USE_V2_MODEL_RUNNER is not True:
+                raise ValueError(
+                    "draft_window_size requires VLLM_USE_V2_MODEL_RUNNER=1"
+                )
+            if self.num_speculative_tokens is not None and (
+                self.draft_window_size < self.num_speculative_tokens + 1
+            ):
+                raise ValueError("draft_window_size must cover the entire query block")
+            if self.target_parallel_config is not None and (
+                self.target_parallel_config.prefill_context_parallel_size != 1
+                or self.target_parallel_config.decode_context_parallel_size != 1
+            ):
+                raise ValueError(
+                    "draft_window_size does not support context parallelism"
+                )
         if self.tensor_parallel_size is not None:
             raise ValueError(
                 "'tensor_parallel_size' is not a valid argument in the "

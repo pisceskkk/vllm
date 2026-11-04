@@ -8,11 +8,62 @@ import pytest
 import torch
 
 from vllm.config import ParallelConfig
+from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.worker.gpu import model_runner
+from vllm.v1.worker.gpu.attn_utils import apply_draft_window
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import _get_dspark_parallel_config
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+
+
+@pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.parametrize("window_size", [8, 1000, 1024])
+def test_draft_window_reads_recent_blocks_without_changing_target(
+    block_size, window_size
+):
+    """Keep absolute writes/RoPE and valid CPU bounds across block boundaries."""
+    values = [0, 8, window_size, window_size + block_size - 1, 32776]
+    lengths = torch.tensor(values, dtype=torch.int32)
+    bounds = lengths + 7  # Async verification can overestimate accepted tokens.
+    cols = (max(values) + block_size - 1) // block_size
+    table = torch.arange(len(values) * cols, dtype=torch.int32).reshape(-1, cols)
+    table = table.flip(1)  # Physical block order is independent of position.
+    query_starts = torch.arange(len(values) + 1, dtype=torch.int32) * 8
+    slots = torch.arange(len(values) * 8, dtype=torch.int64) + 1234
+    positions = slots + 50
+    original_table = table.clone()
+    metadata = CommonAttentionMetadata(
+        query_start_loc=query_starts,
+        query_start_loc_cpu=query_starts,
+        seq_lens=lengths,
+        seq_lens_cpu_upper_bound=bounds,
+        num_reqs=len(values),
+        num_actual_tokens=slots.numel(),
+        max_query_len=8,
+        max_seq_len=max(values) + 7,
+        block_table_tensor=table,
+        slot_mapping=slots,
+        positions=positions,
+        causal=False,
+    )
+    apply_draft_window(metadata, window_size, block_size)
+    assert metadata.seq_lens_cpu_upper_bound is not None
+    for row, length in enumerate(values):
+        first = max(0, length - window_size) // block_size
+        expected_length = length - first * block_size
+        needed = (expected_length + block_size - 1) // block_size
+        assert metadata.seq_lens[row] == expected_length
+        torch.testing.assert_close(
+            metadata.block_table_tensor[row, :needed],
+            table[row, first : first + needed],
+        )
+        assert metadata.seq_lens_cpu_upper_bound[row] >= expected_length
+        assert metadata.max_seq_len >= expected_length
+    torch.testing.assert_close(table, original_table)
+    assert lengths.tolist() == values
+    assert metadata.positions is positions
+    assert metadata.slot_mapping is slots
 
 
 @dataclass

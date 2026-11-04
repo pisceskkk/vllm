@@ -300,6 +300,30 @@ can occur due to following factors:
 
 For mitigation strategies, please refer to the FAQ entry *Can the output of a prompt vary across runs in vLLM?* in the [FAQs](../../usage/faq.md).
 
+## Draft KV window (Model Runner V2)
+
+An independent DFlash or DSpark draft trained on short sequences can lose
+acceptance at long context lengths. Set `draft_window_size` in
+`--speculative-config` to restrict its KV reads:
+
+```bash
+VLLM_USE_V2_MODEL_RUNNER=1 vllm serve /path/to/target \
+    --speculative-config '{"method":"dspark","model":"/path/to/draft","num_speculative_tokens":7,"draft_window_size":1024}'
+```
+
+The window includes the draft query block. Its start is rounded down to a KV
+block boundary, so at most `block_size - 1` extra tokens remain visible. Absolute
+RoPE positions and KV write slots are preserved, and the target still verifies
+against its full context. This limits reads rather than reducing KV allocation.
+Omit the option to preserve the default full-context behavior.
+
+This initial implementation requires Model Runner V2, a full-attention
+FlashAttention draft, and PCP/DCP sizes of one. It runs the draft eagerly even
+when target CUDA graphs are enabled. MLA and native sliding-window drafts are
+not supported. The positive integer window must cover the entire query block
+(`num_speculative_tokens + 1`). MTP is rejected because it can share target
+layers. Measure acceptance on your workload before enabling this option.
+
 ## Known Feature Incompatibility
 
 1. Pipeline parallelism is not composable with speculative decoding as of `vllm<=0.15.0`
