@@ -56,6 +56,17 @@ for output in outputs:
     print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
 ```
 
+## Decode context parallelism
+
+With the V2 model runner, EAGLE3 drafts using GQA run with an effective decode
+context parallel (DCP) size of 1, even when the target uses
+`decode_context_parallel_size > 1`. Their KV cache is replicated across DCP
+ranks (`dcp_sharded=False`), while the target retains its configured DCP size.
+The draft still uses tensor parallelism. This allows the draft and target to
+have different KV-head counts without imposing the target's DCP head-sharding
+constraints on the draft. Replication increases the draft's per-rank KV memory
+compared with sharding it across DCP ranks.
+
 ## Pre-Trained Eagle Draft Models
 
 A variety of EAGLE draft models are available on the Hugging Face hub:

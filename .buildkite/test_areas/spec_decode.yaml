@@ -2,6 +2,19 @@ group: Spec Decode
 depends_on:
   - image-build
 steps:
+- label: ":nvidia: (H100) Eagle3 GQA replicated DCP"
+  key: eagle3-replicated-kv
+  device: h100
+  num_devices: 8
+  timeout_in_minutes: 40
+  source_file_dependencies:
+    - vllm/v1/worker/gpu/
+    - vllm/v1/attention/
+    - vllm/config/
+    - tests/v1/e2e/spec_decode/eagle/test_eagle_correctness.py
+  commands:
+    - pytest -v -s v1/e2e/spec_decode/eagle/test_eagle_correctness.py -k test_eagle3_gqa_replicated_dcp
+
 - label: ":nvidia: (H200 MIG 35GB) V1 Spec Decode"
   device: h200_35gb
   key: v1-spec-decode

@@ -7,7 +7,9 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from transformers import LlamaConfig
 
+from vllm.config import ModelConfig, ParallelConfig, SpeculativeConfig, VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.model_executor.models import supports_multimodal_embeddings
 from vllm.model_executor.models.exaone4_5_mtp import Exaone4_5_MTP
@@ -24,6 +26,7 @@ from vllm.v1.kv_cache_interface import MLAAttentionSpec
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
 from vllm.v1.worker.gpu.spec_decode import speculator as base_spec_module
+from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
 from vllm.v1.worker.gpu.spec_decode.multi_module_mtp.speculator import (
     MultiModuleMTPSpeculator,
 )
@@ -33,6 +36,49 @@ from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import (
     TargetDependentARSpeculator,
 )
 from vllm.v1.worker.utils import AttentionGroup
+
+
+@pytest.mark.parametrize("dcp_size", [1, 4])
+def test_eagle3_gqa_draft_replicates_kv_without_changing_target(tmp_path, dcp_size):
+    """A GQA draft may have more KV heads than the DCP target supports."""
+    target_path, draft_path = tmp_path / "target", tmp_path / "draft"
+    for path, kv_heads, architecture in (
+        (target_path, 1, "LlamaForCausalLM"),
+        (draft_path, 8, "LlamaForCausalLMEagle3"),
+    ):
+        LlamaConfig(
+            architectures=[architecture],
+            hidden_size=128,
+            intermediate_size=256,
+            num_hidden_layers=4,
+            num_attention_heads=16,
+            num_key_value_heads=kv_heads,
+            vocab_size=128,
+            max_position_embeddings=128,
+        ).save_pretrained(path)
+    model_config = ModelConfig(model=str(target_path), max_model_len=128)
+    parallel_config = ParallelConfig(
+        tensor_parallel_size=4,
+        decode_context_parallel_size=dcp_size,
+        distributed_executor_backend="mp",
+    )
+    config = VllmConfig(
+        model_config=model_config,
+        parallel_config=parallel_config,
+    )
+    config.speculative_config = SpeculativeConfig(
+        model=str(draft_path),
+        method="eagle3",
+        num_speculative_tokens=3,
+        target_model_config=model_config,
+        target_parallel_config=parallel_config,
+    )
+    draft = EagleSpeculator(config, torch.device("cpu"))
+    assert draft.dcp_size == 1
+    assert draft.vllm_config.parallel_config.decode_context_parallel_size == 1
+    assert config.parallel_config.decode_context_parallel_size == dcp_size
+    assert draft.vllm_config.parallel_config.tensor_parallel_size == 4
+    assert draft.vllm_config.compilation_config is config.compilation_config
 
 
 class _TestSpeculator(TargetDependentARSpeculator):
