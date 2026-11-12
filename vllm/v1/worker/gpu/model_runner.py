@@ -628,7 +628,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # A draft running at DCP=1 under a DCP target keeps a replicated cache.
         if (
             isinstance(self.speculator, DraftModelSpeculator)
-            and self.speculator.dcp_size == 1
+            and not self.speculator.dcp_sharded
             and self.dcp_size > 1
         ):
             for name in self.speculator.draft_attn_layer_names & kv_cache_spec.keys():

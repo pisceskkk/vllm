@@ -62,20 +62,24 @@ def test_eagle3_gqa_draft_replicates_kv_without_changing_target(tmp_path, dcp_si
         decode_context_parallel_size=dcp_size,
         distributed_executor_backend="mp",
     )
-    config = VllmConfig(
-        model_config=model_config,
-        parallel_config=parallel_config,
-    )
-    config.speculative_config = SpeculativeConfig(
+    speculative_config = SpeculativeConfig(
         model=str(draft_path),
         method="eagle3",
         num_speculative_tokens=3,
         target_model_config=model_config,
         target_parallel_config=parallel_config,
     )
+    config = VllmConfig(
+        model_config=model_config,
+        parallel_config=parallel_config,
+        speculative_config=speculative_config,
+    )
     draft = EagleSpeculator(config, torch.device("cpu"))
     assert draft.dcp_size == 1
-    assert draft.vllm_config.parallel_config.decode_context_parallel_size == 1
+    assert not draft.dcp_sharded
+    assert draft.vllm_config is config
+    assert draft.vllm_config.parallel_config is parallel_config
+    assert draft.vllm_config.parallel_config.decode_context_parallel_size == dcp_size
     assert config.parallel_config.decode_context_parallel_size == dcp_size
     assert draft.vllm_config.parallel_config.tensor_parallel_size == 4
     assert draft.vllm_config.compilation_config is config.compilation_config

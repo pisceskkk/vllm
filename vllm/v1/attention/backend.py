@@ -893,6 +893,16 @@ class AttentionImplBase(ABC, Generic[T]):
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         pass
 
+    def set_kv_cache_spec(self, kv_cache_spec: "KVCacheSpec") -> None:
+        """Apply the resolved per-layer KV layout before attention execution."""
+        self.dcp_sharded = kv_cache_spec.dcp_sharded
+        if not kv_cache_spec.dcp_sharded:
+            self.dcp_world_size = 1
+            self.dcp_rank = 0
+            self.total_cp_world_size = 1
+            self.total_cp_rank = 0
+            self.need_to_return_lse_for_decode = False
+
     def get_impl_variants(self) -> tuple["AttentionImplBase", ...]:
         return (self,)
 

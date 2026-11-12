@@ -20,6 +20,11 @@ from .utils import _run_eagle_correctness
 @pytest.mark.parametrize("enforce_eager", [True, False])
 def test_eagle3_gqa_replicated_dcp(monkeypatch, vllm_runner, enforce_eager):
     """Sharded target KV and replicated draft KV must coexist during generation."""
+
+    def draft_dcp_config(worker):
+        config = worker.model_runner.speculator.vllm_config
+        return config.parallel_config.decode_context_parallel_size
+
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
     prompts = [
@@ -44,6 +49,11 @@ def test_eagle3_gqa_replicated_dcp(monkeypatch, vllm_runner, enforce_eager):
                 "num_speculative_tokens": 3,
             },
         ) as runner:
+            for draft_dcp in runner.llm.collective_rpc(
+                draft_dcp_config,
+                timeout=30,
+            ):
+                assert draft_dcp == dcp_size
             if dcp_size > 1:
                 for flags in runner.llm.collective_rpc(
                     lambda worker: [

@@ -151,7 +151,11 @@ class DraftModelSpeculator(BaseSpeculator):
         # DP configuration
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
-        self.dcp_size = vllm_config.parallel_config.decode_context_parallel_size
+        self.dcp_size = (
+            vllm_config.parallel_config.decode_context_parallel_size
+            if self.dcp_sharded
+            else 1
+        )
         if vllm_config.parallel_config.use_ubatching:
             # A microbatched target forward builds only per-microbatch metadata.
             self.can_reuse_target_attn_metadata = False
@@ -214,6 +218,11 @@ class DraftModelSpeculator(BaseSpeculator):
         # Whether every draft attention builder can refresh its decode metadata
         # in place, so the refresh can be recorded in the draft CUDA graph.
         self.supports_decode_metadata_update = False
+
+    @property
+    def dcp_sharded(self) -> bool:
+        """Whether the draft KV cache is partitioned across DCP ranks."""
+        return self.vllm_config.parallel_config.decode_context_parallel_size > 1
 
     @property
     def max_model_len(self) -> int:
@@ -703,7 +712,7 @@ class DraftModelSpeculator(BaseSpeculator):
     def _update_draft_decode_metadata(
         self, attn_metadata: dict[str, Any], num_reqs: int
     ) -> None:
-        if self.block_tables.cp_size > 1:
+        if self.dcp_size > 1:
             prepare_dcp_local_seq_lens(
                 self.input_buffers.dcp_local_seq_lens,
                 self.input_buffers.seq_lens,

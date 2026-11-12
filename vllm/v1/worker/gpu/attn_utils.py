@@ -20,6 +20,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
+    AttentionImplBase,
     CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.utils import create_fast_prefill_custom_backend
@@ -248,6 +249,11 @@ def init_attn_backend(
             layer_kv_cache_spec: KVCacheSpec = kv_cache_group_spec.kv_cache_spec
             if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
                 layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
+
+            impl = getattr(attn_layers[layer_name], "impl", None)
+            if isinstance(impl, AttentionImplBase):
+                for variant in impl.get_impl_variants():
+                    variant.set_kv_cache_spec(layer_kv_cache_spec)
 
             # Split on per-rank num_heads_q so layers with different Q-head
             # counts (e.g. a spec-decode draft head and its target) get separate
