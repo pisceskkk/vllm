@@ -19,21 +19,29 @@ Both approaches are under active development.
 ### DeepSeek-V4.1 multimodal inputs on NVIDIA GPUs
 
 DeepSeek-V4.1 checkpoints with a vision tower support image and text inputs
-with eager prefill context parallelism. For example:
+with eager prefill context parallelism. The following H20 configuration uses
+NCCL reductions with TP=4 and PCP=2:
 
 ```bash
+VLLM_ALLREDUCE_USE_FLASHINFER=0 \
+VLLM_ALLREDUCE_USE_SYMM_MEM=0 \
+VLLM_USE_NCCL_SYMM_MEM=0 \
 vllm serve /path/to/DeepSeek-V4.1-Flash \
-  --tensor-parallel-size 2 \
+  --tensor-parallel-size 4 \
   --prefill-context-parallel-size 2 \
+  --disable-custom-all-reduce \
   --attention-backend FLASHMLA_SPARSE_DSV41 \
   --moe-backend marlin \
   --engram-config '{"cpu_offload":true}' \
   --kv-cache-dtype fp8_ds_mla --block-size 64 \
+  --gpu-memory-utilization 0.9 \
+  --max-model-len 16384 --max-num-batched-tokens 1024 --max-num-seqs 8 \
+  --limit-mm-per-prompt '{"image":5}' --mm-encoder-tp-mode data \
   --enable-chunked-prefill --no-enable-prefix-caching \
-  --no-swa-bounded-replay --enforce-eager
+  --no-swa-bounded-replay --no-async-scheduling --enforce-eager
 ```
 
-TP=2 with PCP=2 requires four GPUs. Image embeddings are sliced using each
+TP=4 with PCP=2 requires eight GPUs. Image embeddings are sliced using each
 PCP segment's prompt positions, while the original image token IDs remain
 available to Engram and the MoE router. V4.1 image tokens use causal attention.
 
