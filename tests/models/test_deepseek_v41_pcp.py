@@ -366,8 +366,11 @@ MM_PCP_TP_SIZE = int(os.getenv("VLLM_TEST_TP_SIZE", "2"))
     or current_platform.device_count() < 2 * MM_PCP_TP_SIZE,
     reason="Requires TP * PCP CUDA GPUs",
 )
-def test_pcp_multimodal_chunked_prefill(vllm_runner):
+def test_pcp_multimodal_chunked_prefill(vllm_runner, monkeypatch):
     """Image embeddings survive PCP splits and continued prefill with Engram."""
+    monkeypatch.setenv("VLLM_ALLREDUCE_USE_FLASHINFER", "0")
+    monkeypatch.setenv("VLLM_ALLREDUCE_USE_SYMM_MEM", "0")
+    monkeypatch.setenv("VLLM_USE_NCCL_SYMM_MEM", "0")
     stream = io.BytesIO()
     Image.new("RGB", (672, 672), "red").save(stream, format="PNG")
     image = {
@@ -414,6 +417,8 @@ def test_pcp_multimodal_chunked_prefill(vllm_runner):
         enable_prefix_caching=False,
         swa_bounded_replay=False,
         async_scheduling=False,
+        disable_custom_all_reduce=True,
+        enable_chunked_prefill=True,
         max_model_len=8192,
         max_num_batched_tokens=512,
         max_num_seqs=4,
