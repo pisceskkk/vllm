@@ -16,6 +16,27 @@ Depending on the use case, there are two possible strategies:
 
 Both approaches are under active development.
 
+### DeepSeek-V4.1 multimodal inputs on NVIDIA GPUs
+
+DeepSeek-V4.1 checkpoints with a vision tower support image and text inputs
+with eager prefill context parallelism. For example:
+
+```bash
+vllm serve /path/to/DeepSeek-V4.1-Flash \
+  --tensor-parallel-size 2 \
+  --prefill-context-parallel-size 2 \
+  --attention-backend FLASHMLA_SPARSE_DSV41 \
+  --moe-backend marlin \
+  --engram-config '{"cpu_offload":true}' \
+  --kv-cache-dtype fp8_ds_mla --block-size 64 \
+  --enable-chunked-prefill --no-enable-prefix-caching \
+  --no-swa-bounded-replay --enforce-eager
+```
+
+TP=2 with PCP=2 requires four GPUs. Image embeddings are sliced using each
+PCP segment's prompt positions, while the original image token IDs remain
+available to Engram and the MoE router. V4.1 image tokens use causal attention.
+
 ### DeepSeek-V4.1-Flash on ROCm
 
 ROCm supports eager prefill context parallelism for the text-only

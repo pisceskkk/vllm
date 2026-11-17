@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import io
 import os
 from types import MethodType, SimpleNamespace
 from unittest.mock import Mock
 
+import pybase64 as base64
 import pytest
 import torch
+from PIL import Image
 
+from vllm import SamplingParams
 from vllm.forward_context import ForwardContext, override_forward_context
 from vllm.models.deepseek_v41 import attention as attention_module
 from vllm.models.deepseek_v41.amd import model as amd_model_module
@@ -351,3 +355,83 @@ def test_rocm_pcp_attention_skips_stream_overlap_path(monkeypatch):
     ):
         assert attention(torch.arange(2), hidden_states) is hidden_states
     base_forward.assert_called_once()
+
+
+MM_PCP_TP_SIZE = int(os.getenv("VLLM_TEST_TP_SIZE", "2"))
+
+
+@pytest.mark.distributed(num_gpus=2 * MM_PCP_TP_SIZE)
+@pytest.mark.skipif(
+    not current_platform.is_cuda()
+    or current_platform.device_count() < 2 * MM_PCP_TP_SIZE,
+    reason="Requires TP * PCP CUDA GPUs",
+)
+def test_pcp_multimodal_chunked_prefill(vllm_runner):
+    """Image embeddings survive PCP splits and continued prefill with Engram."""
+    stream = io.BytesIO()
+    Image.new("RGB", (672, 672), "red").save(stream, format="PNG")
+    image = {
+        "type": "image_url",
+        "image_url": {
+            "url": "data:image/png;base64,"
+            + base64.b64encode(stream.getvalue()).decode()
+        },
+    }
+    messages = [
+        [
+            {
+                "role": "user",
+                "content": [
+                    image,
+                    {
+                        "type": "text",
+                        "text": "Name the solid color in one English word.",
+                    },
+                ],
+            }
+        ],
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Background context. " * 600},
+                    image,
+                    {
+                        "type": "text",
+                        "text": "Name the solid color in one English word.",
+                    },
+                ],
+            }
+        ],
+        [{"role": "user", "content": "What is two plus two? Answer with one number."}],
+    ]
+    model = os.getenv("MODEL_NAME", "deepseek-ai/DeepSeek-V4.1-Flash")
+    with vllm_runner(
+        model,
+        tensor_parallel_size=MM_PCP_TP_SIZE,
+        prefill_context_parallel_size=2,
+        enforce_eager=True,
+        enable_prefix_caching=False,
+        swa_bounded_replay=False,
+        async_scheduling=False,
+        max_model_len=8192,
+        max_num_batched_tokens=512,
+        max_num_seqs=4,
+        kv_cache_dtype="fp8_ds_mla",
+        block_size=64,
+        limit_mm_per_prompt={"image": 1},
+        mm_encoder_tp_mode="data",
+        engram_config={"cpu_offload": True},
+        attention_config={"backend": "FLASHMLA_SPARSE_DSV41"},
+        kernel_config={"moe_backend": "marlin"},
+    ) as runner:
+        outputs = runner.get_llm().chat(
+            messages,
+            SamplingParams(temperature=0, max_tokens=512, seed=42),
+            chat_template_kwargs={"thinking": False},
+            use_tqdm=False,
+        )
+    assert len(outputs) == 3
+    for output, answer in zip(outputs, ("red", "red", "4"), strict=True):
+        assert output.outputs[0].finish_reason == "stop"
+        assert answer in output.outputs[0].text.lower()
