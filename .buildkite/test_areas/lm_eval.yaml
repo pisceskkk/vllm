@@ -259,9 +259,12 @@ steps:
   - vllm/v1/attention/backends/mla/indexer.py
   - vllm/v1/worker/gpu/model_runner.py
   - vllm/v1/worker/gpu/pcp_manager.py
+  - tests/models/test_deepseek_v41_pcp.py
+  - vllm/models/deepseek_v41/
   autorun_on_main: true
   commands:
   - pytest -s -v evals/gsm8k/test_gsm8k_correctness.py --config-list-file=configs/models-pcp.txt
+  - pytest -v -s models/test_deepseek_v41_pcp.py::test_pcp_multimodal_chunked_prefill
   mirror:
     amd:
       label: ":amd: (MI355) LM Eval PCP"
