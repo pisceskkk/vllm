@@ -10,6 +10,7 @@ steps:
   optional: true
   source_file_dependencies:
     - vllm/config/speculative.py
+    - vllm/models/deepseek_v41/nvidia/dspark.py
     - vllm/v1/worker/gpu/spec_decode/dspark/
     - vllm/v1/attention/backends/mla/sparse_swa.py
     - tests/v1/e2e/spec_decode/acceptance_rates/dspark/test_dspark.py

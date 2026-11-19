@@ -32,7 +32,7 @@ than one, DCP=1 and DP=1, with FlashMLA sparse attention.
 For example, add these options to a DeepSeek-V4.1 serving command:
 
 ```bash
---prefill-context-parallel-size 2 --decode-context-parallel-size 1 \
+--language-model-only --prefill-context-parallel-size 2 --decode-context-parallel-size 1 \
 --enforce-eager --attention-backend FLASHMLA_SPARSE_DSV41 \
 --speculative-config '{"method":"dspark","num_speculative_tokens":5,"dspark_pcp":true}'
 ```

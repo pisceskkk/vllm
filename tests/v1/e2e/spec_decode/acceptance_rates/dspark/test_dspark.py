@@ -24,6 +24,7 @@ def test_dspark_pcp_generates(vllm_runner, monkeypatch):
     from vllm import SamplingParams
 
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     model = os.getenv("DSPARK_PCP_MODEL", "deepseek-ai/DeepSeek-V4.1-Flash")
     with vllm_runner(
         model,
@@ -34,10 +35,12 @@ def test_dspark_pcp_generates(vllm_runner, monkeypatch):
         enable_expert_parallel=True,
         disable_custom_all_reduce=True,
         enable_prefix_caching=False,
+        enable_chunked_prefill=True,
         async_scheduling=False,
         max_model_len=4096,
         max_num_batched_tokens=512,
         max_num_seqs=4,
+        gpu_memory_utilization=0.9,
         kv_cache_dtype="fp8_ds_mla",
         block_size=64,
         engram_config={"cpu_offload": True},
