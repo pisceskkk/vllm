@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
+import os
 from dataclasses import dataclass
 
 import pytest
@@ -10,6 +12,72 @@ from vllm.config import CompilationConfig
 from vllm.platforms import current_platform
 
 from ...utils import compute_acceptance_len, compute_acceptance_rate
+
+
+@pytest.mark.distributed(num_gpus=4)
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or current_platform.device_count() < 4,
+    reason="Requires four CUDA GPUs for DeepSeek-V4.1",
+)
+def test_dspark_pcp_generates(vllm_runner, monkeypatch):
+    """Real checkpoint generation covers padded query shards and cache updates."""
+    from vllm import SamplingParams
+
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    model = os.getenv("DSPARK_PCP_MODEL", "deepseek-ai/DeepSeek-V4.1-Flash")
+    with vllm_runner(
+        model,
+        tensor_parallel_size=2,
+        prefill_context_parallel_size=2,
+        enforce_eager=True,
+        language_model_only=True,
+        enable_expert_parallel=True,
+        disable_custom_all_reduce=True,
+        enable_prefix_caching=False,
+        async_scheduling=False,
+        max_model_len=4096,
+        max_num_batched_tokens=512,
+        max_num_seqs=4,
+        kv_cache_dtype="fp8_ds_mla",
+        block_size=64,
+        engram_config={"cpu_offload": True},
+        swa_bounded_replay=False,
+        attention_config={"backend": "FLASHMLA_SPARSE_DSV41"},
+        kernel_config={"moe_backend": "marlin"},
+        speculative_config={
+            "method": "dspark",
+            "num_speculative_tokens": 5,
+            "dspark_pcp": True,
+        },
+    ) as runner:
+        outputs = runner.llm.chat(
+            [
+                [
+                    {
+                        "role": "user",
+                        "content": "What is 17 plus 25? Answer with one number.",
+                    }
+                ],
+                [
+                    {
+                        "role": "user",
+                        "content": "What is 9 times 8? Answer with one number.",
+                    }
+                ],
+            ],
+            SamplingParams(temperature=0, seed=42, max_tokens=64, logprobs=1),
+            chat_template_kwargs={"thinking": False},
+            use_tqdm=False,
+        )
+        for output, expected in zip(outputs, ("42", "72"), strict=True):
+            completion = output.outputs[0]
+            assert expected in completion.text
+            assert completion.logprobs is not None
+            assert all(
+                math.isfinite(row[token].logprob)
+                for token, row in zip(completion.token_ids, completion.logprobs)
+            )
+
 
 REGRESSION_TOLERANCE = 0.95
 

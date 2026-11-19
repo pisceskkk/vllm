@@ -2,6 +2,20 @@ group: Spec Decode
 depends_on:
   - image-build
 steps:
+- label: ":nvidia: (H200) [Nightly] DSpark PCP Query Partition"
+  key: spec-decode-dspark-pcp-nightly
+  device: h200
+  num_devices: 4
+  timeout_in_minutes: 60
+  optional: true
+  source_file_dependencies:
+    - vllm/config/speculative.py
+    - vllm/v1/worker/gpu/spec_decode/dspark/
+    - vllm/v1/attention/backends/mla/sparse_swa.py
+    - tests/v1/e2e/spec_decode/acceptance_rates/dspark/test_dspark.py
+  commands:
+    - pytest -v -s v1/e2e/spec_decode/acceptance_rates/dspark/test_dspark.py -k dspark_pcp_generates
+
 - label: ":nvidia: (H200 MIG 35GB) V1 Spec Decode"
   device: h200_35gb
   key: v1-spec-decode

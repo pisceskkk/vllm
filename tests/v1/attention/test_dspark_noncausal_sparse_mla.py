@@ -72,6 +72,68 @@ _DSPARK_CONFIGS = {
 }
 
 
+@pytest.mark.parametrize("pcp_size", [2, 4, 8])
+@pytest.mark.parametrize("num_reqs", [1, 3])
+def test_pcp_dspark_shards_keep_full_block_window(pcp_size, num_reqs):
+    """A short last shard must read the same context and future KV as rank 0."""
+    from vllm.v1.attention.backends.mla.sparse_swa import (
+        _COMPUTE_DSPARK_NONCAUSAL_SWA_INDICES_KERNEL,
+    )
+
+    device = torch.device("cuda")
+    block_width, window, block_size, index_width = 5, 128, 64, 256
+    local_width = cdiv(block_width, pcp_size)
+    count = num_reqs * local_width
+    seq_lens = torch.tensor(
+        [200 + i * 7 for i in range(num_reqs)], dtype=torch.int32, device=device
+    )
+    table = (
+        torch.arange(num_reqs * 8, dtype=torch.int32, device=device).view(num_reqs, 8)
+        + 1
+    )
+    qsl = torch.arange(num_reqs + 1, dtype=torch.int32, device=device) * local_width
+    req_ids = torch.arange(
+        num_reqs, dtype=torch.int32, device=device
+    ).repeat_interleave(local_width)
+    for rank in range(pcp_size):
+        valid = (
+            torch.arange(local_width, device=device) + rank * local_width < block_width
+        ).repeat(num_reqs)
+        indices = torch.full(
+            (count, 1, index_width), -7, dtype=torch.int32, device=device
+        )
+        lens = torch.full((count,), -7, dtype=torch.int32, device=device)
+        _COMPUTE_DSPARK_NONCAUSAL_SWA_INDICES_KERNEL(
+            indices,
+            lens,
+            window,
+            index_width,
+            qsl,
+            seq_lens,
+            req_ids,
+            valid,
+            table,
+            block_size,
+            num_tokens=count,
+            token_offset=0,
+            query_block_size=block_width,
+        )
+        for row in range(count):
+            expected = torch.full((index_width,), -1, dtype=torch.int32, device=device)
+            length = 0
+            if valid[row]:
+                req = row // local_width
+                end = int(seq_lens[req])
+                positions = torch.arange(end - block_width - window, end, device=device)
+                length = len(positions)
+                expected[:length] = (
+                    table[req, positions // block_size] * block_size
+                    + positions % block_size
+                ).int()
+            torch.testing.assert_close(indices[row, 0], expected, rtol=0, atol=0)
+            assert int(lens[row]) == length
+
+
 def _build_dspark_noncausal_indices(
     seq_lens: list[int],
     query_lens: list[int],

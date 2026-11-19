@@ -22,6 +22,29 @@ vLLM supports a variety of methods of speculative decoding. Model-based methods 
 - [FLy Verification (Lossy)](fly.md)
 - [Per-Request Acceptance Metrics](acceptance_metrics.md)
 
+## DSpark query partitioning with PCP
+
+For DeepSeek-V4.1 DSpark, set `dspark_pcp: true` in the speculative config
+to partition each draft query block across prefill context parallel ranks.
+This experimental CUDA path requires Model Runner V2, `--enforce-eager`, PCP greater
+than one, DCP=1 and DP=1, with FlashMLA sparse attention.
+
+For example, add these options to a DeepSeek-V4.1 serving command:
+
+```bash
+--prefill-context-parallel-size 2 --decode-context-parallel-size 1 \
+--enforce-eager --attention-backend FLASHMLA_SPARSE_DSV41 \
+--speculative-config '{"method":"dspark","num_speculative_tokens":5,"dspark_pcp":true}'
+```
+
+Each rank computes a contiguous portion of every query block. A tail that does
+not divide evenly is padded. Each layer gathers query KV before attention, so
+every query still reads the trailing context window and the complete non-causal
+draft block. Hidden states are restored to request order before Markov sampling.
+Context KV precomputation remains replicated. Omit `dspark_pcp` to use the
+replicated draft path; compare both modes on the same topology and workload
+before choosing one for performance.
+
 ## Method Selection at a Glance
 
 Use this qualitative table as a starting point for method selection. Real gains
