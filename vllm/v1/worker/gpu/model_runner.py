@@ -1706,6 +1706,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             for block_table in block_tables:
                 block_table[:, 0].copy_(state_slots)
+            if input_batch.pcp is not None and input_batch.pcp.mamba is not None:
+                context = input_batch.pcp.mamba
+                num_mamba_reqs = context.global_batch.num_reqs
+                mamba_slots = torch.arange(
+                    1, num_mamba_reqs + 1, dtype=torch.int32, device=self.device
+                )
+                for block_table in context.block_tables:
+                    block_table[:num_mamba_reqs, 0].copy_(mamba_slots)
         slot_mappings = block_table_provider.get_dummy_slot_mappings(
             input_batch.num_tokens
         )

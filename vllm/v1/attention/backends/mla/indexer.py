@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from copy import copy
 from dataclasses import dataclass
 from typing import Any
 
@@ -15,6 +16,7 @@ from vllm.model_executor.kernels.attention.dsa.fused_mqa_topk import (
     FUSED_MQA_TOPK_MAX_ROWS,
     use_fused_mqa_topk,
 )
+from vllm.model_executor.layers.mamba.pcp import MambaPCPMetadata
 from vllm.model_executor.warmup.jit_warmup import kernel_launcher, zip_inputs
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     LaunchSpec,
@@ -251,6 +253,10 @@ class DeepseekV32IndexerBackend(AttentionBackend):
 
 class Glm5NextIndexerBackend(DeepseekV32IndexerBackend):
     @staticmethod
+    def get_builder_cls():
+        return Glm5NextIndexerMetadataBuilder
+
+    @staticmethod
     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
         if kv_cache_spec is not None:
             # Worker get_kv_cache_layer_configs: runs without the current config.
@@ -264,6 +270,8 @@ class Glm5NextIndexerBackend(DeepseekV32IndexerBackend):
 
 class KpoolTailBackend(DeepseekV32IndexerBackend):
     """Storage-only backend for the GLM-5.3-Flash kpool tail cache."""
+
+    uses_global_pcp_batch = True
 
     @classmethod
     def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
@@ -729,6 +737,10 @@ class DeepseekV32IndexerMetadata:
     prefill: DeepseekV32IndexerPrefillMetadata | None = None
     positions: torch.Tensor | None = None
     block_table: torch.Tensor | None = None
+    # PCP keeps query scoring local, but pools and tail writes use the restored
+    # causal batch. The write builder owns separate graph-stable buffers.
+    write_metadata: "DeepseekV32IndexerMetadata | None" = None
+    pcp: "MambaPCPMetadata | None" = None
 
 
 @triton.jit(do_not_specialize=["num_reqs", "num_actual_tokens", "num_tokens"])
@@ -835,7 +847,8 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.slot_mapping_buffer = torch.empty(
-            vllm_config.scheduler_config.max_num_batched_tokens,
+            vllm_config.scheduler_config.max_num_batched_tokens
+            * vllm_config.parallel_config.prefill_context_parallel_size,
             dtype=torch.int64,
             device=device,
         )
@@ -1710,8 +1723,13 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
             max_decode_len = int(decode_lens_cpu.max().item())
             min_decode_len = int(decode_lens_cpu.min().item())
-            write_is_uniform = min_decode_len == max_decode_len
             next_n = 1 + self.num_speculative_tokens
+            if max_decode_len == 0:
+                # A FULL graph can pad a PCP rank with no live queries. Keep
+                # the captured query width: DeepGEMM cannot schedule a (B, 0)
+                # context-lens tensor, and replays read the whole padded row.
+                max_decode_len = max(1, min(next_n, common_attn_metadata.max_query_len))
+            write_is_uniform = min_decode_len == max_decode_len
             if self.use_adaptive_verification:
                 # Varlen FULL graphs are captured by distributing the graph's
                 # token bucket over as many one-token dummy requests as
@@ -1928,6 +1946,27 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             )
             assert schedule_metadata.shape == decode.schedule_metadata.shape
             decode.schedule_metadata.copy_(schedule_metadata)
+
+
+class Glm5NextIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
+    """Local query scoring with a separate global Kpool write layout."""
+
+    def __init__(
+        self, kv_cache_spec, layer_names, vllm_config, device, **kwargs
+    ) -> None:
+        pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
+        self.pcp_write_metadata_builder: DeepseekV32IndexerMetadataBuilder | None = None
+        if pcp_size > 1:
+            vllm_config = copy(vllm_config)
+            vllm_config.parallel_config = copy(vllm_config.parallel_config)
+            vllm_config.parallel_config.prefill_context_parallel_size = 1
+            write_config = copy(vllm_config)
+            write_config.scheduler_config = copy(vllm_config.scheduler_config)
+            write_config.scheduler_config.max_num_batched_tokens *= pcp_size
+            self.pcp_write_metadata_builder = DeepseekV32IndexerMetadataBuilder(
+                kv_cache_spec, layer_names, write_config, device, **kwargs
+            )
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device, **kwargs)
 
 
 def build_prefill_chunk_metadata(

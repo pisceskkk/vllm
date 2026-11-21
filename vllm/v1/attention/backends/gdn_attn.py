@@ -18,6 +18,7 @@ from vllm.model_executor.layers.mamba.checkpoint import (
     MambaPrefillCheckpointBuilder,
     MambaPrefillCheckpointMetadata,
 )
+from vllm.model_executor.layers.mamba.pcp import MambaPCPMetadata
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -103,6 +104,8 @@ class GDNAttentionMetadata:
     num_spec_decodes: int
     num_spec_decode_tokens: int
     num_actual_tokens: int
+
+    pcp: MambaPCPMetadata | None = None
 
     checkpoint: MambaPrefillCheckpointMetadata | None = None
     flashinfer_checkpoint_plan: GDNFlashInferCheckpointPlan | None = None
@@ -217,12 +220,15 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             self.mamba_aligned_state_indices: torch.Tensor | None = None
 
         self.decode_cudagraph_max_bs: int = (
-            self.vllm_config.scheduler_config.max_num_seqs * (self.num_spec + 1)
+            self.vllm_config.scheduler_config.max_num_seqs
+            * (self.num_spec + 1)
+            * vllm_config.parallel_config.prefill_context_parallel_size
         )
         if self.compilation_config.max_cudagraph_capture_size is not None:
             self.decode_cudagraph_max_bs = min(
                 self.decode_cudagraph_max_bs,
-                self.compilation_config.max_cudagraph_capture_size,
+                self.compilation_config.max_cudagraph_capture_size
+                * vllm_config.parallel_config.prefill_context_parallel_size,
             )
 
         self.spec_state_indices_tensor: torch.Tensor = torch.empty(

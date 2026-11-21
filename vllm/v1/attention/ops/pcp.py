@@ -76,15 +76,16 @@ def maybe_gather_mla_latent_cache_inputs(
     if not use_pcp or num_decode_tokens is None:
         return kv_c_normed, k_pe, slot_mapping
     assert slot_mapping is not None
-    num_tokens = kv_c_normed.shape[0]
-    k_pe_flat = k_pe.reshape(num_tokens, -1)
+    k_pe_flat = k_pe.flatten(start_dim=1)
     (cache_kv_c, cache_k_pe_flat), cache_slot_mapping = _gather_prefill_cache_inputs(
         (kv_c_normed, k_pe_flat),
         slot_mapping,
         num_decode_tokens,
         pcp_shard_decode_requests,
     )
-    cache_k_pe = cache_k_pe_flat.view(-1, *k_pe.shape[1:])
+    # GLM MLA has no separate positional key channels. With a zero-width
+    # trailing dimension, the token count cannot be inferred from numel().
+    cache_k_pe = cache_k_pe_flat.view(cache_kv_c.shape[0], *k_pe.shape[1:])
     return cache_kv_c, cache_k_pe, cache_slot_mapping
 
 
