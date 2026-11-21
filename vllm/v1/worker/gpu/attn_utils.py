@@ -550,7 +550,10 @@ def build_attn_metadata(
             slot_mapping=slot_mapping,
             causal=group_causal,
             dcp_local_seq_lens=dcp_local_seq_lens,
-            dcp_local_seq_lens_cpu_upper_bound=dcp_local_seq_lens_cpu_upper_bound,
+            dcp_local_seq_lens_cpu_upper_bound=common_attn_metadata_extra_kwargs.pop(
+                "dcp_local_seq_lens_cpu_upper_bound",
+                dcp_local_seq_lens_cpu_upper_bound,
+            ),
             positions=positions,
             is_prefilling=group_is_prefilling,
             mm_req_doc_ranges=mm_req_doc_ranges,

@@ -86,6 +86,7 @@ def test_mamba_pcp_restores_causal_tokens_without_duplicate_state_rows(
         num_draft_tokens_per_req=np.array([2, *([-1] * len(prefill_lengths))]),
     )
     local_batches = []
+    contexts = []
     for rank in range(2):
         tables = BlockTables(
             [16], 8, 64, [8], device, slot_mapping_enabled=[False], dcp_sharded=[False]
@@ -108,10 +109,10 @@ def test_mamba_pcp_restores_causal_tokens_without_duplicate_state_rows(
                 ),
             )
         )
+        assert manager.batch_metadata is not None
+        contexts.append(manager.batch_metadata.mamba)
     gathered = torch.cat([local.input_ids for local in local_batches])
-    for local in local_batches:
-        assert local.pcp is not None
-        context = local.pcp.mamba
+    for local, context in zip(local_batches, contexts):
         assert context is not None
         global_batch = context.global_batch
         mapping = context.token_mapping
@@ -183,9 +184,9 @@ def test_mamba_pcp_capture_stages_global_decode_at_max_request_capacity(
         has_mamba=True,
     )
     dummy = InputBatch.make_dummy(4, 4, InputBuffers(4, 16, device), max_query_len=1)
-    captured = manager.prepare_inputs_for_capture_or_profile(dummy)
-    assert captured.pcp is not None
-    context = captured.pcp.mamba
+    manager.prepare_inputs_for_capture_or_profile(dummy)
+    assert manager.batch_metadata is not None
+    context = manager.batch_metadata.mamba
     assert context is not None
     assert context.global_batch.num_reqs == 4
     assert context.global_batch.max_query_len == 1
@@ -202,9 +203,9 @@ def test_mamba_pcp_capture_stages_global_decode_at_max_request_capacity(
         getattr(context.token_mapping, name).data_ptr()
         for name in ("restore_indices", "restore_mask", "local_indices", "local_mask")
     ]
-    replay_batch = manager.prepare_inputs_for_capture_or_profile(dummy)
-    assert replay_batch.pcp is not None
-    replay = replay_batch.pcp.mamba
+    manager.prepare_inputs_for_capture_or_profile(dummy)
+    assert manager.batch_metadata is not None
+    replay = manager.batch_metadata.mamba
     assert replay is not None
     assert pointers == [
         getattr(replay.token_mapping, name).data_ptr()
@@ -946,13 +947,13 @@ def test_partition_defers_dcp_metadata_to_post_partition_batch():
 
     assert local_batch.dcp_local_seq_lens is None
     assert local_batch.seq_lens.tolist() == [17, 25, 0, 0]
-    assert local_batch.pcp is not None
-    assert local_batch.pcp.dcp_local_seq_lens_cpu_upper_bound is not None
+    assert manager.batch_metadata is not None
+    assert manager.batch_metadata.dcp_local_seq_lens_cpu_upper_bound is not None
     expected_dcp_upper_bound = get_dcp_local_seq_lens(
         torch.tensor([17, 25], dtype=torch.int32), 2, 0, 1
     )
     assert torch.equal(
-        local_batch.pcp.dcp_local_seq_lens_cpu_upper_bound,
+        manager.batch_metadata.dcp_local_seq_lens_cpu_upper_bound,
         torch.cat([expected_dcp_upper_bound, torch.zeros(2, dtype=torch.int32)]),
     )
 

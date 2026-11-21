@@ -14,6 +14,7 @@ steps:
     - vllm/models/glm5next/
     - vllm/model_executor/layers/linear.py
     - vllm/model_executor/layers/mamba/pcp.py
+    - vllm/v1/attention/backend.py
     - vllm/v1/attention/backends/gdn_attn.py
     - vllm/v1/attention/backends/mla/indexer.py
     - vllm/v1/attention/ops/pcp.py

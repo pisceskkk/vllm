@@ -10,6 +10,26 @@ from tests.models.utils import check_logprobs_close
 from tests.utils import create_new_process_for_each_test
 
 
+def _indexer_pcp_sizes(worker):
+    from vllm.v1.attention.backends.mla.indexer import Glm5NextIndexerMetadataBuilder
+
+    runner = worker.model_runner
+    groups = list(runner.attn_groups)
+    if runner.speculator is not None:
+        groups += list(runner.speculator.attn_groups)
+    sizes = []
+    for row in groups:
+        for group in row:
+            builder = group.get_metadata_builder()
+            if isinstance(builder, Glm5NextIndexerMetadataBuilder):
+                for item in (builder, builder.pcp_write_metadata_builder):
+                    if item is not None:
+                        sizes.append(
+                            item.vllm_config.parallel_config.prefill_context_parallel_size
+                        )
+    return sizes
+
+
 @pytest.mark.distributed(num_gpus=8)
 @pytest.mark.parametrize(
     "graph_mode", ["NONE", "PIECEWISE", "FULL_DECODE_ONLY", "FULL_AND_PIECEWISE"]
@@ -70,6 +90,8 @@ def test_glm5next_pcp_matches_tp(vllm_runner, monkeypatch, graph_mode, num_spec)
         speculative_config=speculative_config,
         **options,
     ) as pcp:
+        for sizes in pcp.llm.collective_rpc(_indexer_pcp_sizes):
+            assert sizes and all(size == 2 for size in sizes)
         for reference in references:
             actual = pcp.generate_greedy_logprobs(prompts, 32, 5)
             check_logprobs_close(

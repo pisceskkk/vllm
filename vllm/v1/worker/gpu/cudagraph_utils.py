@@ -6,8 +6,9 @@ from collections import defaultdict
 from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
+from functools import partial
 from itertools import groupby, product
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, cast
 
 import torch
 import torch.nn as nn
@@ -54,12 +55,16 @@ from vllm.v1.worker.gpu.input_batch import (
     InputBuffers,
     set_dummy_context,
 )
-from vllm.v1.worker.gpu.model_states.interface import ModelState
+from vllm.v1.worker.gpu.model_states.interface import (
+    ModelSpecificAttnMetadata,
+    ModelState,
+)
 from vllm.v1.worker.ubatch_utils import check_ubatch_thresholds, get_num_ubatches
 from vllm.v1.worker.utils import AttentionGroup, clear_layer_kv_caches
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+    from vllm.v1.worker.gpu.model_states.default import DefaultModelState
     from vllm.v1.worker.gpu.pcp_manager import PCPManager
     from vllm.v1.worker.gpu.ubatch_utils import UBatchRunner
 
@@ -910,6 +915,7 @@ def prepare_inputs_to_capture(
     max_query_len: int | None = None,
     pcp_manager: "PCPManager | None" = None,
     slot_mappings_buffer: torch.Tensor | None = None,
+    model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
 ) -> AttentionState:
     if full_cudagraph and max_query_len is None:
         # Mixed graphs can replay a single prefill spanning the entire batch,
@@ -976,7 +982,15 @@ def prepare_inputs_to_capture(
     # In summary: We always generate attention metadata for both FULL and PIECEWISE
     # CUDA graphs, setting for_capture=True for FULL graphs, and for_capture=False
     # for PIECEWISE graphs, to ensure correct execution and capture.
-    attn_metadata = model_state.prepare_attn(
+    prepare_metadata = model_state.prepare_attn
+    if pcp_manager is not None:
+        prepare_metadata = partial(pcp_manager.build_attn_metadata, model_state)
+    elif model_specific_attn_metadata is not None:
+        prepare_metadata = partial(
+            cast("DefaultModelState", model_state).prepare_attn,
+            model_specific_attn_metadata=model_specific_attn_metadata,
+        )
+    attn_metadata = prepare_metadata(
         input_batch,
         CUDAGraphMode.NONE,
         input_block_tables,

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -13,11 +13,18 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.pcp import MambaPCPMetadata
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID, get_dcp_local_seq_lens
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.input_batch import (
     InputBatch,
     InputBuffers,
 )
+from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+from vllm.v1.worker.gpu.model_states.interface import (
+    ModelSpecificAttnMetadata,
+    ModelState,
+)
+from vllm.v1.worker.utils import AttentionGroup
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
@@ -35,7 +42,7 @@ class PCPMambaContext:
 
 
 @dataclass(frozen=True, slots=True)
-class PCPBatchMetadata:
+class PCPBatchMetadata(ModelSpecificAttnMetadata):
     """Per-step metadata of a PCP rank-local batch."""
 
     # Unpadded token count before PCP partitioning. Under adaptive verification,
@@ -47,6 +54,16 @@ class PCPBatchMetadata:
     # [num_reqs_after_padding], set only under PCP+DCP.
     dcp_local_seq_lens_cpu_upper_bound: torch.Tensor | None = None
     mamba: PCPMambaContext | None = None
+
+    def get_extra_common_attn_kwargs(
+        self, kv_cache_group_id: int, num_reqs: int
+    ) -> dict[str, Any]:
+        return {
+            "dcp_local_seq_lens_cpu_upper_bound": (
+                self.dcp_local_seq_lens_cpu_upper_bound
+            ),
+            "mamba_pcp": self.mamba.token_mapping if self.mamba is not None else None,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +109,8 @@ class PCPManager:
         self.cp_interleave = cp_interleave
         self.shard_decode_requests = shard_decode_requests
         self.has_mamba = has_mamba
+        self.batch_metadata: PCPBatchMetadata | None = None
+        self._pcp_write_groups: dict[AttentionGroup, AttentionGroup] = {}
         self._mamba_buffers = (
             InputBuffers(max_num_reqs, max_num_tokens * pcp_world_size, device)
             if has_mamba and max_num_reqs is not None and max_num_tokens is not None
@@ -721,6 +740,14 @@ class PCPManager:
                 real_dcp_local_seq_lens_cpu_upper_bound
             )
 
+        self.batch_metadata = PCPBatchMetadata(
+            global_num_tokens=global_batch.num_tokens,
+            global_query_lens_np=num_scheduled_tokens[local_to_global_batch_req_idx_np],
+            global_seq_lens_cpu_upper_bound_np=global_batch.seq_lens_cpu_upper_bound.numpy()[
+                local_to_global_batch_req_idx_np
+            ],
+            dcp_local_seq_lens_cpu_upper_bound=dcp_local_seq_lens_cpu_upper_bound,
+        )
         self._local_batch = replace(
             input_batch,
             req_ids=local_req_ids,
@@ -740,16 +767,6 @@ class PCPManager:
             seq_lens=seq_lens,
             seq_lens_cpu_upper_bound=torch.from_numpy(seq_lens_cpu_upper_bound_np),
             dcp_local_seq_lens=None,
-            pcp=PCPBatchMetadata(
-                global_num_tokens=global_batch.num_tokens,
-                global_query_lens_np=num_scheduled_tokens[
-                    local_to_global_batch_req_idx_np
-                ],
-                global_seq_lens_cpu_upper_bound_np=global_batch.seq_lens_cpu_upper_bound.numpy()[
-                    local_to_global_batch_req_idx_np
-                ],
-                dcp_local_seq_lens_cpu_upper_bound=dcp_local_seq_lens_cpu_upper_bound,
-            ),
             num_computed_tokens_np=local_start_pos_np,
             prefill_len_np=local_prefill_len_np,
             num_computed_prefill_tokens_np=local_num_computed_prefill_tokens_np,
@@ -772,10 +789,10 @@ class PCPManager:
             prompt_lens=None,
         )
         if self.has_mamba:
-            self._attach_mamba_context(self._local_batch, global_batch)
+            self._prepare_mamba_context(self._local_batch, global_batch)
         return self._local_batch
 
-    def _attach_mamba_context(
+    def _prepare_mamba_context(
         self, local_batch: InputBatch, global_batch: InputBatch, *, dummy: bool = False
     ) -> None:
         buffers = self._mamba_buffers
@@ -849,7 +866,6 @@ class PCPManager:
             seq_lens=seq_lens,
             seq_lens_cpu_upper_bound=seq_lens_cpu,
             positions=positions,
-            pcp=None,
         )
         context = PCPMambaContext(
             global_batch=global_batch,
@@ -859,20 +875,21 @@ class PCPManager:
                 restore_indices, restore_mask, local_indices, local_mask
             ),
         )
-        if local_batch.pcp is None:
-            local_batch.pcp = PCPBatchMetadata(
+        if self.batch_metadata is None:
+            self.batch_metadata = PCPBatchMetadata(
                 global_batch.num_tokens,
                 global_batch.num_scheduled_tokens,
                 global_batch.seq_lens_cpu_upper_bound.numpy(),
                 mamba=context,
             )
         else:
-            local_batch.pcp = replace(local_batch.pcp, mamba=context)
+            self.batch_metadata = replace(self.batch_metadata, mamba=context)
 
     def prepare_inputs_for_capture_or_profile(
         self, input_batch: InputBatch
     ) -> InputBatch:
         """Stage a capture or dummy batch in persistent PCP input buffers."""
+        self.batch_metadata = None
         input_buffers = self.input_buffers
         num_reqs = input_batch.num_reqs_after_padding
         num_tokens = input_batch.num_tokens_after_padding
@@ -903,7 +920,7 @@ class PCPManager:
                 self._mamba_buffers,
                 max_query_len=input_batch.max_query_len,
             )
-            self._attach_mamba_context(input_batch, global_batch, dummy=True)
+            self._prepare_mamba_context(input_batch, global_batch, dummy=True)
         return input_batch
 
     def moe_is_padding(self, is_padding: torch.Tensor) -> torch.Tensor:
@@ -939,14 +956,107 @@ class PCPManager:
             out=self._local_block_tables,
             out_ptrs=self._local_block_table_ptrs,
         )
-        if input_batch.pcp is not None and input_batch.pcp.mamba is not None:
-            global_batch = input_batch.pcp.mamba.global_batch
+        if self.batch_metadata is not None and self.batch_metadata.mamba is not None:
+            global_batch = self.batch_metadata.mamba.global_batch
             self._block_tables.gather_block_tables(
                 global_batch.idx_mapping,
                 global_batch.num_reqs_after_padding,
             )
         slot_mappings = self.prepare_slot_mappings()
         return block_tables, slot_mappings
+
+    def build_attn_metadata(
+        self,
+        model_state: ModelState,
+        input_batch: InputBatch,
+        cudagraph_mode: CUDAGraphMode,
+        block_tables: tuple[torch.Tensor, ...],
+        slot_mappings: torch.Tensor,
+        attn_groups: list[list[AttentionGroup]],
+        kv_cache_config: KVCacheConfig,
+        for_capture: bool = False,
+    ) -> dict[str, Any]:
+        assert isinstance(model_state, DefaultModelState)
+        context = self.batch_metadata.mamba if self.batch_metadata is not None else None
+        if context is None:
+            return model_state.prepare_attn(
+                input_batch,
+                cudagraph_mode,
+                block_tables,
+                slot_mappings,
+                attn_groups,
+                kv_cache_config,
+                for_capture=for_capture,
+                model_specific_attn_metadata=self.batch_metadata,
+            )
+
+        def uses_global_batch(group: AttentionGroup) -> bool:
+            return isinstance(group.kv_cache_spec, MambaSpec) or getattr(
+                group.backend, "uses_global_pcp_batch", False
+            )
+
+        recurrent_groups = [
+            [g for g in groups if uses_global_batch(g)] for groups in attn_groups
+        ]
+        attention_groups = [
+            [g for g in groups if not uses_global_batch(g)] for groups in attn_groups
+        ]
+        for global_groups, local_groups in zip(recurrent_groups, attention_groups):
+            for group in local_groups:
+                builder = group.get_metadata_builder()
+                write_builder = getattr(builder, "pcp_write_metadata_builder", None)
+                if write_builder is None:
+                    continue
+                if group not in self._pcp_write_groups:
+                    # Read and write tables must not alias: global request
+                    # rows differ from the local mirrored query segments.
+                    self._pcp_write_groups[group] = replace(
+                        group,
+                        metadata_builders=[write_builder],
+                        kernel_block_table=(
+                            None
+                            if group.kernel_block_table is None
+                            else torch.empty_like(group.kernel_block_table)
+                        ),
+                    )
+                global_groups.append(self._pcp_write_groups[group])
+        metadata = DefaultModelState.prepare_attn(
+            model_state,
+            input_batch,
+            cudagraph_mode,
+            block_tables,
+            slot_mappings,
+            attention_groups,
+            kv_cache_config,
+            for_capture=for_capture,
+            model_specific_attn_metadata=self.batch_metadata,
+        )
+        recurrent_metadata = model_state.prepare_attn(
+            context.global_batch,
+            cudagraph_mode,
+            context.block_tables,
+            context.slot_mappings[
+                :,
+                : (
+                    context.global_batch.num_tokens_after_padding
+                    if cudagraph_mode == CUDAGraphMode.FULL
+                    else context.global_batch.num_tokens
+                ),
+            ],
+            recurrent_groups,
+            kv_cache_config,
+            for_capture=for_capture,
+            model_specific_attn_metadata=self.batch_metadata,
+        )
+        for name, value in recurrent_metadata.items():
+            value.pcp = context.token_mapping
+            if name in metadata:
+                value.positions = context.global_batch.positions
+                metadata[name].write_metadata = value
+                metadata[name].pcp = context.token_mapping
+            else:
+                metadata[name] = value
+        return metadata
 
     def prepare_slot_mappings(self) -> torch.Tensor:
         assert self._block_tables is not None

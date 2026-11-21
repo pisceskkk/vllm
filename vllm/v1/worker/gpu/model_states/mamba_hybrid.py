@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -22,7 +22,7 @@ from vllm.v1.attention.backends.short_conv_attn import (
     ShortConvAttentionMetadataBuilder,
 )
 from vllm.v1.core.sched.output import NewRequestData
-from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.input_batch import InputBatch
@@ -43,13 +43,21 @@ from vllm.v1.worker.utils import AttentionGroup
 @dataclass
 class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     is_prefilling: torch.Tensor
+    extra_metadata: ModelSpecificAttnMetadata | None = None
     num_accepted_tokens: torch.Tensor | None = None
     num_decode_draft_tokens_cpu: torch.Tensor | None = None
 
     def get_extra_common_attn_kwargs(
         self, kv_cache_group_id: int, num_reqs: int
     ) -> dict[str, Any]:
-        return {"is_prefilling": self.is_prefilling[:num_reqs]}
+        kwargs = (
+            self.extra_metadata.get_extra_common_attn_kwargs(
+                kv_cache_group_id, num_reqs
+            )
+            if self.extra_metadata is not None
+            else {}
+        )
+        return {**kwargs, "is_prefilling": self.is_prefilling[:num_reqs]}
 
     def get_extra_attn_kwargs(
         self, attn_metadata_builder: Any, num_reqs: int
@@ -90,7 +98,6 @@ class MambaHybridModelState(DefaultModelState):
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
         self._replayssm_query_start_loc: torch.Tensor | None = None
-        self._pcp_write_groups: dict[AttentionGroup, AttentionGroup] = {}
         # Pre-copy prefix-cache state (V2). The migration of each request's
         # mamba state across block boundaries runs as a fused GPU kernel reusing
         # the postprocess copy machinery, so the per-step src columns and the
@@ -187,10 +194,6 @@ class MambaHybridModelState(DefaultModelState):
         """
         if not self._align_mode:
             return
-        pcp = getattr(input_batch, "pcp", None)
-        if pcp is not None and pcp.mamba is not None:
-            context = pcp.mamba
-            input_batch = context.global_batch
         num_reqs = input_batch.num_reqs
         if num_reqs == 0:
             return
@@ -244,76 +247,6 @@ class MambaHybridModelState(DefaultModelState):
         model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
     ) -> dict[str, Any]:
         assert ubatch_idx == 0, "DBO is not supported"
-        assert model_specific_attn_metadata is None
-        pcp = getattr(input_batch, "pcp", None)
-        if pcp is not None and pcp.mamba is not None:
-            context = pcp.mamba
-
-            def uses_global_batch(group: AttentionGroup) -> bool:
-                return isinstance(group.kv_cache_spec, MambaSpec) or getattr(
-                    group.backend, "uses_global_pcp_batch", False
-                )
-
-            recurrent_groups = [
-                [g for g in groups if uses_global_batch(g)] for groups in attn_groups
-            ]
-            attention_groups = [
-                [g for g in groups if not uses_global_batch(g)]
-                for groups in attn_groups
-            ]
-            for global_groups, local_groups in zip(recurrent_groups, attention_groups):
-                for group in local_groups:
-                    builder = group.get_metadata_builder()
-                    write_builder = getattr(builder, "pcp_write_metadata_builder", None)
-                    if write_builder is None:
-                        continue
-                    if group not in self._pcp_write_groups:
-                        # Read and write tables must not alias: global request
-                        # rows differ from the local mirrored query segments.
-                        self._pcp_write_groups[group] = replace(
-                            group,
-                            metadata_builders=[write_builder],
-                            kernel_block_table=(
-                                None
-                                if group.kernel_block_table is None
-                                else torch.empty_like(group.kernel_block_table)
-                            ),
-                        )
-                    global_groups.append(self._pcp_write_groups[group])
-            metadata = super().prepare_attn(
-                input_batch,
-                cudagraph_mode,
-                block_tables,
-                slot_mappings,
-                attention_groups,
-                kv_cache_config,
-                for_capture=for_capture,
-            )
-            recurrent_metadata = self.prepare_attn(
-                context.global_batch,
-                cudagraph_mode,
-                context.block_tables,
-                context.slot_mappings[
-                    :,
-                    : (
-                        context.global_batch.num_tokens_after_padding
-                        if cudagraph_mode == CUDAGraphMode.FULL
-                        else context.global_batch.num_tokens
-                    ),
-                ],
-                recurrent_groups,
-                kv_cache_config,
-                for_capture=for_capture,
-            )
-            for name, value in recurrent_metadata.items():
-                value.pcp = context.token_mapping
-                if name in metadata:
-                    value.positions = context.global_batch.positions
-                    metadata[name].write_metadata = value
-                    metadata[name].pcp = context.token_mapping
-                else:
-                    metadata[name] = value
-            return metadata
         if cudagraph_mode == CUDAGraphMode.FULL:
             num_reqs = input_batch.num_reqs_after_padding
             num_tokens = input_batch.num_tokens_after_padding
@@ -393,6 +326,7 @@ class MambaHybridModelState(DefaultModelState):
                     builder.mamba_aligned_state_indices = all_group_indices[group_idx]
 
         mamba_attn_metadata = MambaHybridAttnMetadata(
+            extra_metadata=model_specific_attn_metadata,
             is_prefilling=is_prefilling,
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,

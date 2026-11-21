@@ -568,6 +568,11 @@ class DraftModelSpeculator(BaseSpeculator):
             seq_lens_cpu_upper_bound=draft_seq_lens_cpu_upper_bound,
             positions=self.input_buffers.positions[:num_tokens],
             is_prefilling=self.draft_is_prefilling[:num_reqs_padded],
+            model_specific_attn_metadata=(
+                self.pcp_manager.batch_metadata
+                if self.pcp_manager is not None and self.pcp_manager.has_mamba
+                else None
+            ),
         )
         return attn_metadata
 

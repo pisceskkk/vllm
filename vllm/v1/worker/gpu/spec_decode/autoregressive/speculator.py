@@ -161,6 +161,11 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             progress_bar_desc="Capturing decode CUDA graphs",
             specialize_spec_tokens=self.supports_decode_metadata_update
             and self.speculative_config.uses_dynamic_speculative_decoding(),
+            model_specific_attn_metadata=(
+                self.pcp_manager.batch_metadata
+                if self.pcp_manager is not None and self.pcp_manager.has_mamba
+                else None
+            ),
         )
         self.on_multi_step_decode_end(self.max_num_reqs)
 

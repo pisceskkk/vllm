@@ -1483,6 +1483,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> DeepseekV32IndexerMetadata:
+        use_pcp = self.use_pcp and common_attn_metadata.mamba_pcp is None
         num_reqs = common_attn_metadata.num_reqs
         num_tokens = common_attn_metadata.num_actual_tokens
         query_start_loc = common_attn_metadata.query_start_loc
@@ -1496,7 +1497,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         if self.compress_ratio > 1:
             padded_num_tokens = num_tokens
             local_slot_mapping = slot_mapping
-            if self.use_pcp:
+            if use_pcp:
                 # The gathered layout holds each rank's local tokens, padded, in
                 # rank order, so this rank's segment lines up with query_start_loc.
                 padded_num_tokens = slot_mapping.shape[0] // self.pcp_world_size
@@ -1516,7 +1517,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 dcp_world_size=self.dcp_world_size,
                 cp_interleave=self.cp_kv_cache_interleave_size,
             )
-            if self.pcp_world_size > 1:
+            if use_pcp:
                 compressed_slot_mapping = get_pcp_group().all_gather(
                     self.compressed_slot_mapping_buffer[:padded_num_tokens],
                     dim=0,
@@ -1543,7 +1544,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 common_attn_metadata,
                 decode_threshold=self.decode_threshold,
                 require_uniform=not (self.use_flattening or self.supports_varlen),
-                treat_short_extends_as_decodes=not self.use_pcp,
+                treat_short_extends_as_decodes=not use_pcp,
             )
         )
 
@@ -1614,7 +1615,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
             req_idx = None
             shard_rows = None
-            if self.use_pcp and self.dcp_world_size > 1:
+            if use_pcp and self.dcp_world_size > 1:
                 # The gathered KV must be packed identically on every PCP rank:
                 # chunk by request from its DCP shard rows, which every rank
                 # holds. A dummy batch bypasses the PCP manager and has one
@@ -1957,9 +1958,6 @@ class Glm5NextIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
         pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
         self.pcp_write_metadata_builder: DeepseekV32IndexerMetadataBuilder | None = None
         if pcp_size > 1:
-            vllm_config = copy(vllm_config)
-            vllm_config.parallel_config = copy(vllm_config.parallel_config)
-            vllm_config.parallel_config.prefill_context_parallel_size = 1
             write_config = copy(vllm_config)
             write_config.scheduler_config = copy(vllm_config.scheduler_config)
             write_config.scheduler_config.max_num_batched_tokens *= pcp_size

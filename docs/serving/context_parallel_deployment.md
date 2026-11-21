@@ -34,59 +34,6 @@ This configuration requires PP=DP=DCP=1 and does not support microbatching,
 speculative decoding, KV transfer, prefix caching, MegaMoE, or the ROCm
 monokernel. TP and PCP multiply, so TP=2 with PCP=2 requires four GPUs.
 
-### GLM-5.3-Flash on NVIDIA GPUs
-
-The V2 model runner supports head-sharded KDA state with PCP for text generation.
-Each KDA layer restores the global causal token order and partitions its heads
-across TP × PCP, including its projections, convolutions and recurrent cache.
-The Kpool indexer exchanges projected K and compression gates to restore causal
-pool boundaries. Cache and tail writes use global request metadata, while Q
-scoring and top-k selection stay local to each PCP rank.
-
-For example, the following layout uses eight GPUs:
-
-```bash
-VLLM_USE_V2_MODEL_RUNNER=1 vllm serve zai-org/GLM-5.3-Flash \
-  --language-model-only \
-  --tensor-parallel-size 4 \
-  --prefill-context-parallel-size 2 \
-  --decode-context-parallel-size 1 \
-  --max-model-len 132096 \
-  --max-num-batched-tokens 4096 \
-  --max-num-seqs 32 \
-  --enable-chunked-prefill \
-  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE"}'
-```
-
-The number of KDA heads must be divisible by TP × PCP. Chunked prefill and
-aligned Mamba prefix caching use global request boundaries. Supported graph
-modes are `NONE`, `PIECEWISE`, `FULL_DECODE_ONLY` and `FULL_AND_PIECEWISE`.
-Add `--speculative-config '{"method":"mtp","num_speculative_tokens":3}'`
-to use MTP. With PCP, hybrid-model draft prefill runs eagerly; target verification
-and multi-step draft decode retain their configured graph modes.
-
-Use generation with DCP=1. This path does not support P/D disaggregation, KV
-transfer, pooling, multimodal input, or LoRA.
-
-For an equal-GPU comparison, use TP=8/PCP=1 and TP=4/PCP=2 with the same model
-revision, cache dtype, scheduler settings and request workload. Measure GSM8K
-accuracy and serving TTFT, TPOT and throughput separately; a functional generation
-test does not establish accuracy or a performance improvement.
-
-For a 128k-input comparison, reserve room for the output beyond 131072 input
-tokens and use a fixed output length. For example, against each server layout:
-
-```bash
-vllm bench serve --model zai-org/GLM-5.3-Flash \
-  --dataset-name random --input-len 131072 --output-len 128 \
-  --num-prompts 32 --max-concurrency 16 --ignore-eos --seed 0
-```
-
-Measure concurrency 1, 8 and 16 separately. Warm up with distinct requests and
-clear the prefix cache before each measured workload so earlier cases cannot
-turn long prefills into cache hits. Keep the request count and token lengths
-identical across TP and PCP.
-
 ## Decode Context Parallel
 
 Due to the auto-regressive nature of decoding, every decoding step needs to compute a small amount of query tokens w.r.t. a large number of key/value tokens stored in the paged KV cache. The core of decode context parallel is how to shard the KV cache across GPUs.

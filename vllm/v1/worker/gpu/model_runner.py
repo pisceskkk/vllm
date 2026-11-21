@@ -23,6 +23,7 @@ from collections.abc import Iterable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from copy import deepcopy
 from dataclasses import replace
+from functools import partial
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -1706,8 +1707,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             for block_table in block_tables:
                 block_table[:, 0].copy_(state_slots)
-            if input_batch.pcp is not None and input_batch.pcp.mamba is not None:
-                context = input_batch.pcp.mamba
+            pcp_metadata = (
+                self.pcp_manager.batch_metadata
+                if self.pcp_manager is not None
+                else None
+            )
+            if pcp_metadata is not None and pcp_metadata.mamba is not None:
+                context = pcp_metadata.mamba
                 num_mamba_reqs = context.global_batch.num_reqs
                 mamba_slots = torch.arange(
                     1, num_mamba_reqs + 1, dtype=torch.int32, device=self.device
@@ -1948,9 +1954,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # boundaries before the forward. Runs only on real batches, and
             # before model_state.prepare_attn gathers num_accepted_tokens so the
             # boundary reset is visible to the attention metadata.
+            pcp_metadata = (
+                self.pcp_manager.batch_metadata
+                if self.pcp_manager is not None
+                else None
+            )
+            context = pcp_metadata.mamba if pcp_metadata is not None else None
             self.model_state.preprocess_state(
-                input_batch,
-                block_tables,
+                context.global_batch if context is not None else input_batch,
+                context.block_tables if context is not None else block_tables,
                 self.kv_cache_config,
                 self.req_states.num_computed_tokens.gpu,
             )
@@ -2057,7 +2069,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     [g for g in groups if not isinstance(g.kv_cache_spec, MambaSpec)]
                     for groups in attn_groups
                 ]
-            attn_metadata = self.model_state.prepare_attn(
+            prepare_metadata = self.model_state.prepare_attn
+            if self.pcp_manager is not None:
+                prepare_metadata = partial(
+                    self.pcp_manager.build_attn_metadata, self.model_state
+                )
+            attn_metadata = prepare_metadata(
                 input_batch,
                 batch_desc.cg_mode,
                 block_tables,
