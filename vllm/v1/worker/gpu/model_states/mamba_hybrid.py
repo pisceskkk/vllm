@@ -43,13 +43,21 @@ from vllm.v1.worker.utils import AttentionGroup
 @dataclass
 class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     is_prefilling: torch.Tensor
+    extra_metadata: ModelSpecificAttnMetadata | None = None
     num_accepted_tokens: torch.Tensor | None = None
     num_decode_draft_tokens_cpu: torch.Tensor | None = None
 
     def get_extra_common_attn_kwargs(
         self, kv_cache_group_id: int, num_reqs: int
     ) -> dict[str, Any]:
-        return {"is_prefilling": self.is_prefilling[:num_reqs]}
+        kwargs = (
+            self.extra_metadata.get_extra_common_attn_kwargs(
+                kv_cache_group_id, num_reqs
+            )
+            if self.extra_metadata is not None
+            else {}
+        )
+        return {**kwargs, "is_prefilling": self.is_prefilling[:num_reqs]}
 
     def get_extra_attn_kwargs(
         self, attn_metadata_builder: Any, num_reqs: int
@@ -239,14 +247,15 @@ class MambaHybridModelState(DefaultModelState):
         model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
     ) -> dict[str, Any]:
         assert ubatch_idx == 0, "DBO is not supported"
-        assert model_specific_attn_metadata is None
         if cudagraph_mode == CUDAGraphMode.FULL:
             num_reqs = input_batch.num_reqs_after_padding
             num_tokens = input_batch.num_tokens_after_padding
         else:
             num_reqs = input_batch.num_reqs
             num_tokens = input_batch.num_tokens
-        query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
+        query_start_loc_cpu = torch.from_numpy(
+            input_batch.query_start_loc_np[: num_reqs + 1]
+        )
         # Prefer the promised bound: a capture dummy's measured max is its even
         # split, not the length the graph must replay.
         max_query_len = input_batch.max_query_len
@@ -317,6 +326,7 @@ class MambaHybridModelState(DefaultModelState):
                     builder.mamba_aligned_state_indices = all_group_indices[group_idx]
 
         mamba_attn_metadata = MambaHybridAttnMetadata(
+            extra_metadata=model_specific_attn_metadata,
             is_prefilling=is_prefilling,
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
@@ -325,7 +335,7 @@ class MambaHybridModelState(DefaultModelState):
             attn_groups=attn_groups,
             num_reqs=num_reqs,
             num_tokens=num_tokens,
-            query_start_loc_gpu=input_batch.query_start_loc,
+            query_start_loc_gpu=input_batch.query_start_loc[: num_reqs + 1],
             query_start_loc_cpu=query_start_loc_cpu,
             max_query_len=max_query_len,
             seq_lens=input_batch.seq_lens,

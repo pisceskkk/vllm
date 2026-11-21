@@ -14,7 +14,6 @@ from vllm.utils.math_utils import cdiv
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.attn_utils import FastPrefillBatchMetadata
     from vllm.v1.worker.gpu.block_table import BlockTables
-    from vllm.v1.worker.gpu.pcp_manager import PCPBatchMetadata
     from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
         AdmittedDraftCounts,
     )
@@ -118,9 +117,6 @@ class InputBatch:
     # Arms the KV-sharing fast prefill path for this step. Absent for dummy
     # (cudagraph capture) batches, which run the KV-sharing layers in full.
     fast_prefill: "FastPrefillBatchMetadata | None" = None
-
-    # Set only on a PCP rank-local batch.
-    pcp: "PCPBatchMetadata | None" = None
 
     # [num_reqs] prefilling rows that schedule one new prompt token (excluding
     # drafts) over existing context and so compute exactly like decodes.

@@ -2,24 +2,215 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import cast
 
 import numpy as np
 import pytest
 import torch
 
 from tests.v1.spec_decode.utils import fake_speculative_config
-from vllm.config import CUDAGraphMode, ParallelConfig, VllmConfig
+from vllm.config import CUDAGraphMode, ParallelConfig, SchedulerConfig, VllmConfig
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.fused_moe.router.fused_topk_router import fused_topk
+from vllm.v1.attention.backend import AttentionBackend
+from vllm.v1.attention.backends.linear_attn import LinearAttentionBackend
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID, get_dcp_local_seq_lens
 from vllm.v1.attention.ops import pcp as attention_pcp
+from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.worker.gpu import cp_utils as gpu_cp_utils
 from vllm.v1.worker.gpu import pcp_manager as pcp_manager_module
+from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers, set_dummy_context
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
 from vllm.v1.worker.gpu.spec_decode.draft_logits import DraftLogitsCache
 from vllm.v1.worker.gpu.spec_decode.dspark.config import DSparkSpeculatorConfig
+from vllm.v1.worker.utils import AttentionGroup
+
+
+@pytest.mark.parametrize("pcp_size", [1, 2, 4])
+def test_mamba_pcp_metadata_capacity_preserves_scheduler_request_limit(pcp_size):
+    config = VllmConfig(
+        parallel_config=ParallelConfig(
+            prefill_context_parallel_size=pcp_size,
+            distributed_executor_backend="mp",
+        ),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=4,
+            max_num_batched_tokens=64,
+            max_model_len=64,
+            is_encoder_decoder=False,
+        ),
+    )
+    group = AttentionGroup(
+        cast(type[AttentionBackend], LinearAttentionBackend),
+        ["linear"],
+        MambaSpec(block_size=16, shapes=((2,),), dtypes=(torch.float32,)),
+        0,
+    )
+    group.create_metadata_builders(config, torch.device("cpu"))
+    metadata_config = group.get_metadata_builder().vllm_config
+    assert metadata_config.scheduler_config.max_num_seqs == (8 if pcp_size > 1 else 4)
+    assert config.scheduler_config.max_num_seqs == 4
+    assert metadata_config.parallel_config is config.parallel_config
+
+
+@pytest.mark.parametrize("shard_decode", [False, True])
+@pytest.mark.parametrize("prefill_lengths", [[17], [1, 3, 19]])
+def test_mamba_pcp_restores_causal_tokens_without_duplicate_state_rows(
+    shard_decode, prefill_lengths
+):
+    """DualChunkSwap rows share a request, but recurrent updates must not."""
+    device = torch.device("cuda:0")
+    lengths = np.array([3, *prefill_lengths], dtype=np.int32)
+    num_reqs, num_tokens = len(lengths), int(lengths.sum())
+    buffers = InputBuffers(8, 64, device)
+    batch = InputBatch.make_dummy(num_reqs, num_tokens, buffers)
+    starts = np.concatenate(([0], lengths.cumsum())).astype(np.int32)
+    batch.query_start_loc.copy_(torch.from_numpy(starts).to(device))
+    batch.seq_lens.copy_(torch.from_numpy(lengths).to(device))
+    batch.input_ids.copy_(torch.arange(num_tokens, device=device))
+    batch.positions.copy_(
+        torch.cat([torch.arange(int(length), device=device) for length in lengths])
+    )
+    prefilling = np.arange(num_reqs) > 0
+    batch = replace(
+        batch,
+        num_scheduled_tokens=lengths,
+        query_start_loc_np=starts,
+        is_prefilling_np=prefilling,
+        has_prefill=True,
+        decode_graph_eligible=False,
+        prefill_len_np=np.where(prefilling, lengths, 0),
+        seq_lens_cpu_upper_bound=torch.from_numpy(lengths.copy()),
+        num_draft_tokens_per_req=np.array([2, *([-1] * len(prefill_lengths))]),
+    )
+    local_batches = []
+    contexts = []
+    for rank in range(2):
+        tables = BlockTables(
+            [16], 8, 64, [8], device, slot_mapping_enabled=[False], dcp_sharded=[False]
+        )
+        manager = PCPManager(
+            2,
+            rank,
+            device,
+            shard_decode,
+            max_num_reqs=8,
+            max_num_tokens=64,
+            block_tables=tables,
+            has_mamba=True,
+        )
+        local_batches.append(
+            manager.partition_batch(
+                batch,
+                BatchExecutionDescriptor(
+                    cg_mode=CUDAGraphMode.NONE, num_tokens=64, num_reqs=num_reqs
+                ),
+            )
+        )
+        assert manager.batch_metadata is not None
+        contexts.append(manager.batch_metadata.mamba)
+    gathered = torch.cat([local.input_ids for local in local_batches])
+    for local, context in zip(local_batches, contexts):
+        assert context is not None
+        global_batch = context.global_batch
+        mapping = context.token_mapping
+        restored = gathered[mapping.restore_indices][mapping.restore_mask]
+        torch.testing.assert_close(restored, batch.input_ids, rtol=0, atol=0)
+        assert global_batch.num_reqs == num_reqs
+        np.testing.assert_array_equal(global_batch.num_scheduled_tokens, lengths)
+        np.testing.assert_array_equal(
+            global_batch.num_draft_tokens_per_req, batch.num_draft_tokens_per_req
+        )
+        torch.testing.assert_close(
+            global_batch.query_start_loc[: num_reqs + 1], batch.query_start_loc
+        )
+        torch.testing.assert_close(
+            restored[mapping.local_indices][mapping.local_mask],
+            local.input_ids[: local.num_tokens],
+        )
+
+
+@pytest.mark.parametrize("query_len", [2, 4])
+def test_mamba_pcp_empty_rank_keeps_full_graph_query_width(query_len):
+    device = torch.device("cuda:0")
+    batch = InputBatch.make_dummy(1, query_len, InputBuffers(4, 16, device))
+    batch = replace(
+        batch,
+        is_prefilling_np=np.zeros(1, dtype=np.bool_),
+        has_prefill=False,
+        decode_graph_eligible=True,
+    )
+    manager = PCPManager(2, 1, device, True, max_num_reqs=4, max_num_tokens=16)
+    local = manager.partition_batch(
+        batch,
+        BatchExecutionDescriptor(
+            cg_mode=CUDAGraphMode.FULL,
+            num_tokens=query_len,
+            num_reqs=1,
+            uniform_token_count=query_len,
+        ),
+    )
+    # PCP retains one inactive request row so every rank can run the graph.
+    assert local.num_reqs == 1
+    assert local.num_tokens == 0
+    np.testing.assert_array_equal(local.num_scheduled_tokens, [0])
+    assert local.num_reqs_after_padding == 1
+    assert local.num_tokens_after_padding == query_len
+    assert local.max_query_len == query_len
+    torch.testing.assert_close(
+        local.query_start_loc, torch.zeros(2, device=device, dtype=torch.int32)
+    )
+
+
+@pytest.mark.parametrize("shard_decode", [False, True])
+@pytest.mark.parametrize("rank", [0, 1])
+def test_mamba_pcp_capture_stages_global_decode_at_max_request_capacity(
+    shard_decode, rank
+):
+    device = torch.device("cuda:0")
+    tables = BlockTables(
+        [16], 4, 16, [8], device, slot_mapping_enabled=[False], dcp_sharded=[False]
+    )
+    manager = PCPManager(
+        2,
+        rank,
+        device,
+        shard_decode,
+        max_num_reqs=4,
+        max_num_tokens=16,
+        block_tables=tables,
+        has_mamba=True,
+    )
+    dummy = InputBatch.make_dummy(4, 4, InputBuffers(4, 16, device), max_query_len=1)
+    manager.prepare_inputs_for_capture_or_profile(dummy)
+    assert manager.batch_metadata is not None
+    context = manager.batch_metadata.mamba
+    assert context is not None
+    assert context.global_batch.num_reqs == 4
+    assert context.global_batch.max_query_len == 1
+    assert context.global_batch.num_tokens_after_padding == 8
+    start = rank * 4 if shard_decode else 0
+    torch.testing.assert_close(
+        context.token_mapping.local_mask,
+        torch.arange(start, start + 4, device=device) < context.global_batch.num_tokens,
+    )
+    torch.testing.assert_close(
+        context.global_batch.seq_lens, torch.ones(4, device=device, dtype=torch.int32)
+    )
+    pointers = [
+        getattr(context.token_mapping, name).data_ptr()
+        for name in ("restore_indices", "restore_mask", "local_indices", "local_mask")
+    ]
+    manager.prepare_inputs_for_capture_or_profile(dummy)
+    assert manager.batch_metadata is not None
+    replay = manager.batch_metadata.mamba
+    assert replay is not None
+    assert pointers == [
+        getattr(replay.token_mapping, name).data_ptr()
+        for name in ("restore_indices", "restore_mask", "local_indices", "local_mask")
+    ]
 
 
 def _copy_to_cpu(value, device=None, dtype=None, out=None):
@@ -756,13 +947,13 @@ def test_partition_defers_dcp_metadata_to_post_partition_batch():
 
     assert local_batch.dcp_local_seq_lens is None
     assert local_batch.seq_lens.tolist() == [17, 25, 0, 0]
-    assert local_batch.pcp is not None
-    assert local_batch.pcp.dcp_local_seq_lens_cpu_upper_bound is not None
+    assert manager.batch_metadata is not None
+    assert manager.batch_metadata.dcp_local_seq_lens_cpu_upper_bound is not None
     expected_dcp_upper_bound = get_dcp_local_seq_lens(
         torch.tensor([17, 25], dtype=torch.int32), 2, 0, 1
     )
     assert torch.equal(
-        local_batch.pcp.dcp_local_seq_lens_cpu_upper_bound,
+        manager.batch_metadata.dcp_local_seq_lens_cpu_upper_bound,
         torch.cat([expected_dcp_upper_bound, torch.zeros(2, dtype=torch.int32)]),
     )
 

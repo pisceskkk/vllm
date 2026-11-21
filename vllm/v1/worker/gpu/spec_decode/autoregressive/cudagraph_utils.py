@@ -15,7 +15,10 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
     prepare_inputs_to_capture,
 )
 from vllm.v1.worker.gpu.input_batch import InputBuffers
-from vllm.v1.worker.gpu.model_states.interface import ModelState
+from vllm.v1.worker.gpu.model_states.interface import (
+    ModelSpecificAttnMetadata,
+    ModelState,
+)
 from vllm.v1.worker.utils import AttentionGroup
 
 
@@ -57,6 +60,7 @@ class SpeculatorCudaGraphManager(CudaGraphManager):
         progress_bar_desc: str = "Capturing CUDA graphs",
         specialize_spec_tokens: bool = False,
         slot_mappings_buffer: torch.Tensor | None = None,
+        model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
     ) -> None:
         if specialize_spec_tokens:
             speculative_config = self.vllm_config.speculative_config
@@ -97,6 +101,7 @@ class SpeculatorCudaGraphManager(CudaGraphManager):
                 full_cudagraph=desc.cg_mode == CUDAGraphMode.FULL,
                 max_query_len=desc.max_query_len or desc.uniform_token_count,
                 slot_mappings_buffer=slot_mappings_buffer,
+                model_specific_attn_metadata=model_specific_attn_metadata,
             )
 
             forward_kwargs = {}

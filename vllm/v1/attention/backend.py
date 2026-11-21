@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.config.cache import CacheDType
     from vllm.model_executor.layers.linear import ColumnParallelLinear
+    from vllm.model_executor.layers.mamba.pcp import MambaPCPMetadata
     from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
     from vllm.platforms.interface import DeviceCapability
     from vllm.v1.kv_cache_interface import (
@@ -445,6 +446,8 @@ class CommonAttentionMetadata:
     encoder_seq_lens: torch.Tensor | None = None
     encoder_seq_lens_cpu: np.ndarray | None = None
 
+    mamba_pcp: "MambaPCPMetadata | None" = None
+
     dcp_local_seq_lens: torch.Tensor | None = None
     """Sequence lengths of the local rank in decode context parallelism world"""
 
@@ -550,6 +553,7 @@ class CommonAttentionMetadata:
             max_logits_per_req=self.max_logits_per_req,
             encoder_seq_lens=maybe_slice_reqs(self.encoder_seq_lens),
             encoder_seq_lens_cpu=maybe_slice_reqs(self.encoder_seq_lens_cpu),
+            mamba_pcp=self.mamba_pcp,
             dcp_local_seq_lens=maybe_slice_reqs(self.dcp_local_seq_lens),
             dcp_local_seq_lens_cpu_upper_bound=maybe_slice_reqs(
                 self.dcp_local_seq_lens_cpu_upper_bound

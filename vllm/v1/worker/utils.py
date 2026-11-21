@@ -3,6 +3,7 @@
 import math
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from copy import copy
 from dataclasses import dataclass, field, replace
 from itertools import product as iprod
 from typing import Any
@@ -289,6 +290,13 @@ class AttentionGroup:
         num_metadata_builders: int = 1,
         kv_cache_group: KVCacheGroup | None = None,
     ):
+        if getattr(vllm_config.parallel_config, "prefill_context_parallel_size", 1) > 1:
+            # DualChunkSwap can publish two query rows for each request. Both
+            # builders and mapped kernel block tables must own this capacity
+            # before capture; resizing their views would invalidate graph pointers.
+            vllm_config = copy(vllm_config)
+            vllm_config.scheduler_config = copy(vllm_config.scheduler_config)
+            vllm_config.scheduler_config.max_num_seqs *= 2
         spec = self.kv_cache_spec
         if kernel_block_size is not None and isinstance(spec, AttentionSpec):
             # A backend in a packed KV cache group may need smaller blocks than
