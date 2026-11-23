@@ -107,6 +107,7 @@ class DSparkSpeculator(DFlashSpeculator):
         self._sharded_sequential_comm: PyNcclCommunicator | None = None
 
         self.use_draft_pcp = bool(self.speculative_config.dspark_pcp)
+        self.use_context_pcp = self.use_draft_pcp
         if self.use_draft_pcp:
             if not current_platform.is_cuda():
                 raise NotImplementedError("dspark_pcp currently requires CUDA.")
@@ -115,7 +116,52 @@ class DSparkSpeculator(DFlashSpeculator):
             self._pcp_inputs = InputBuffers(
                 self.max_num_reqs, self.max_num_tokens, device
             )
-            logger.info("DSpark query blocks are partitioned across PCP ranks.")
+            logger.info("DSpark context projections and queries use PCP partitions.")
+
+    def _store_hidden_states(
+        self,
+        num_tokens: int,
+        last_hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        num_graph_tokens: int = 0,
+    ) -> None:
+        if not self.use_context_pcp or num_tokens == 0:
+            return super()._store_hidden_states(
+                num_tokens, last_hidden_states, aux_hidden_states, num_graph_tokens
+            )
+        assert num_graph_tokens == 0
+        assert aux_hidden_states is not None
+        group = get_pcp_group()
+        width = cdiv(num_tokens, group.world_size)
+        # An empty rank projects one disposable row, keeping quantized GEMMs valid.
+        start = min(group.rank_in_group * width, num_tokens - 1)
+        end = min((group.rank_in_group + 1) * width, num_tokens)
+        hidden = self.model.combine_hidden_states(
+            torch.cat([states[start:end] for states in aux_hidden_states], dim=-1)
+        )
+        self.hidden_states[: hidden.shape[0]].copy_(hidden)
+        self.hidden_states[hidden.shape[0] : width].zero_()
+
+    def _precompute_context_kv(
+        self, start: int, end: int, dummy_run: bool = False
+    ) -> None:
+        if not self.use_context_pcp or dummy_run or start == end:
+            return super()._precompute_context_kv(start, end, dummy_run)
+        assert start == 0  # PCP is eager; graph-prefix context updates are disabled.
+        context_slots: torch.Tensor | list[torch.Tensor | None]
+        if self._layer_group_idx is not None:
+            context_slots = [
+                self._context_slot_mappings[gidx][start:end]
+                for gidx in self._layer_group_idx
+            ]
+        else:
+            context_slots = self._context_slot_mappings[0][start:end]
+        self.model.precompute_and_store_context_kv(
+            self.hidden_states[start:end],
+            self.context_positions[start:end],
+            context_slots,
+            pcp_context=True,
+        )
 
     def _build_uniform_attn_metadata(
         self,

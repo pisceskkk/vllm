@@ -699,9 +699,10 @@ class SpeculativeConfig:
     top-k base-logit candidates. Requires draft tensor parallel size 1."""
 
     dspark_pcp: bool | None = None
-    """Partition DeepSeek-V4.1 DSpark query tokens across PCP ranks. Requires
-    Model Runner V2, eager execution, DCP=1 and DP=1. Context KV remains
-    replicated; the Markov head runs after restoring the full query block."""
+    """Partition DeepSeek-V4.1 DSpark context projections and queries across PCP
+    ranks. Requires Model Runner V2, eager execution, DCP=1 and DP=1. Projected
+    context KV is gathered before cache insertion; the Markov head runs after
+    restoring the full query block."""
 
     xpress_topc: int | None = Field(default=None, ge=0)
     """For XPress drafting, score each Jacobi pass only on the drafter's top-C

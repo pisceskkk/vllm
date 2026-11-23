@@ -20,7 +20,7 @@ from ...utils import compute_acceptance_len, compute_acceptance_rate
     reason="Requires four CUDA GPUs for DeepSeek-V4.1",
 )
 def test_dspark_pcp_generates(vllm_runner, monkeypatch):
-    """Real checkpoint generation covers padded query shards and cache updates."""
+    """Real weights cover query shards, uneven context, and empty PCP ranks."""
     from vllm import SamplingParams
 
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
@@ -53,6 +53,23 @@ def test_dspark_pcp_generates(vllm_runner, monkeypatch):
             "dspark_pcp": True,
         },
     ) as runner:
+        token = runner.llm.get_tokenizer().encode("Hello", add_special_tokens=False)[0]
+        for length in (1, 513):
+            output = runner.llm.generate(
+                [{"prompt_token_ids": [token] * length}],
+                SamplingParams(
+                    temperature=0, seed=42, max_tokens=1, ignore_eos=True, logprobs=1
+                ),
+                use_tqdm=False,
+            )[0]
+            completion = output.outputs[0]
+            assert len(output.prompt_token_ids) == length
+            assert len(completion.token_ids) == 1
+            assert output.num_cached_tokens == 0
+            assert completion.logprobs is not None
+            assert math.isfinite(
+                completion.logprobs[0][completion.token_ids[0]].logprob
+            )
         outputs = runner.llm.chat(
             [
                 [

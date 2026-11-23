@@ -19,6 +19,7 @@ import torch.nn as nn
 import vllm.envs as envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.kernel import NATIVE_MEGA_MOE_BACKENDS
+from vllm.distributed.parallel_state import get_pcp_group
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.tilelang import (
@@ -53,6 +54,7 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_shard,
 )
 from vllm.models.deepseek_v4.nvidia.dspark import _duplicate_context_wkv_weights
+from vllm.utils.math_utils import cdiv
 
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID
 from .model import (
@@ -184,6 +186,8 @@ class DSparkDeepseekV4Model(nn.Module):
         main_x: torch.Tensor,
         context_positions: torch.Tensor,
         context_slot_mappings: list[torch.Tensor | None] | None = None,
+        *,
+        pcp_context: bool = False,
     ) -> None:
         """Insert the sliding-window context KV for every draft layer.
 
@@ -197,9 +201,15 @@ class DSparkDeepseekV4Model(nn.Module):
         place draft layers in different groups). ``None`` (or a ``None`` entry)
         runs the projection to reserve workspace but writes nothing (profiling).
         """
+        num_context_tokens = context_positions.shape[0]
+        if pcp_context:
+            width = cdiv(num_context_tokens, get_pcp_group().world_size)
+            main_x = main_x[:width]
         all_kv = self.context_wkv_proj(main_x).view(
             main_x.shape[0], self.num_dspark_layers, self.config.head_dim
         )
+        if pcp_context:
+            all_kv = get_pcp_group().all_gather(all_kv, dim=0)[:num_context_tokens]
         for i, (layer, kv) in enumerate(
             zip(self.layers, all_kv.unbind(1), strict=True)
         ):
@@ -340,9 +350,14 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         context_states: torch.Tensor,
         context_positions: torch.Tensor,
         context_slot_mappings: list[torch.Tensor | None] | None = None,
+        *,
+        pcp_context: bool = False,
     ) -> None:
         self.model.precompute_and_store_context_kv(
-            context_states, context_positions, context_slot_mappings
+            context_states,
+            context_positions,
+            context_slot_mappings,
+            pcp_context=pcp_context,
         )
 
     def forward(
