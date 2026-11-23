@@ -34,9 +34,18 @@ import torch
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
-from vllm.distributed.parallel_state import get_tp_group
+from vllm.distributed.parallel_state import get_pcp_group, get_tp_group
+from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.backend import PCPAttentionContext
+from vllm.v1.worker.gpu.attn_utils import (
+    build_attn_metadata,
+    build_slot_mappings_by_layer,
+)
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.sample.batch_shard import (
     all_to_all_vocab_shards,
     batch_sharded_sampling_enabled,
@@ -96,6 +105,179 @@ class DSparkSpeculator(DFlashSpeculator):
 
         # Set when the sequential sampling can be batch-sharded across TP.
         self._sharded_sequential_comm: PyNcclCommunicator | None = None
+
+        self.use_draft_pcp = bool(self.speculative_config.dspark_pcp)
+        self.use_context_pcp = self.use_draft_pcp
+        if self.use_draft_pcp:
+            if not current_platform.is_cuda():
+                raise NotImplementedError("dspark_pcp currently requires CUDA.")
+            if not vllm_config.model_config.enforce_eager:
+                raise ValueError("dspark_pcp currently requires enforce_eager=True.")
+            self._pcp_inputs = InputBuffers(
+                self.max_num_reqs, self.max_num_tokens, device
+            )
+            logger.info("DSpark context projections and queries use PCP partitions.")
+
+    def _store_hidden_states(
+        self,
+        num_tokens: int,
+        last_hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        num_graph_tokens: int = 0,
+    ) -> None:
+        if not self.use_context_pcp or num_tokens == 0:
+            return super()._store_hidden_states(
+                num_tokens, last_hidden_states, aux_hidden_states, num_graph_tokens
+            )
+        assert num_graph_tokens == 0
+        assert aux_hidden_states is not None
+        group = get_pcp_group()
+        width = cdiv(num_tokens, group.world_size)
+        # An empty rank projects one disposable row, keeping quantized GEMMs valid.
+        start = min(group.rank_in_group * width, num_tokens - 1)
+        end = min((group.rank_in_group + 1) * width, num_tokens)
+        hidden = self.model.combine_hidden_states(
+            torch.cat([states[start:end] for states in aux_hidden_states], dim=-1)
+        )
+        self.hidden_states[: hidden.shape[0]].copy_(hidden)
+        self.hidden_states[hidden.shape[0] : width].zero_()
+
+    def _precompute_context_kv(
+        self, start: int, end: int, dummy_run: bool = False
+    ) -> None:
+        if not self.use_context_pcp or dummy_run or start == end:
+            return super()._precompute_context_kv(start, end, dummy_run)
+        assert start == 0  # PCP is eager; graph-prefix context updates are disabled.
+        context_slots: torch.Tensor | list[torch.Tensor | None]
+        if self._layer_group_idx is not None:
+            context_slots = [
+                self._context_slot_mappings[gidx][start:end]
+                for gidx in self._layer_group_idx
+            ]
+        else:
+            context_slots = self._context_slot_mappings[0][start:end]
+        self.model.precompute_and_store_context_kv(
+            self.hidden_states[start:end],
+            self.context_positions[start:end],
+            context_slots,
+            pcp_context=True,
+        )
+
+    def _build_uniform_attn_metadata(
+        self,
+        batch_desc: BatchExecutionDescriptor,
+        num_reqs: int,
+        num_query_per_req: int,
+        seq_lens_cpu_upper_bound: torch.Tensor,
+        step: int,
+        causal: Any = True,
+        dcp_local_seq_lens: torch.Tensor | None = None,
+    ) -> dict[str, Any] | None:
+        if not self.use_draft_pcp:
+            return super()._build_uniform_attn_metadata(
+                batch_desc,
+                num_reqs,
+                num_query_per_req,
+                seq_lens_cpu_upper_bound,
+                step,
+                causal,
+                dcp_local_seq_lens,
+            )
+        group = get_pcp_group()
+        width = cdiv(num_query_per_req, group.world_size)
+        offsets = torch.arange(width, device=self.device) + group.rank_in_group * width
+        valid = offsets < num_query_per_req
+        rows = (
+            torch.arange(num_reqs, device=self.device)[:, None] * num_query_per_req
+            + offsets.clamp(max=num_query_per_req - 1)
+        ).flatten()
+        num_tokens = num_reqs * width
+        inputs = self._pcp_inputs
+        inputs.input_ids[:num_tokens].copy_(self.input_buffers.input_ids[rows])
+        inputs.positions[:num_tokens].copy_(self.input_buffers.positions[rows])
+        inputs.is_padding[:num_tokens].copy_(
+            self.input_buffers.is_padding[rows] | ~valid.repeat(num_reqs)
+        )
+        inputs.seq_lens[:num_reqs].copy_(self.input_buffers.seq_lens[:num_reqs])
+        query_start_cpu = torch.arange(num_reqs + 1, dtype=torch.int32) * width
+        inputs.query_start_loc[: num_reqs + 1].copy_(query_start_cpu)
+        slots = self.block_tables.slot_mappings[:, rows].masked_fill(
+            inputs.is_padding[:num_tokens].unsqueeze(0), -1
+        )
+        self._pcp_slots = group.all_gather(slots, dim=1)
+        self._pcp_num_tokens = num_tokens
+        self._pcp_num_reqs = num_reqs
+        return build_attn_metadata(
+            attn_groups=self.attn_groups,
+            num_reqs=num_reqs,
+            num_tokens=num_tokens,
+            query_start_loc_gpu=inputs.query_start_loc[: num_reqs + 1],
+            query_start_loc_cpu=query_start_cpu,
+            max_query_len=width,
+            seq_lens=inputs.seq_lens[:num_reqs],
+            max_seq_len=self.draft_max_seq_len,
+            block_tables=self.block_tables.input_block_tables,
+            slot_mappings=self._pcp_slots,
+            kv_cache_config=self.kv_cache_config,
+            seq_lens_cpu_upper_bound=(seq_lens_cpu_upper_bound[:num_reqs] + step).clamp(
+                max=self.max_model_len
+            ),
+            positions=inputs.positions[:num_tokens],
+            is_prefilling=self.draft_is_prefilling[:num_reqs],
+            causal=causal,
+            pcp_context=PCPAttentionContext(group.world_size, group.rank_in_group),
+        )
+
+    @torch.inference_mode()
+    def _run_model(
+        self,
+        num_tokens: int,
+        attn_metadata: dict[str, Any] | None,
+        slot_mappings: dict[str, torch.Tensor] | None,
+        num_tokens_across_dp: torch.Tensor | None,
+        cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+    ) -> torch.Tensor:
+        if not self.use_draft_pcp or attn_metadata is None:
+            return super()._run_model(
+                num_tokens,
+                attn_metadata,
+                slot_mappings,
+                num_tokens_across_dp,
+                cudagraph_runtime_mode,
+            )
+        assert cudagraph_runtime_mode == CUDAGraphMode.NONE
+        group = get_pcp_group()
+        inputs = self._pcp_inputs
+        num_tokens = self._pcp_num_tokens
+        is_padding = inputs.is_padding[:num_tokens]
+        # MoE token gathering spans the physical PCP group as well as TP.
+        if not self.vllm_config.parallel_config.enable_expert_parallel:
+            is_padding = group.all_gather(is_padding, dim=0)
+        with set_forward_context(
+            attn_metadata,
+            self.vllm_config,
+            num_tokens=num_tokens,
+            slot_mapping=build_slot_mappings_by_layer(
+                self._pcp_slots, self.kv_cache_config
+            ),
+            batch_descriptor=BatchDescriptor(num_tokens=num_tokens),
+            is_padding=is_padding,
+        ):
+            hidden = self.model(
+                input_ids=inputs.input_ids[:num_tokens],
+                positions=inputs.positions[:num_tokens],
+                inputs_embeds=None,
+            )
+        gathered = group.all_gather(hidden, dim=0)
+        # rank, request, local query -> request, full query; discard tail padding.
+        return (
+            gathered.view(group.world_size, self._pcp_num_reqs, -1, hidden.shape[-1])
+            .transpose(0, 1)
+            .reshape(self._pcp_num_reqs, -1, hidden.shape[-1])[
+                :, : self.num_query_per_req
+            ]
+            .reshape(-1, hidden.shape[-1])
+        )
 
     def load_model(self, target_model: torch.nn.Module) -> None:
         super().load_model(target_model)

@@ -22,7 +22,9 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
     speculator_class = (
         "vllm.v1.worker.gpu.spec_decode.dspark.speculator.DSparkSpeculator"
     )
-    supported_options = frozenset({"dspark_draft_topk", "draft_lm_head_quantization"})
+    supported_options = frozenset(
+        {"dspark_draft_topk", "draft_lm_head_quantization", "dspark_pcp"}
+    )
     uses_separate_workspace_lane = True
     # DSpark predicts acceptance with its own confidence head.
     adaptive_verification_uses_draft_logits = False
@@ -78,6 +80,17 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
     def apply_options(cls, spec: "SpeculativeConfig") -> None:
         draft = spec.draft_model_config
         hf_config = draft.hf_config
+        if spec.dspark_pcp:
+            if "DSparkV41DraftModel" not in draft.architectures:
+                raise ValueError("dspark_pcp requires a DeepSeek-V4.1 DSpark draft.")
+            parallel = spec.target_parallel_config
+            if (
+                parallel is None
+                or parallel.prefill_context_parallel_size <= 1
+                or parallel.decode_context_parallel_size != 1
+                or parallel.data_parallel_size != 1
+            ):
+                raise ValueError("dspark_pcp requires PCP>1, DCP=1 and DP=1.")
         dspark_draft_topk = spec.dspark_draft_topk
         if dspark_draft_topk is None:
             dspark_draft_topk = getattr(hf_config, "dspark_draft_topk", None)
@@ -128,7 +141,10 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
 
     def hash_factors(self) -> list[Any]:
         # Adaptive verification changes the DSpark draft graph.
-        return [self.spec_config.enable_adaptive_verification]
+        return [
+            self.spec_config.enable_adaptive_verification,
+            self.spec_config.dspark_pcp,
+        ]
 
     def pcp_unsupported_reason(self, parallel_config: "ParallelConfig") -> str | None:
         dcp_size = parallel_config.decode_context_parallel_size

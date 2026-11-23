@@ -103,6 +103,7 @@ _QWEN3_OMNI_TARGET_ARCHITECTURES = frozenset(
 _QWEN3_OMNI_DSPARK_ARCHITECTURE = "Qwen3OmniDSparkModel"
 # See `SpeculatorConfig.supported_options`.
 _METHOD_SPECIFIC_OPTIONS = (
+    "dspark_pcp",
     "dspark_draft_topk",
     "draft_lm_head_quantization",
     "index_share_for_mtp_iteration",
@@ -696,6 +697,12 @@ class SpeculativeConfig:
     dspark_draft_topk: int | None = Field(default=None, ge=1)
     """For Qwen3 DSpark drafting, evaluate the Markov projection only for the
     top-k base-logit candidates. Requires draft tensor parallel size 1."""
+
+    dspark_pcp: bool | None = None
+    """Partition DeepSeek-V4.1 DSpark context projections and queries across PCP
+    ranks. Requires Model Runner V2, eager execution, DCP=1 and DP=1. Projected
+    context KV is gathered before cache insertion; the Markov head runs after
+    restoring the full query block."""
 
     xpress_topc: int | None = Field(default=None, ge=0)
     """For XPress drafting, score each Jacobi pass only on the drafter's top-C

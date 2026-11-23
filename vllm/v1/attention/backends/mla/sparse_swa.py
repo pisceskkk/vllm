@@ -650,6 +650,11 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 decode_swa_indices = self.decode_swa_indices_noncausal
                 # No replay_start: decode rows sit above the hit, so a
                 # request's replayed window never reaches them.
+                query_block_size = 0
+                if common_attn_metadata.pcp_context is not None:
+                    spec = self.vllm_config.speculative_config
+                    assert spec is not None
+                    query_block_size = spec.speculator_config.num_lookahead_tokens
                 _COMPUTE_DSPARK_NONCAUSAL_SWA_INDICES_KERNEL(
                     decode_swa_indices,
                     self.decode_swa_lens,
@@ -663,6 +668,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                     self.block_size,
                     num_tokens=num_decode_tokens,
                     token_offset=0,
+                    query_block_size=query_block_size,
                 )
             else:
                 _COMPUTE_SWA_INDICES_AND_LENS_KERNEL(
@@ -1263,6 +1269,7 @@ class ComputeDSparkNoncausalSWAIndicesKernel(
         block_table_stride,
         block_size,
         token_offset,
+        query_block_size,
         TRITON_BLOCK_SIZE: tl.constexpr,
     ):
         """Non-causal per-token indices for the DSpark draft block.
@@ -1292,7 +1299,9 @@ class ComputeDSparkNoncausalSWAIndicesKernel(
         query_len = query_end - query_start
 
         seq_len = tl.load(seq_lens_ptr + req_idx)
-        prefix_len = seq_len - query_len
+        prefix_len = seq_len - tl.where(
+            query_block_size > 0, query_block_size, query_len
+        )
 
         # Block-anchored window (shared by every token in the block) + full block.
         start_pos = tl.maximum(prefix_len - window_size, 0)
@@ -1380,6 +1389,7 @@ class ComputeDSparkNoncausalSWAIndicesKernel(
         *,
         num_tokens: int,
         token_offset: int,
+        query_block_size: int = 0,
     ) -> LaunchSpec:
         return (num_tokens,), dict(
             swa_indices_stride=swa_indices.stride(0),
