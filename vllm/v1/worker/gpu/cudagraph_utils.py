@@ -6,6 +6,7 @@ from collections import defaultdict
 from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
+from functools import partial
 from itertools import groupby, product
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
@@ -700,6 +701,10 @@ class ModelCudaGraphManager(CudaGraphManager):
             (d.num_tokens for descs in self._capture_descs.values() for d in descs),
             default=0,
         )
+        model_config = self.vllm_config.model_config
+        uses_inputs_embeds = (
+            model_config.supports_multimodal_inputs or model_config.enable_prompt_embeds
+        )
 
         def persistent_like(x: torch.Tensor) -> torch.Tensor:
             return x.new_empty((max(max_tokens, x.shape[0]), *x.shape[1:]))
@@ -756,9 +761,17 @@ class ModelCudaGraphManager(CudaGraphManager):
                 else None
             )
 
+            input_ids: torch.Tensor | None = input_buffers.input_ids[:num_tokens]
+            inputs_embeds: torch.Tensor | None = None
+            if uses_inputs_embeds and self.is_first_pp_rank:
+                inputs_embeds = model_state.dummy_inputs_embeds(num_tokens)
+                if inputs_embeds is not None and not requires_raw_input_tokens(model):
+                    input_ids = None
+
             model_inputs = {
-                "input_ids": input_buffers.input_ids[:num_tokens],
+                "input_ids": input_ids,
                 "positions": input_buffers.positions[:num_tokens],
+                "inputs_embeds": inputs_embeds,
                 "intermediate_tensors": None,
                 **model_state.prepare_dummy_inputs(num_reqs, num_tokens),
             }
@@ -974,7 +987,12 @@ def prepare_inputs_to_capture(
     # In summary: We always generate attention metadata for both FULL and PIECEWISE
     # CUDA graphs, setting for_capture=True for FULL graphs, and for_capture=False
     # for PIECEWISE graphs, to ensure correct execution and capture.
-    attn_metadata = model_state.prepare_attn(
+    prepare_metadata = (
+        partial(pcp_manager.build_attn_metadata, model_state)
+        if pcp_manager is not None
+        else model_state.prepare_attn
+    )
+    attn_metadata = prepare_metadata(
         input_batch,
         CUDAGraphMode.NONE,
         input_block_tables,

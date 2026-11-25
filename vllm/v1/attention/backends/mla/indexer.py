@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from copy import copy
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
@@ -48,14 +49,14 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     split_decodes_and_prefills,
 )
-from vllm.v1.attention.ops.shardq import build_shardq_split
+from vllm.v1.attention.ops.pcp import PCPTokenMapping
+from vllm.v1.attention.ops.shardq import ShardQSplit, build_shardq_split
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheLayout,
     KVCacheSpec,
     MLAAttentionSpec,
 )
-from vllm.v1.utils import CpuGpuBuffer
 
 logger = init_logger(__name__)
 
@@ -251,6 +252,10 @@ class DeepseekV32IndexerBackend(AttentionBackend):
 
 class Glm5NextIndexerBackend(DeepseekV32IndexerBackend):
     @staticmethod
+    def get_builder_cls():
+        return Glm5NextIndexerMetadataBuilder
+
+    @staticmethod
     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
         if kv_cache_spec is not None:
             # Worker get_kv_cache_layer_configs: runs without the current config.
@@ -264,6 +269,8 @@ class Glm5NextIndexerBackend(DeepseekV32IndexerBackend):
 
 class KpoolTailBackend(DeepseekV32IndexerBackend):
     """Storage-only backend for the GLM-5.3-Flash kpool tail cache."""
+
+    uses_global_pcp_batch = True
 
     @classmethod
     def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
@@ -426,6 +433,8 @@ class DeepseekV32IndexerPrefillChunkMetadata:
     token_start: int
     token_end: int
     num_reqs: int
+    # The batch index of the chunk's first request.
+    req_start: int = 0
     skip_kv_gather: bool = False
     local_cu_seq_lens: torch.Tensor | None = None
     local_total_seq_lens: int = 0
@@ -694,6 +703,12 @@ class DeepseekV32IndexerPrefillMetadata:
     # tokens, gathered compactly in the order their top-k is written: the
     # indices of those tokens.
     shardq_gather_indices: torch.Tensor | None = None
+    # The split behind shardq_gather_indices and the requests' query ranges
+    # over those tokens.
+    shardq_split: ShardQSplit | None = None
+    shardq_query_start_loc_cpu: torch.Tensor | None = None
+    # The tokens' rows on the device, uploaded by the first layer to exchange.
+    shardq_rows: torch.Tensor | None = None
 
 
 @dataclass(slots=True)
@@ -734,6 +749,10 @@ class DeepseekV32IndexerMetadata:
     prefill: DeepseekV32IndexerPrefillMetadata | None = None
     positions: torch.Tensor | None = None
     block_table: torch.Tensor | None = None
+    # PCP keeps query scoring local, but pools and tail writes use the restored
+    # causal batch. The write builder owns separate graph-stable buffers.
+    write_metadata: "DeepseekV32IndexerMetadata | None" = None
+    pcp: PCPTokenMapping | None = None
 
 
 @triton.jit(do_not_specialize=["num_reqs", "num_actual_tokens", "num_tokens"])
@@ -840,7 +859,8 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.slot_mapping_buffer = torch.empty(
-            vllm_config.scheduler_config.max_num_batched_tokens,
+            vllm_config.scheduler_config.max_num_batched_tokens
+            * vllm_config.parallel_config.prefill_context_parallel_size,
             dtype=torch.int64,
             device=device,
         )
@@ -978,11 +998,30 @@ def _use_flattening(vllm_config: VllmConfig) -> bool:
     )
 
 
+def upload_shardq_indices(
+    split: ShardQSplit, query_start_loc_cpu: torch.Tensor, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather indices on the device and query ranges renumbered over them.
+
+    Fresh host memory each step: async scheduling builds the next step before
+    this step's copy runs, which a reused pinned buffer would race with.
+    """
+    num_decode_tokens = split.num_decode_tokens
+    indices = np.concatenate(
+        (np.arange(num_decode_tokens), split.local_token_ids + num_decode_tokens)
+    ).astype(np.int32)
+    renumbered = torch.searchsorted(
+        torch.from_numpy(indices), query_start_loc_cpu, out_int32=True
+    )
+    return async_tensor_h2d(indices, device), renumbered
+
+
 class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
     # The indexer opts out of the shared reorder-threshold vote (see __init__),
     # so this is None; its own split uses self.decode_threshold.
     reorder_batch_threshold: int | None = None
     requires_block_table_width = True
+    uses_pcp_cache_layout: ClassVar[bool] = True
 
     @classmethod
     def get_cudagraph_support(
@@ -1011,15 +1050,6 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         self.use_shardq = self.dcp_world_size == 1 and any(
             getattr(layers.get(name), "use_shardq", False) for name in self.layer_names
         )
-        if self.use_shardq:
-            self.shardq_gather_indices = CpuGpuBuffer(
-                scheduler_config.max_num_batched_tokens,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            self.shardq_query_start_loc = CpuGpuBuffer(
-                scheduler_config.max_num_seqs + 1, dtype=torch.int32, device=self.device
-            )
         # KV compression (DeepseekV4). Default to 1 for no compression.
         self.compress_ratio = 1
         if isinstance(self.kv_cache_spec, MLAAttentionSpec):
@@ -1042,11 +1072,10 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         )
         self.indexer_uses_fp4 = dsa_indexer_uses_fp4(self.vllm_config)
         # Plan prefill chunks for the fused MQA+top-k kernel (not bounded by
-        # the logits budget). PCP + DCP has its own planner. v4.1 candidate
-        # selection is not excluded: its pre-candidate indexers take
-        # fused_mqa_topk and the others row-split their dense logits. Indexers
-        # that pad their heads to 32 run fused_mqa_topk on budget-planned
-        # chunks.
+        # the logits budget). v4.1 candidate selection is not excluded: its
+        # pre-candidate indexers take fused_mqa_topk and the others row-split
+        # their dense logits. Indexers that pad their heads to 32 run
+        # fused_mqa_topk on budget-planned chunks.
         model_config = self.vllm_config.model_config
         cfg = model_config.hf_text_config if model_config is not None else None
         self.fused_mqa_topk_eligible = cfg is not None and use_fused_mqa_topk(
@@ -1057,7 +1086,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             topk=getattr(cfg, "index_topk", 0)
             // (getattr(cfg, "index_kpool", None) or 1),
             fp4_cache=self.indexer_uses_fp4,
-            full_context=self.dcp_world_size == 1,
+            full_context=self.use_pcp or self.dcp_world_size == 1,
         )
 
         next_n = self.num_speculative_tokens + 1
@@ -1402,6 +1431,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             torch.from_numpy(query_lens.astype(np.int32)),
             self.max_prefill_buffer_size,
             max_logits_bytes,
+            fused_mqa_topk_eligible=self.fused_mqa_topk_eligible,
         )
         return [
             (
@@ -1502,6 +1532,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> DeepseekV32IndexerMetadata:
+        use_pcp = self.use_pcp and self.uses_pcp_cache_layout
         num_reqs = common_attn_metadata.num_reqs
         num_tokens = common_attn_metadata.num_actual_tokens
         query_start_loc = common_attn_metadata.query_start_loc
@@ -1515,7 +1546,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         if self.compress_ratio > 1:
             padded_num_tokens = num_tokens
             local_slot_mapping = slot_mapping
-            if self.use_pcp:
+            if use_pcp:
                 # The gathered layout holds each rank's local tokens, padded, in
                 # rank order, so this rank's segment lines up with query_start_loc.
                 padded_num_tokens = slot_mapping.shape[0] // self.pcp_world_size
@@ -1535,7 +1566,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 dcp_world_size=self.dcp_world_size,
                 cp_interleave=self.cp_kv_cache_interleave_size,
             )
-            if self.pcp_world_size > 1:
+            if use_pcp:
                 compressed_slot_mapping = get_pcp_group().all_gather(
                     self.compressed_slot_mapping_buffer[:padded_num_tokens],
                     dim=0,
@@ -1562,7 +1593,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 common_attn_metadata,
                 decode_threshold=self.decode_threshold,
                 require_uniform=not (self.use_flattening or self.supports_varlen),
-                treat_short_extends_as_decodes=not self.use_pcp,
+                treat_short_extends_as_decodes=not use_pcp,
             )
         )
 
@@ -1584,7 +1615,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 if self.compress_ratio > 1
                 else seq_lens_cpu
             )
-            positions = shardq_gather_indices = None
+            positions = shardq_gather_indices = split = None
             if self.use_shardq and (
                 split := build_shardq_split(common_attn_metadata, self.vllm_config)
             ):
@@ -1593,18 +1624,8 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 # Every rank scores every decode token in place, then its own
                 # tokens compactly, in the order the token-sharded attention
                 # reads them.
-                shardq_decode_tokens = split.num_decode_tokens
-                num_indices = shardq_decode_tokens + len(split.local_token_ids)
-                indices_cpu = self.shardq_gather_indices.cpu[:num_indices]
-                np.concatenate(
-                    (
-                        np.arange(shardq_decode_tokens),
-                        split.local_token_ids + shardq_decode_tokens,
-                    ),
-                    out=indices_cpu.numpy(),
-                )
-                shardq_gather_indices = self.shardq_gather_indices.copy_to_gpu(
-                    num_indices
+                shardq_gather_indices, query_start_loc_cpu = upload_shardq_indices(
+                    split, query_start_loc_cpu[: num_reqs + 1], self.device
                 )
                 # Chunk only these tokens, each at its position, and renumber
                 # the requests' query ranges (the decodes' stay put).
@@ -1616,13 +1637,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     + seq_lens[token_to_req]
                     - query_start_loc[token_to_req + 1]
                 )
-                query_start_loc_cpu = torch.searchsorted(
-                    indices_cpu,
-                    query_start_loc_cpu[: num_reqs + 1],
-                    out_int32=True,
-                    out=self.shardq_query_start_loc.cpu[: num_reqs + 1],
-                )
-                query_start_loc = self.shardq_query_start_loc.copy_to_gpu(num_reqs + 1)
+                query_start_loc = async_tensor_h2d(query_start_loc_cpu, self.device)
             prefill_query_lens_cpu = torch.diff(
                 query_start_loc_cpu[num_decodes : num_decodes + num_prefills + 1]
             )
@@ -1633,7 +1648,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
             req_idx = None
             shard_rows = None
-            if self.use_pcp and self.dcp_world_size > 1:
+            if use_pcp and self.dcp_world_size > 1:
                 # The gathered KV must be packed identically on every PCP rank:
                 # chunk by request from its DCP shard rows, which every rank
                 # holds. A dummy batch bypasses the PCP manager and has one
@@ -1708,6 +1723,10 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     else 0
                 ),
                 shardq_gather_indices=shardq_gather_indices,
+                shardq_split=split,
+                shardq_query_start_loc_cpu=query_start_loc_cpu
+                if split is not None
+                else None,
             )
 
         decode_metadata = None
@@ -1743,8 +1762,13 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
             max_decode_len = int(decode_lens_cpu.max().item())
             min_decode_len = int(decode_lens_cpu.min().item())
-            write_is_uniform = min_decode_len == max_decode_len
             next_n = 1 + self.num_speculative_tokens
+            if max_decode_len == 0:
+                # A FULL graph can pad a PCP rank with no live queries. Keep
+                # the captured query width: DeepGEMM cannot schedule a (B, 0)
+                # context-lens tensor, and replays read the whole padded row.
+                max_decode_len = max(1, min(next_n, common_attn_metadata.max_query_len))
+            write_is_uniform = min_decode_len == max_decode_len
             if self.use_adaptive_verification:
                 # Varlen FULL graphs are captured by distributing the graph's
                 # token bucket over as many one-token dummy requests as
@@ -1968,6 +1992,45 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             decode.schedule_metadata.copy_(schedule_metadata)
 
 
+class Glm5NextIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
+    """Local query scoring with a separate global Kpool write layout."""
+
+    uses_pcp_cache_layout: ClassVar[bool] = False
+    uses_pcp_global_write_builder: ClassVar[bool] = True
+
+    def __init__(
+        self,
+        kv_cache_spec,
+        layer_names,
+        vllm_config,
+        device,
+        *,
+        global_max_num_seqs: int | None = None,
+        create_write_builder: bool = True,
+        **kwargs,
+    ) -> None:
+        pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
+        layers = vllm_config.compilation_config.static_forward_context
+        is_draft_only = bool(layer_names) and all(
+            getattr(layers.get(name), "is_draft_layer", False) for name in layer_names
+        )
+        self.pcp_write_metadata_builder: Glm5NextIndexerMetadataBuilder | None = None
+        if create_write_builder and pcp_size > 1 and not is_draft_only:
+            write_config = copy(vllm_config)
+            write_config.scheduler_config = copy(vllm_config.scheduler_config)
+            if global_max_num_seqs is not None:
+                write_config.scheduler_config.max_num_seqs = global_max_num_seqs
+            self.pcp_write_metadata_builder = Glm5NextIndexerMetadataBuilder(
+                kv_cache_spec,
+                layer_names,
+                write_config,
+                device,
+                create_write_builder=False,
+                **kwargs,
+            )
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device, **kwargs)
+
+
 def build_prefill_chunk_metadata(
     start_idx: int,
     end_idx: int,
@@ -2115,6 +2178,7 @@ def build_prefill_chunk_metadata(
         token_start=token_start,
         token_end=token_end,
         num_reqs=num_reqs,
+        req_start=start_idx,
         skip_kv_gather=skip_kv_gather,
         local_cu_seq_lens=local_cu_seq_lens,
         local_total_seq_lens=local_total_seq_lens,
